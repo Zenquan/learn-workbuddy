@@ -1,6 +1,6 @@
 # s01: Agent Loop — 一个循环就够了
 
-> *"一个循环 + 一个工具 = 一个 Agent"* — while True, stop_reason, tool_use。
+> *"一个循环 + 一个工具 = 一个 Agent"* — tool_use 驱动继续，显式结果说明停止。
 >
 > **Harness 层**: 循环 — 模型与真实世界的第一道连接。
 
@@ -13,11 +13,11 @@
 ```mermaid
 flowchart LR
     A["User Prompt"] --> B["Anthropic Message API"]
-    B --> C["Agent Loop"]
-    C --> D["bash tool"]
+    B --> C["AgentTurn.from_response"]
+    C -->|"有 tool_use block"| D["bash tool"]
     D --> E["tool_result -> messages"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    E --> B
+    C -->|"无 tool_use block"| F["AgentLoopResult"]
 ```
 
 ## 学习前置知识
@@ -29,13 +29,15 @@ flowchart LR
 ## 本章抓住的 WorkBuddy-style 机制
 
 - 用最小 while 循环模拟 WorkBuddy-style harness 的心跳。
-- 用 tool_use/tool_result 形成可恢复、可记录的交互边界。
+- 用 tool_use/tool_result 形成可观察、可测试的交互边界。
+- 用 `AgentLoopResult` 显式区分正常回答、token 截断和轮次预算。
 - 先接受单进程简化, 后续章节再把 UI、Sidecar、Session 拆开。
 
 ## 常见误区
 
 - 把 agent 写成一次性 prompt 调用, 后面就很难加入工具、记忆和恢复。
 - 直接信任 stop_reason 容易漏掉流式响应里的工具调用。
+- 使用无界 `while True`, 模型持续调用工具时无法给 harness 一个确定的停止点。
 - 一开始就上复杂框架, 会看不清 harness 的真正边界。
 ## 问题
 
@@ -51,12 +53,14 @@ flowchart LR
 
 ## 解决方案
 
-一个 `while True` 循环，模型调用工具就继续，不调用就停。整个过程只有两个信号：
+模型返回工具调用就继续，没有工具调用就停止。内容块决定“是否继续”，provider 的 `stop_reason` 用来解释“为什么停止”；harness 自己还维护最大轮次预算。
 
-| 信号 | 含义 | 循环动作 |
+| 观察结果 | Harness 解释 | 循环动作 |
 |------|------|---------|
-| 有 `tool_use` block | 模型举手说"我要用工具" | 执行 → 结果喂回去 → 继续 |
-| 没有 `tool_use` block | 模型说"我做完了" | 退出循环 |
+| 有 `tool_use` block | 模型请求执行真实 I/O | 执行 → 结果喂回去 → 继续 |
+| 无工具块，普通结束 | 模型给出最终回答 | 返回 `final_answer` |
+| 无工具块，`max_tokens` | 回答被 provider 截断 | 返回 `max_tokens`，保留部分文本 |
+| 达到 `max_turns` | Harness 预算耗尽 | 返回 `max_turns`，不再发起新模型调用 |
 
 ---
 
@@ -77,61 +81,70 @@ response = client.messages.create(
 )
 ```
 
-**第 3 步**：追加模型回答，检查它是否调了工具。没调 → 结束。
+**第 3 步**：把 provider 响应归一成一个 `AgentTurn`。解析只做一次，后续判断和执行共享同一份数据。
 
 ```python
-messages.append({"role": "assistant", "content": response.content})
-if response.stop_reason != "tool_use":
-    return
+turn = AgentTurn.from_response(response)
+messages.append({"role": "assistant", "content": turn.content})
 ```
 
-**第 4 步**：执行模型要求的工具，收集结果。
+**第 4 步**：先判断是否停止。工具内容块优先决定循环是否继续，`stop_reason` 负责区分终止类型。
 
 ```python
-results = []
-for block in response.content:
-    if block.type == "tool_use":
-        output = run_bash(block.input["command"])
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
+stop_reason = stop_reason_for(turn)
+if stop_reason is not None:
+    return AgentLoopResult(
+        stop_reason=stop_reason,
+        turns=turn_number,
+        tool_calls=tool_call_count,
+        final_text=turn.text,
+        provider_stop_reason=turn.provider_stop_reason,
+    )
 ```
 
-**第 5 步**：把工具结果作为新消息追加，回到第 2 步。
+**第 5 步**：执行模型要求的工具，收集结果。
+
+```python
+results = [execute_bash_call(call) for call in turn.tool_calls]
+```
+
+**第 6 步**：把工具结果作为新消息追加，回到第 2 步。
 
 ```python
 messages.append({"role": "user", "content": results})
 ```
 
-组装为一个完整函数：
+核心循环因此保持直接，同时返回一个可测试的结果契约：
 
 ```python
-def agent_loop(messages):
-    while True:
+def agent_loop(messages, max_turns=8):
+    tool_call_count = 0
+    for turn_number in range(1, max_turns + 1):
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        turn = AgentTurn.from_response(response)
+        messages.append({"role": "assistant", "content": turn.content})
 
-        if response.stop_reason != "tool_use":
-            return
+        stop_reason = stop_reason_for(turn)
+        if stop_reason is not None:
+            return AgentLoopResult(
+                stop_reason, turn_number, tool_call_count,
+                turn.text, turn.provider_stop_reason,
+            )
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = run_bash(block.input["command"])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
+        results = [execute_bash_call(call) for call in turn.tool_calls]
+        tool_call_count += len(results)
         messages.append({"role": "user", "content": results})
+
+    return AgentLoopResult(
+        LoopStopReason.MAX_TURNS, max_turns, tool_call_count,
+        turn.text, turn.provider_stop_reason,
+    )
 ```
 
-不到 30 行，这就是最小可运行的 agent harness 内核。后面 23 个章节都在这个循环上叠加机制，循环本身始终不变。
+循环主体仍然很小；新增类型不是框架层，而是把原来隐藏在松散对象和 `return` 里的 turn、tool call 与停止原因显式化。后面 23 个章节会在这个循环周围叠加机制。
 
 ---
 
@@ -159,7 +172,7 @@ python s01_agent_loop/code.py
 2. `List all Python files in this directory`
 3. `What is the current git branch?`
 
-观察重点：模型什么时候调用工具（循环继续），什么时候不调用（循环结束）？
+观察重点：模型什么时候调用工具（循环继续），什么时候给出最终文本；如果模型连续调用工具，`max_turns` 如何让 harness 有界停止？
 
 ---
 
@@ -201,7 +214,7 @@ Electron Main Process
 
 ### stop_reason 的处理
 
-WorkBuddy 使用 Anthropic SDK 的流式响应。在流式模式下，`stop_reason` 可能在 `message_delta` 事件中才到达，而不是在第一个 `message_start` 中。WorkBuddy 的处理方式与 Claude Code 类似——不直接信任 `stop_reason`，而是检查内容中是否有 `tool_use` block。
+流式 provider 往往会让内容块和最终停止元数据在不同事件中到达。因此 harness 不应只用 `stop_reason` 决定是否执行工具；先检查归一化后的 `tool_use` 内容块，再用停止元数据解释最终状态，更容易兼容同步与流式实现。
 
 ### RingBuffer — 有界输出缓冲
 
@@ -209,13 +222,13 @@ Sidecar 进程使用 固定大小的 RingBuffer 来缓冲 agent 的流式输出�
 
 ### 教学版的简化
 
-- 生产级 agent bridge → 30 行 `while True`
+- 生产级 agent bridge → 一个小型有界循环 + 显式结果契约
 - 多进程 Sidecar → 单进程直接调用
 - 流式响应 → 同步响应
 - RingBuffer → 列表
 - ACP HTTP → 函数调用
 
-**一句话**：生产级 agent bridge 核心就是 30 行 `while True`。所有复杂字段和退出路径都是保护机制。
+**一句话**：生产级 agent bridge 的核心仍是有界 turn loop；显式字段和退出路径让它可以被测试、观测和安全停止。
 
 </details>
 
@@ -223,6 +236,6 @@ Sidecar 进程使用 固定大小的 RingBuffer 来缓冲 agent 的流式输出�
 
 ## 下一课
 
-30 行 `while True` 搭好了 agent 的骨架。但循环里只有 `tool_use` 和 `tool_result`——agent 怎么知道有哪些工具可用？怎么从模型输出的函数调用路由到正确的工具？s02 讲工具分发——dispatch map、并发执行、流式工具调用。
+有界循环搭好了 agent 的骨架。但循环里只有一个显式的 bash 分支——agent 怎么知道有哪些工具可用？怎么从模型输出的函数调用路由到正确的工具？s02 讲工具分发——dispatch map、并发执行、流式工具调用。
 
 s02 Tool Dispatch → 多个工具, 一个 dispatch map。

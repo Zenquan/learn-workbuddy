@@ -34,10 +34,10 @@
   <path d="M838 124 L862 124 L862 318 L848 318" fill="none" stroke="#ea4335" stroke-width="2.4" marker-end="url(#arrow-red)"/>
 
   <rect x="648" y="218" width="78" height="24" rx="12" fill="#34a853"/>
-  <text x="687" y="234" text-anchor="middle" class="label">tool_use</text>
+  <text x="687" y="234" text-anchor="middle" class="label">有: 执行</text>
 
   <rect x="807" y="214" width="78" height="24" rx="12" fill="#ea4335"/>
-  <text x="846" y="230" text-anchor="middle" class="label">end_turn</text>
+  <text x="846" y="230" text-anchor="middle" class="label">无: 停止</text>
 
   <rect x="384" y="252" width="138" height="28" rx="14" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1"/>
   <text x="453" y="271" text-anchor="middle" font-size="11" font-weight="700" fill="#1a73e8">下一轮 messages</text>
@@ -56,21 +56,21 @@
 
   <g transform="translate(760 124)">
     <polygon points="0,-52 78,0 0,52 -78,0" fill="#fff8e1" stroke="#fbbc04" stroke-width="2"/>
-    <text y="-5" text-anchor="middle" font-size="14" font-weight="700" fill="#202124">stop_reason?</text>
-    <text y="15" text-anchor="middle" font-size="10.5" fill="#5f6368">tool_use / end_turn</text>
+    <text y="-5" text-anchor="middle" font-size="14" font-weight="700" fill="#202124">有 tool_use?</text>
+    <text y="15" text-anchor="middle" font-size="10.5" fill="#5f6368">inspect content blocks</text>
   </g>
 
   <rect x="500" y="376" width="170" height="64" rx="10" fill="#34a853"/>
   <text x="585" y="403" text-anchor="middle" class="node-title" fill="#ffffff">执行工具</text>
-  <text x="585" y="423" text-anchor="middle" class="node-sub" fill="#d7f5df">read / bash / search</text>
+  <text x="585" y="423" text-anchor="middle" class="node-sub" fill="#d7f5df">bash only (s01)</text>
 
   <rect x="280" y="376" width="170" height="64" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.6"/>
   <text x="365" y="403" text-anchor="middle" class="node-title" fill="#188038">写回 tool_result</text>
   <text x="365" y="423" text-anchor="middle" class="node-sub" fill="#5f6368">append to messages</text>
 
   <rect x="675" y="286" width="170" height="64" rx="32" fill="#fce8e6" stroke="#ea4335" stroke-width="1.8"/>
-  <text x="760" y="313" text-anchor="middle" class="node-title" fill="#ea4335">输出最终回答</text>
-  <text x="760" y="333" text-anchor="middle" class="node-sub" fill="#5f6368">break loop</text>
+  <text x="760" y="313" text-anchor="middle" class="node-title" fill="#ea4335">返回 LoopResult</text>
+  <text x="760" y="333" text-anchor="middle" class="node-sub" fill="#5f6368">final / token / turn budget</text>
 
   <rect x="64" y="506" width="12" height="12" rx="2" fill="#1a73e8"/>
   <text x="82" y="517" font-size="11" fill="#5f6368">主推理路径</text>
@@ -78,5 +78,5 @@
   <text x="188" y="517" font-size="11" fill="#5f6368">工具执行分支</text>
   <rect x="292" y="506" width="12" height="12" rx="2" fill="#ea4335"/>
   <text x="310" y="517" font-size="11" fill="#5f6368">结束分支</text>
-  <text x="820" y="517" text-anchor="end" class="hint">while True: call model -> maybe run tools -> append results</text>
+  <text x="820" y="517" text-anchor="end" class="hint">bounded loop: parse turn -> maybe run tools -> return explicit reason</text>
 </svg>

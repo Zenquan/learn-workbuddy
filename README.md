@@ -72,6 +72,17 @@ pip install -r requirements.txt
 python3 examples/full_tour/code.py
 ```
 
+使用 Conda 管理 Python、uv 管理依赖时：
+
+```bash
+conda env create -f environment.yml
+conda activate learn-workbuddy
+uv sync --python "$CONDA_PREFIX/bin/python" --no-python-downloads
+uv run python examples/full_tour/code.py
+```
+
+环境已存在时，运行 `conda env update -f environment.yml --prune`，激活环境后再执行上面的 `uv sync` 命令即可同步。项目依赖安装在 `.venv`，其 Python 解释器来自 Conda 环境。
+
 这条命令会离线跑完整 harness tour：provider adapter、session、记忆、工具、权限、外部化、JSONL、HTTP、审计和 artifacts 全部走一遍。想按课程学，走 [Learning Guide](./docs/learning-guide.md)；想先看图，走 [Visual Tour](./docs/visual-tour.md)。
 
 ---

@@ -1,69 +1,97 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
   <defs>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#202124"/>
-    </marker>
-    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
       <path d="M0,0 L10,5 L0,10 z" fill="#1a73e8"/>
     </marker>
+    <marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5f6368"/>
+    </marker>
+    <style>
+      .title { font-size: 22px; font-weight: 700; fill: #202124; }
+      .node-title { font-size: 14px; font-weight: 700; }
+      .node-sub { font-size: 11px; }
+      .edge-label { font-size: 10.5px; font-weight: 600; }
+      .hint { font-size: 11px; fill: #5f6368; }
+    </style>
   </defs>
-  <rect width="800" height="500" fill="#f8f9fa"/>
 
-  <text x="400" y="35" text-anchor="middle" font-size="22" font-weight="bold" fill="#202124">工具分发 (Tool Dispatch)</text>
+  <rect width="920" height="560" fill="#f8f9fa"/>
+  <text x="460" y="34" text-anchor="middle" class="title">单一工具注册表：模型协议 ↔ Python 执行</text>
 
-  <!-- Model -->
-  <rect x="300" y="60" width="200" height="50" rx="8" fill="#1a73e8"/>
-  <text x="400" y="85" text-anchor="middle" font-size="15" fill="white" font-weight="bold">LLM 模型输出</text>
-  <text x="400" y="102" text-anchor="middle" font-size="12" fill="#e8f0fe">function_call: {name, args}</text>
+  <!-- Provider input -->
+  <rect x="36" y="82" width="164" height="66" rx="10" fill="#1a73e8"/>
+  <text x="118" y="109" text-anchor="middle" class="node-title" fill="#ffffff">provider tool_use</text>
+  <text x="118" y="130" text-anchor="middle" class="node-sub" fill="#e8f0fe">id · name · input</text>
 
-  <!-- Arrow down -->
-  <line x1="400" y1="110" x2="400" y2="140" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <line x1="200" y1="115" x2="240" y2="115" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
 
-  <!-- Dispatch Map -->
-  <rect x="250" y="145" width="300" height="60" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
-  <text x="400" y="170" text-anchor="middle" font-size="15" font-weight="bold" fill="#1a73e8">TOOL_HANDLERS (分发字典)</text>
-  <text x="400" y="190" text-anchor="middle" font-size="12" fill="#202124">{"read": ReadHandler, "write": WriteHandler, "bash": BashHandler, "grep": GrepHandler}</text>
+  <!-- Normalized call -->
+  <rect x="248" y="82" width="150" height="66" rx="10" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.6"/>
+  <text x="323" y="109" text-anchor="middle" class="node-title" fill="#1a73e8">ToolCall</text>
+  <text x="323" y="130" text-anchor="middle" class="node-sub" fill="#5f6368">provider-neutral</text>
 
-  <!-- Arrows branching -->
-  <line x1="280" y1="205" x2="140" y2="260" stroke="#202124" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <line x1="360" y1="205" x2="310" y2="260" stroke="#202124" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <line x1="440" y1="205" x2="490" y2="260" stroke="#202124" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <line x1="520" y1="205" x2="660" y2="260" stroke="#202124" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="398" y1="115" x2="438" y2="115" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
 
-  <!-- Tools -->
-  <rect x="70" y="265" width="140" height="55" rx="8" fill="#34a853"/>
-  <text x="140" y="288" text-anchor="middle" font-size="14" fill="white" font-weight="bold">Read Tool</text>
-  <text x="140" y="306" text-anchor="middle" font-size="11" fill="white">读取文件</text>
+  <!-- Registry: the single source -->
+  <rect x="446" y="60" width="224" height="110" rx="12" fill="#fff8e1" stroke="#f9ab00" stroke-width="2"/>
+  <text x="558" y="88" text-anchor="middle" class="node-title" fill="#a15c00">ToolRegistry</text>
+  <text x="558" y="110" text-anchor="middle" class="node-sub" fill="#5f6368">name → ToolSpec</text>
+  <line x1="470" y1="122" x2="646" y2="122" stroke="#f9ab00" stroke-width="1"/>
+  <text x="558" y="143" text-anchor="middle" class="node-sub" fill="#5f6368">schema · handler · concurrency policy</text>
 
-  <rect x="240" y="265" width="140" height="55" rx="8" fill="#34a853"/>
-  <text x="310" y="288" text-anchor="middle" font-size="14" fill="white" font-weight="bold">Write Tool</text>
-  <text x="310" y="306" text-anchor="middle" font-size="11" fill="white">写入文件</text>
+  <!-- Schema feedback to model request -->
+  <path d="M558 60 L558 48 L118 48 L118 76" fill="none" stroke="#f9ab00" stroke-width="1.7" stroke-dasharray="5,4" marker-end="url(#arrow-gray)"/>
+  <text x="338" y="43" text-anchor="middle" class="edge-label" fill="#a15c00">model_schemas() 也来自同一注册表</text>
 
-  <rect x="420" y="265" width="140" height="55" rx="8" fill="#34a853"/>
-  <text x="490" y="288" text-anchor="middle" font-size="14" fill="white" font-weight="bold">Bash Tool</text>
-  <text x="490" y="306" text-anchor="middle" font-size="11" fill="white">执行命令</text>
+  <!-- Dispatch stages -->
+  <line x1="558" y1="170" x2="558" y2="202" stroke="#5f6368" stroke-width="2" marker-end="url(#arrow-gray)"/>
 
-  <rect x="590" y="265" width="140" height="55" rx="8" fill="#34a853"/>
-  <text x="660" y="288" text-anchor="middle" font-size="14" fill="white" font-weight="bold">Grep Tool</text>
-  <text x="660" y="306" text-anchor="middle" font-size="11" fill="white">搜索内容</text>
+  <rect x="112" y="214" width="172" height="64" rx="10" fill="#ffffff" stroke="#5f6368" stroke-width="1.5"/>
+  <text x="198" y="240" text-anchor="middle" class="node-title" fill="#202124">1. 名称查找</text>
+  <text x="198" y="260" text-anchor="middle" class="node-sub" fill="#5f6368">registry.get(name)</text>
 
-  <!-- Concurrent execution -->
-  <text x="400" y="355" text-anchor="middle" font-size="13" fill="#202124" font-style="italic">并发执行 (concurrent execution)</text>
+  <rect x="374" y="214" width="172" height="64" rx="10" fill="#ffffff" stroke="#5f6368" stroke-width="1.5"/>
+  <text x="460" y="240" text-anchor="middle" class="node-title" fill="#202124">2. 参数校验</text>
+  <text x="460" y="260" text-anchor="middle" class="node-sub" fill="#5f6368">required · type · extra</text>
 
-  <!-- Arrows down -->
-  <line x1="140" y1="320" x2="140" y2="370" stroke="#202124" stroke-width="1" stroke-dasharray="4,3"/>
-  <line x1="310" y1="320" x2="310" y2="370" stroke="#202124" stroke-width="1" stroke-dasharray="4,3"/>
-  <line x1="490" y1="320" x2="490" y2="370" stroke="#202124" stroke-width="1" stroke-dasharray="4,3"/>
-  <line x1="660" y1="320" x2="660" y2="370" stroke="#202124" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="636" y="214" width="172" height="64" rx="10" fill="#ffffff" stroke="#5f6368" stroke-width="1.5"/>
+  <text x="722" y="240" text-anchor="middle" class="node-title" fill="#202124">3. Handler 执行</text>
+  <text x="722" y="260" text-anchor="middle" class="node-sub" fill="#5f6368">validated **arguments</text>
 
-  <!-- Results collection -->
-  <rect x="100" y="375" width="600" height="45" rx="8" fill="#fbbc04"/>
-  <text x="400" y="402" text-anchor="middle" font-size="14" fill="#202124" font-weight="bold">结果收集 (Results Collection)</text>
+  <line x1="284" y1="246" x2="366" y2="246" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <line x1="546" y1="246" x2="628" y2="246" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <path d="M558 202 L558 190 L198 190 L198 206" fill="none" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
 
-  <!-- Arrow down to return -->
-  <line x1="400" y1="420" x2="400" y2="450" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <!-- Success/error paths converge -->
+  <rect x="636" y="322" width="172" height="62" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.6"/>
+  <text x="722" y="348" text-anchor="middle" class="node-title" fill="#188038">成功结果</text>
+  <text x="722" y="369" text-anchor="middle" class="node-sub" fill="#5f6368">content</text>
+  <line x1="722" y1="278" x2="722" y2="314" stroke="#34a853" stroke-width="2" marker-end="url(#arrow-gray)"/>
 
-  <!-- Return to model -->
-  <rect x="280" y="455" width="240" height="35" rx="8" fill="#1a73e8"/>
-  <text x="400" y="477" text-anchor="middle" font-size="13" fill="white">tool_result → 返回模型继续推理</text>
+  <rect x="112" y="322" width="434" height="62" rx="10" fill="#fce8e6" stroke="#ea4335" stroke-width="1.6"/>
+  <text x="329" y="347" text-anchor="middle" class="node-title" fill="#c5221f">显式错误结果</text>
+  <text x="329" y="369" text-anchor="middle" class="node-sub" fill="#5f6368">unknown_tool · invalid_arguments · execution_error</text>
+  <path d="M198 278 L198 314" fill="none" stroke="#ea4335" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <path d="M460 278 L460 314" fill="none" stroke="#ea4335" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <path d="M680 278 L580 306 L546 330" fill="none" stroke="#ea4335" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-gray)"/>
+
+  <!-- Unified local result -->
+  <rect x="344" y="424" width="232" height="66" rx="12" fill="#f3e8fd" stroke="#a142f4" stroke-width="1.8"/>
+  <text x="460" y="451" text-anchor="middle" class="node-title" fill="#7627bb">ToolDispatchResult</text>
+  <text x="460" y="472" text-anchor="middle" class="node-sub" fill="#5f6368">ok / error_code / content</text>
+  <path d="M329 384 L329 405 L424 418" fill="none" stroke="#a142f4" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <path d="M722 384 L722 405 L496 418" fill="none" stroke="#a142f4" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Back to provider -->
+  <line x1="576" y1="457" x2="630" y2="457" stroke="#1a73e8" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+  <rect x="638" y="424" width="224" height="66" rx="10" fill="#1a73e8"/>
+  <text x="750" y="451" text-anchor="middle" class="node-title" fill="#ffffff">provider tool_result</text>
+  <text x="750" y="472" text-anchor="middle" class="node-sub" fill="#e8f0fe">content + optional is_error</text>
+
+  <!-- Concurrency note -->
+  <rect x="54" y="426" width="238" height="60" rx="10" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.2" stroke-dasharray="5,3"/>
+  <text x="173" y="451" text-anchor="middle" class="node-title" fill="#1a73e8">批量执行策略</text>
+  <text x="173" y="472" text-anchor="middle" class="node-sub" fill="#5f6368">全员 concurrent_safe 才并发</text>
+
+  <text x="460" y="535" text-anchor="middle" class="hint">Agent Loop 只看 ToolCall 与 ToolDispatchResult，不知道具体工具实现</text>
 </svg>

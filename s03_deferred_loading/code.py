@@ -1,60 +1,55 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-"""
-s03_deferred_loading.py - Deferred Tool Loading
+"""s03_deferred_loading.py - discover, load, then execute deferred tools.
 
-Two-step pattern: ToolSearch → DeferExecuteTool
+s02 made one registry the source of truth for model schemas and handlers.  This
+lesson keeps that invariant and adds a visibility policy on top:
 
-    ┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
-    │ Model needs │────►│  ToolSearch  │────►│  Schema loaded   │
-    │  a tool     │     │  (by name)   │     │  into context    │
-    └─────────────┘     └──────────────┘     └────────┬─────────┘
-                                                    │
-    ┌─────────────┐     ┌──────────────┐            │
-    │ Tool result │◄────│ DeferExecute │◄───────────┘
-    │             │     │    Tool      │
-    └─────────────┘     └──────────────┘
+    compact directory -> ToolSearch -> loaded schema -> DeferExecuteTool
 
-Problem:  dozens of tools x ~1000 tokens/schema = tens of thousands of tokens just for
-          tool descriptions. That's 20% of a 200K context window.
-
-Solution: Tools marked deferLoading=true only have their name + brief
-          description loaded at startup. When the model needs the tool,
-          it calls ToolSearch to get the full schema, then
-          DeferExecuteTool to execute.
-
-This is like dynamic linking vs static linking:
-  - Static linking: load all code at startup (slow, memory-heavy)
-  - Dynamic linking: load code on demand (fast startup, efficient)
+The catalog is static on purpose.  Deferred loading controls what enters one
+model session; it is not a dynamic plugin installer.  The mock conversation is
+offline so the complete data flow can be inspected without an API key.
 
 Usage:
     python s03_deferred_loading/code.py
-
-No API key needed — uses a mock LLM with predefined responses.
 """
 
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import re
+import textwrap
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
 
 
-# Machine-readable learning path metadata. Tests enforce that every
-# chapter declares what it inherits and what it adds.
-PROGRESSION = {'chapter': 's03_deferred_loading',
- 'builds_on': ['s02_tool_dispatch'],
- 'adds': ['ToolSearch', 'DeferExecuteTool', 'lazy schema loading'],
- 'preserves': ['tool registry and dispatch']}
+# Machine-readable learning path metadata. Tests enforce that every chapter
+# declares what it inherits and what it adds.
+PROGRESSION = {
+    "chapter": "s03_deferred_loading",
+    "builds_on": ["s02_tool_dispatch"],
+    "adds": [
+        "compact deferred tool directory",
+        "deterministic tool discovery",
+        "session-scoped schema loading",
+    ],
+    "preserves": ["single-source tool registry", "dispatch boundary"],
+}
 
-# Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
+# Shared learning entrypoints: --demo is offline; --provider deepseek configures
+# a real API environment before this standalone lesson loads.
 import sys as _wb_sys
 from pathlib import Path as _wb_Path
+
 _WB_ROOT = _wb_Path(__file__).resolve().parents[1]
 if str(_WB_ROOT) not in _wb_sys.path:
     _wb_sys.path.insert(0, str(_WB_ROOT))
 from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_chapter_demo
+
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
-import argparse
-import json
-import textwrap
-from dataclasses import dataclass, field
-from typing import Any, Callable
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -66,88 +61,186 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def schema_tokens(schema: dict) -> int:
+def schema_tokens(schema: Mapping[str, Any]) -> int:
     """Estimate tokens for a tool schema (name + description + input_schema)."""
+
     return estimate_tokens(json.dumps(schema, ensure_ascii=False))
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Tool Registry
+# Tool Catalog and Session Loading State
 # ═══════════════════════════════════════════════════════════════════
 
-@dataclass
-class ToolEntry:
-    """A registered tool with its schema, handler, and loading mode."""
-    name: str
-    schema: dict
-    handler: Callable
-    defer: bool                       # True = deferred (lazy) loading
-    description: str = ""             # Brief description for the directory
-    _schema_loaded: bool = field(default=False, repr=False)
-                                     # Tracks if schema has been loaded this session
+ToolHandler = Callable[..., str]
 
-    def __post_init__(self):
-        if not self.description:
-            self.description = self.schema.get("description", "")[:120]
+
+@dataclass(frozen=True)
+class ToolEntry:
+    """One immutable source for a tool's directory row, schema, and handler."""
+
+    name: str
+    description: str
+    input_schema: Mapping[str, Any]
+    handler: ToolHandler | None
+    defer: bool  # True = expose only the directory row until ToolSearch loads it.
+
+    def model_schema(self) -> dict[str, Any]:
+        """Build a detached provider schema from the same entry used to execute."""
+
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": copy.deepcopy(dict(self.input_schema)),
+        }
 
     @property
     def full_schema_tokens(self) -> int:
-        return schema_tokens(self.schema)
+        return schema_tokens(self.model_schema())
 
     @property
     def directory_tokens(self) -> int:
         """Tokens for just name + brief description (the 'symbol table' entry)."""
+
         return estimate_tokens(f"{self.name}: {self.description}")
 
 
+@dataclass(frozen=True)
+class ToolMatch:
+    """A stable search hit plus the schema that was loaded for this session."""
+
+    name: str
+    score: int
+    schema: Mapping[str, Any]
+    cache_hit: bool
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return a model-readable result without exposing the catalog's schema."""
+
+        return {
+            "name": self.name,
+            "score": self.score,
+            "load_state": "cached" if self.cache_hit else "loaded",
+            "schema": copy.deepcopy(dict(self.schema)),
+        }
+
+
+@dataclass(frozen=True)
+class ToolSearchResult:
+    """The complete, inspectable outcome of one ToolSearch call."""
+
+    matches: tuple[ToolMatch, ...] = ()
+    missing: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.matches)
+
+    def render(self) -> str:
+        """Encode success and misses as data the model can reason about."""
+
+        lines: list[str] = []
+        for match in self.matches:
+            state = "cache hit" if match.cache_hit else "schema loaded"
+            lines.append(
+                f"✓ {match.name}: {state} ({schema_tokens(match.schema)} tokens, "
+                f"score={match.score})"
+            )
+            lines.append(json.dumps(match.to_payload(), indent=2, ensure_ascii=False))
+        lines.extend(f"✗ {name}: deferred tool not found" for name in self.missing)
+        return "\n".join(lines) or "No deferred tools matched the request."
+
+
 class ToolRegistry:
-    """
-    Manages both immediate and deferred tools.
+    """Own tool definitions and one session's deferred-schema activation state.
 
     - Immediate tools: full schema always in context
-    - Deferred tools: only name + brief description in context;
-      full schema loaded on demand via ToolSearch
+    - Deferred tools: compact directory row at startup, full schema after search
+
+    Search and execution both resolve this same registry.  There is no second
+    plugin map that can drift away from the model-visible contract.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._tools: dict[str, ToolEntry] = {}
-        # Cache: schemas loaded via ToolSearch in this session
-        self._loaded_schemas: dict[str, dict] = {}
+        # This cache is session state: it answers which schemas ToolSearch has
+        # already placed in the transcript, not which tools exist globally.
+        self._loaded_schemas: dict[str, dict[str, Any]] = {}
 
     # -- Registration --
 
-    def register(self, name: str, schema: dict, handler: Callable,
-                 defer: bool = False, description: str = "") -> None:
-        """Register a tool as immediate or deferred."""
-        entry = ToolEntry(
-            name=name, schema=schema, handler=handler,
-            defer=defer, description=description,
+    def register(
+        self,
+        name: str,
+        schema: Mapping[str, Any],
+        handler: ToolHandler | None,
+        defer: bool = False,
+        description: str = "",
+    ) -> None:
+        """Register one complete definition and reject ambiguous names early."""
+
+        if not name:
+            raise ValueError("tool name must not be empty")
+        if name in self._tools:
+            raise ValueError(f"duplicate tool name: {name}")
+        schema_name = schema.get("name")
+        if schema_name != name:
+            raise ValueError(f"schema name {schema_name!r} does not match tool name {name!r}")
+        input_schema = schema.get("input_schema")
+        if not isinstance(input_schema, Mapping) or input_schema.get("type") != "object":
+            raise ValueError(f"tool {name} must declare an object input schema")
+
+        # Own a deep snapshot so later edits to the source constant cannot change
+        # search results or the execution contract halfway through a session.
+        self._tools[name] = ToolEntry(
+            name=name,
+            description=description or str(schema.get("description", "")),
+            input_schema=copy.deepcopy(dict(input_schema)),
+            handler=handler,
+            defer=defer,
         )
-        self._tools[name] = entry
 
     # -- Accessors --
 
-    def get_immediate_schemas(self) -> list[dict]:
+    def get_immediate_schemas(self) -> list[dict[str, Any]]:
         """Full schemas for all immediate tools (always in context)."""
-        return [t.schema for t in self._tools.values() if not t.defer]
+
+        return [entry.model_schema() for entry in self._tools.values() if not entry.defer]
 
     def get_deferred_directory(self) -> str:
-        """
-        Compact directory of deferred tools: name + one-line description.
+        """Render the compact startup directory: name plus one-line purpose.
+
         This is what the model sees instead of full schemas.
         """
-        lines = []
-        for t in self._tools.values():
-            if t.defer:
-                lines.append(f"  - {t.name}: {t.description}")
-        return "\n".join(lines)
+
+        return "\n".join(
+            f"  - {entry.name}: {entry.description}"
+            for entry in self._tools.values()
+            if entry.defer
+        )
 
     def get_deferred_names(self) -> list[str]:
         """Names of all deferred tools."""
-        return [t.name for t in self._tools.values() if t.defer]
 
-    def get_handler(self, name: str) -> Callable | None:
+        return [entry.name for entry in self._tools.values() if entry.defer]
+
+    def get_immediate_names(self) -> list[str]:
+        """Names whose full schemas are visible from the first model turn."""
+
+        return [entry.name for entry in self._tools.values() if not entry.defer]
+
+    def get_loaded_names(self) -> tuple[str, ...]:
+        """Expose session activation without leaking the mutable cache."""
+
+        return tuple(self._loaded_schemas)
+
+    def loaded_schema_tokens(self) -> int:
+        """Return the incremental context cost created by ToolSearch calls."""
+
+        return sum(schema_tokens(schema) for schema in self._loaded_schemas.values())
+
+    def get_handler(self, name: str) -> ToolHandler | None:
         """Get the handler for a tool (works for both immediate and deferred)."""
+
         entry = self._tools.get(name)
         return entry.handler if entry else None
 
@@ -155,63 +248,82 @@ class ToolRegistry:
         entry = self._tools.get(name)
         return entry.defer if entry else False
 
-    # -- ToolSearch: load deferred schema on demand --
+    # -- ToolSearch: discover and load deferred schemas on demand --
 
-    def load_deferred_schema(self, tool_names: list[str]) -> list[dict]:
-        """
-        Load full schemas for deferred tools by name.
-        This is what ToolSearch calls internally.
-        """
-        results = []
-        for name in tool_names:
+    def load_by_name(self, tool_names: Iterable[str]) -> ToolSearchResult:
+        """Resolve exact deferred names, loading each full schema once."""
+
+        matches: list[ToolMatch] = []
+        missing: list[str] = []
+        # Preserve caller order but collapse duplicate requests.  A repeated name
+        # should not create repeated transcript payloads in the same result.
+        for name in dict.fromkeys(tool_names):
             entry = self._tools.get(name)
-            if entry is None:
-                results.append({"error": f"Tool not found: {name}"})
+            if entry is None or not entry.defer:
+                missing.append(name)
                 continue
-            if not entry.defer:
-                # Already loaded as immediate — return it anyway
-                results.append(entry.schema)
-                continue
-            # Mark as loaded (cache)
-            if name not in self._loaded_schemas:
-                self._loaded_schemas[name] = entry.schema
-                entry._schema_loaded = True
-            results.append(entry.schema)
-        return results
+            matches.append(self._load_match(entry, score=100))
+        return ToolSearchResult(tuple(matches), tuple(missing))
 
-    def search_by_query(self, queries: list[str], top_k: int = 3) -> list[dict]:
+    def search(self, queries: Iterable[str], top_k: int = 3) -> ToolSearchResult:
+        """Rank deferred tools deterministically, then load only the top matches.
+
+        This deliberately small scorer is inspectable teaching code, not a claim
+        to replace a production BM25/vector index.  Exact name matches dominate,
+        name-token matches outrank description matches, and name breaks score ties.
         """
-        Fuzzy search deferred tools by keyword.
-        Simple substring matching (WorkBuddy uses MiniSearch).
-        """
-        scored: list[tuple[int, ToolEntry]] = []
+
+        if top_k < 1:
+            raise ValueError("top_k must be at least 1")
+        terms = _search_terms(queries)
+        if not terms:
+            return ToolSearchResult(missing=("<empty query>",))
+
+        ranked: list[tuple[int, str, ToolEntry]] = []
         for entry in self._tools.values():
             if not entry.defer:
                 continue
-            score = 0
-            haystack = (entry.name + " " + entry.description).lower()
-            for q in queries:
-                if q.lower() in haystack:
-                    score += len(q)  # longer match = higher score
-            if score > 0:
-                scored.append((score, entry))
-        scored.sort(key=lambda x: -x[0])
-        return [entry.schema for _, entry in scored[:top_k]]
+            score = _match_score(entry, terms)
+            if score:
+                ranked.append((score, entry.name, entry))
+
+        # The explicit secondary key makes equal-score output independent of
+        # registration or dictionary order, which keeps traces and tests stable.
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        if not ranked:
+            return ToolSearchResult(missing=(" ".join(terms),))
+        matches = tuple(
+            self._load_match(entry, score)
+            for score, _name, entry in ranked[:top_k]
+        )
+        return ToolSearchResult(matches=matches)
+
+    def _load_match(self, entry: ToolEntry, score: int) -> ToolMatch:
+        cache_hit = entry.name in self._loaded_schemas
+        if not cache_hit:
+            self._loaded_schemas[entry.name] = entry.model_schema()
+        return ToolMatch(
+            name=entry.name,
+            score=score,
+            schema=copy.deepcopy(self._loaded_schemas[entry.name]),
+            cache_hit=cache_hit,
+        )
 
     # -- Token Accounting --
 
-    def token_report(self) -> dict:
+    def token_report(self) -> dict[str, int]:
         """Calculate token usage for immediate vs deferred vs full loading."""
+
         immediate_tokens = sum(
-            t.full_schema_tokens for t in self._tools.values() if not t.defer
+            entry.full_schema_tokens for entry in self._tools.values() if not entry.defer
         )
         deferred_dir_tokens = sum(
-            t.directory_tokens for t in self._tools.values() if t.defer
+            entry.directory_tokens for entry in self._tools.values() if entry.defer
         )
-        full_tokens = sum(t.full_schema_tokens for t in self._tools.values())
+        full_tokens = sum(entry.full_schema_tokens for entry in self._tools.values())
         return {
-            "immediate_tools": sum(1 for t in self._tools.values() if not t.defer),
-            "deferred_tools": sum(1 for t in self._tools.values() if t.defer),
+            "immediate_tools": sum(1 for entry in self._tools.values() if not entry.defer),
+            "deferred_tools": sum(1 for entry in self._tools.values() if entry.defer),
             "immediate_tokens": immediate_tokens,
             "deferred_dir_tokens": deferred_dir_tokens,
             "full_load_tokens": full_tokens,
@@ -222,6 +334,36 @@ class ToolRegistry:
                 / max(full_tokens, 1) * 100
             ),
         }
+
+
+def _search_terms(queries: Iterable[str]) -> tuple[str, ...]:
+    """Normalize free text into unique lowercase terms in caller order."""
+
+    terms = (
+        term
+        for query in queries
+        for term in re.findall(r"[a-z0-9]+", query.lower().replace("_", " "))
+    )
+    return tuple(dict.fromkeys(terms))
+
+
+def _match_score(entry: ToolEntry, terms: tuple[str, ...]) -> int:
+    """Score exact names, name tokens, then description tokens."""
+
+    name = entry.name.lower()
+    name_terms = set(name.replace("_", " ").split())
+    description_terms = set(re.findall(r"[a-z0-9]+", entry.description.lower()))
+    score = 0
+    if "_".join(terms) == name or " ".join(terms) == name:
+        score += 100
+    for term in terms:
+        if term in name_terms:
+            score += 20
+        elif term in name:
+            score += 10
+        if term in description_terms:
+            score += 3
+    return score
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -516,30 +658,13 @@ def handle_tool_search(registry: ToolRegistry,
                        tool_names: list[str] | None = None,
                        queries: list[str] | None = None,
                        top_k: int = 3) -> str:
-    """Execute ToolSearch: load deferred schemas on demand."""
+    """Discover deferred tools and place only matching schemas in the session."""
+
     if tool_names:
-        schemas = registry.load_deferred_schema(tool_names)
-        parts = []
-        for name, schema in zip(tool_names, schemas):
-            if "error" in schema:
-                parts.append(f"✗ {name}: not found")
-            else:
-                tokens = schema_tokens(schema)
-                parts.append(f"✓ {name}: schema loaded ({tokens} tokens)")
-                parts.append(json.dumps(schema, indent=2, ensure_ascii=False))
-        return "\n".join(parts)
+        return registry.load_by_name(tool_names).render()
 
     if queries:
-        schemas = registry.search_by_query(queries, top_k)
-        if not schemas:
-            return f"No tools matched: {queries}"
-        parts = []
-        for schema in schemas:
-            name = schema.get("name", "?")
-            tokens = schema_tokens(schema)
-            parts.append(f"✓ {name}: schema loaded ({tokens} tokens)")
-            parts.append(json.dumps(schema, indent=2, ensure_ascii=False))
-        return "\n".join(parts)
+        return registry.search(queries, top_k).render()
 
     return "Error: provide tool_names or queries."
 
@@ -547,18 +672,25 @@ def handle_tool_search(registry: ToolRegistry,
 def handle_defer_execute(registry: ToolRegistry,
                          toolName: str,
                          params: dict | None = None) -> str:
-    """Execute DeferExecuteTool: run the deferred tool's handler."""
+    """Execute a deferred tool only after ToolSearch exposed its contract."""
+
     params = params or {}
     handler = registry.get_handler(toolName)
     if handler is None:
         return f"Error: Unknown tool '{toolName}'"
-    if registry.is_deferred(toolName) and toolName not in registry._loaded_schemas:
-        return (f"Error: Schema for '{toolName}' not loaded. "
-                f"Call ToolSearch first.")
+    if not registry.is_deferred(toolName):
+        return f"Error: '{toolName}' is immediate; call it directly."
+    if toolName not in registry.get_loaded_names():
+        return (
+            f"Error: Schema for '{toolName}' not loaded. "
+            "Call ToolSearch first."
+        )
     try:
         return handler(**params)
-    except Exception as e:
-        return f"Error executing {toolName}: {e}"
+    except Exception as exc:
+        # Tool failures become observations; one bad handler must not tear down
+        # the surrounding agent loop.
+        return f"Error executing {toolName}: {exc}"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -800,7 +932,7 @@ def main():
     print_separator("Tool Registry Summary")
 
     report = registry.token_report()
-    immediate_names = [t.name for t in registry._tools.values() if not t.defer]
+    immediate_names = registry.get_immediate_names()
     deferred_names = registry.get_deferred_names()
 
     print(f"\n{C_BOLD}Immediate tools ({report['immediate_tools']}):{C_RESET}")
@@ -847,9 +979,7 @@ def main():
     print_separator("Session Summary")
 
     # Recalculate tokens with loaded schemas
-    loaded_schema_tokens = sum(
-        schema_tokens(s) for s in registry._loaded_schemas.values()
-    )
+    loaded_schema_tokens = registry.loaded_schema_tokens()
     final_tokens = report["current_tokens"] + loaded_schema_tokens
     net_saved = report["full_load_tokens"] - final_tokens
 
@@ -876,17 +1006,17 @@ def main():
     # -- OS analogy --
     print_separator("OS Analogy: Dynamic Linking")
     print(f"""
-  {C_BOLD}Static Linking (s02){C_RESET}          {C_BOLD}Dynamic Linking (s04){C_RESET}
+  {C_BOLD}Static Visibility (s02){C_RESET}       {C_BOLD}Deferred Visibility (s03){C_RESET}
   ─────────────────────          ──────────────────────
   All schemas at startup         Only names at startup
   High memory, no lookup         Low memory, dlopen() on demand
   ToolSearch: not needed         ToolSearch: required
   DeferExecuteTool: not needed   DeferExecuteTool: required
 
-  {C_DIM}ToolSearch   = dlopen() — load the library on demand{C_RESET}
-  {C_DIM}DeferExecute = call     — use the loaded library{C_RESET}
-  {C_DIM}Schema       = .so file — the actual code{C_RESET}
-  {C_DIM}Tool name    = symbol   — just a name in the symbol table{C_RESET}
+  {C_DIM}ToolSearch   = resolve  — choose and expose a contract{C_RESET}
+  {C_DIM}DeferExecute = call     — use the loaded contract{C_RESET}
+  {C_DIM}Schema       = contract — model-visible invocation rules{C_RESET}
+  {C_DIM}Tool name    = symbol   — compact discovery handle{C_RESET}
 """)
 
     print("下一课: s04 Permission & Hooks — 先划边界, 再给自由\n")

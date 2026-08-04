@@ -1,6 +1,6 @@
 # Progression Contract
 
-本教程的代码不是 24 个孤立 demo，而是一条类似 learn-claude-code 的渐进学习路径：每章继承上一章的稳定边界，只新增一个主要机制。`tests/test_project_structure.py` 会检查每个 `code.py` 都声明 `PROGRESSION` 元数据。
+本教程的代码不是 24 个孤立 demo，而是一条围绕桌面 Agent Harness 展开的渐进学习路径：每章继承上一章的稳定边界，只新增一个主要机制。`tests/test_project_structure.py` 会检查每个 `code.py` 都声明 `PROGRESSION` 元数据。
 
 ## 机器可检查规则
 
@@ -16,8 +16,8 @@
 |---|---|---|---|
 | `s01_agent_loop` | 起点 | minimal agent loop<br>single bash tool<br>tool_use/tool_result feedback | interactive CLI |
 | `s02_tool_dispatch` | s01_agent_loop | tool dispatch map<br>read/write/edit/glob tools<br>workspace path guard | same agent loop shape |
-| `s03_deferred_loading` | s02_tool_dispatch | ToolSearch<br>DeferExecuteTool<br>lazy schema loading | tool registry and dispatch |
-| `s04_permission_hooks` | s03_deferred_loading | pre-tool permission gates<br>hook lifecycle<br>audit hook point | multi-tool execution boundary |
+| `s03_deferred_loading` | s02_tool_dispatch | compact deferred tool directory<br>deterministic tool discovery<br>session-scoped schema loading | single-source tool registry<br>dispatch boundary |
+| `s04_permission_hooks` | s03_deferred_loading | allow/ask/deny decisions<br>workspace path scope<br>separate user approval<br>auditable execution outcomes | multi-tool execution boundary<br>hook lifecycle |
 | `s05_electron_shell` | s04_permission_hooks | main/renderer/preload split<br>IPC bridge<br>process isolation | agent request boundary |
 | `s06_sidecar_server` | s05_electron_shell | sidecar control plane<br>JSON-RPC routing<br>ring buffer logs | desktop process boundary |
 | `s07_session_management` | s06_sidecar_server | session lifecycle<br>ACP-like HTTP endpoints<br>PTY/pipe model | sidecar-managed runtime |

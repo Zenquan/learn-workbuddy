@@ -12,8 +12,8 @@
 
 ## 教学 harness 已经保护的东西
 
-- **明显危险命令**：Gate 1 和 Gate 2 会拦截首 token 是 `rm`、`sudo`、`shutdown`、`mkfs`、`dd` 等命令，以及写入根路径的文件操作。见 `s04_permission_hooks` 和 `mini_workbuddy/tools.py::_check_command`。
-- **工作区路径逃逸**：`read_file` 会解析真实路径，拒绝绝对路径、`..` 穿越和符号链接逃出 session `cwd`。相关测试在 `test_mini_workbuddy.py` 和 `test_security_regressions.py`。
+- **明显危险命令**：S04 会不可覆盖地拒绝 `sudo`、递归强制删除、格式化、关机重启和典型设备写入；其他未证明只读的 shell 命令进入用户审批。`mini_workbuddy` 仍采用更小的首 token deny-list。见 `s04_permission_hooks` 和 `mini_workbuddy/tools.py::_check_command`。
+- **工作区路径逃逸**：S04 的文件工具 policy 与 `mini_workbuddy.read_file` 都会解析真实路径，拒绝绝对外部路径、`..` 穿越和符号链接逃出 workspace/session `cwd`。相关测试在 `test_permission_gates.py`、`test_mini_workbuddy.py` 和 `test_security_regressions.py`。
 - **无法安全解析的命令**：例如不平衡引号。现在会 fail closed，返回拒绝，而不是崩溃或继续执行。
 - **审计链篡改检测**：哈希链能检测历史条目被修改；额外的 head anchor 记录链尾哈希和条目数，用来检测删尾截断。裸哈希链做不到这一点，因为任何合法前缀本身仍是一条合法链。
 - **上下文洪泛**：超过阈值的大工具输出会写入文件，prompt 里只保留预览和指针，避免多 MB 输出挤爆上下文窗口。

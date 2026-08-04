@@ -1,22 +1,19 @@
-"""Unit tests for the s04 permission gates (the security-critical lesson).
+"""Behavior tests for s04's permission governance pipeline.
 
-The s04 chapter teaches the three-gate model (hard deny -> rules -> user
-approval). Its logic was previously only exercised manually because the
-chapter script imports the SDK at module level. With the stub SDK on
-sys.path we can import the chapter and pin the gate behavior offline.
+The lesson separates three questions that are easy to blur together:
 
-These tests double as the chapter's spec:
+1. What does policy decide (allow / ask / deny)?
+2. If policy asks, what did the user approve?
+3. Did the governed tool actually run, fail, or stay blocked?
 
-- what is hard-denied (gate 1),
-- what rules deny or escalate to ask (gate 2),
-- and — just as important for readers — what the simple pattern
-  matching does NOT catch, so nobody mistakes a teaching deny-list
-  for a sandbox.
+The tests also document the chapter boundary: command rules are a useful
+preflight guard, but operating-system isolation is still required in production.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -28,109 +25,221 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def s04():
-    root = ROOT
-    stub_dir = root / "tests" / "stubs"
-    sys.path.insert(0, str(stub_dir))
-    saved = sys.modules.pop("anthropic", None)
-    import os
+    """Import the standalone chapter with the offline Anthropic stub."""
 
-    os.environ.setdefault("MODEL_ID", "offline-test-model")
+    stub_dir = ROOT / "tests" / "stubs"
+    sys.path.insert(0, str(stub_dir))
+    saved_anthropic = sys.modules.pop("anthropic", None)
+    old_model = os.environ.get("MODEL_ID")
+    os.environ["MODEL_ID"] = "offline-test-model"
+    module_name = "s04_permission_hooks_test_module"
     try:
         spec = importlib.util.spec_from_file_location(
-            "s04_permission_hooks_code", root / "s04_permission_hooks" / "code.py"
+            module_name,
+            ROOT / "s04_permission_hooks" / "code.py",
         )
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
+        sys.modules[module_name] = module
         spec.loader.exec_module(module)
         yield module
     finally:
         sys.path.remove(str(stub_dir))
+        sys.modules.pop(module_name, None)
         sys.modules.pop("anthropic", None)
-        if saved is not None:
-            sys.modules["anthropic"] = saved
+        if saved_anthropic is not None:
+            sys.modules["anthropic"] = saved_anthropic
+        if old_model is None:
+            os.environ.pop("MODEL_ID", None)
+        else:
+            os.environ["MODEL_ID"] = old_model
 
 
-# -- Gate 1: hard deny --------------------------------------------------------
+def request(s04, name: str, arguments: object, call_id: str = "call_1"):
+    return s04.ToolRequest(call_id, name, arguments)
+
 
 @pytest.mark.parametrize(
     "command",
-    ["sudo apt install x", "rm -rf / --no-preserve-root", "mkfs.ext4 /dev/sda1", "dd if=/dev/zero"],
-)
-def test_gate1_hard_deny(s04, command: str) -> None:
-    action, reason = s04.check_permission("bash", {"command": command})
-    assert action == "deny"
-    assert "Hard deny" in reason
-
-
-# -- Gate 2: rules ------------------------------------------------------------
-
-def test_gate2_rm_rf_denied_even_in_workspace(s04) -> None:
-    action, _ = s04.check_permission("bash", {"command": "rm -rf ./build"})
-    assert action == "deny"
-
-
-@pytest.mark.parametrize(
-    "command", ["rm old.log", "mv a b", "chmod +x run.sh", "chown user file"]
-)
-def test_gate2_destructive_bash_escalates_to_ask(s04, command: str) -> None:
-    action, _ = s04.check_permission("bash", {"command": command})
-    assert action == "ask"
-
-
-def test_gate2_write_to_absolute_root_denied(s04) -> None:
-    action, _ = s04.check_permission("write_file", {"path": "/etc/hosts", "content": "x"})
-    assert action == "deny"
-
-
-def test_gate2_large_write_escalates_to_ask(s04) -> None:
-    action, _ = s04.check_permission("write_file", {"path": "big.txt", "content": "a" * 6000})
-    assert action == "ask"
-
-
-def test_benign_commands_are_allowed(s04) -> None:
-    for command in ["ls -la", "cat notes.md", "python3 script.py"]:
-        action, reason = s04.check_permission("bash", {"command": command})
-        assert action == "allow", (command, reason)
-
-
-# -- Boundary: what pattern matching does NOT catch ---------------------------
-
-@pytest.mark.parametrize(
-    "command,expected",
     [
-        # Indirection bypasses a command-string deny list. Kept as an
-        # explicit, documented boundary of the lesson (see the s04 README
-        # and docs/security-boundaries.md): pattern matching is a seatbelt,
-        # not a sandbox.
-        ("find . -name '*.tmp' -delete", "allow"),
-        ('sh -c "rm -rf ./x"', "deny"),  # still caught: 'rm -rf' substring survives quoting
-        ("SUDO=1 env true", "allow"),  # \bsudo\b is case-sensitive; SUDO= passes
+        "sudo apt install x",
+        "rm -rf / --no-preserve-root",
+        "rm -fr ./build",
+        "mkfs.ext4 /dev/sda1",
+        "dd if=/dev/zero of=/dev/sda",
     ],
 )
-def test_documented_pattern_matching_boundary(s04, command: str, expected: str) -> None:
-    action, _ = s04.check_permission("bash", {"command": command})
-    assert action == expected
+def test_hard_denies_are_structured_decisions(s04, tmp_path: Path, command: str) -> None:
+    policy = s04.PermissionPolicy(s04.WorkspaceScope(tmp_path))
+
+    decision = policy.decide(request(s04, "bash", {"command": command}))
+
+    assert decision.action is s04.PermissionAction.DENY
+    assert decision.rule_id == "bash.hard_deny"
+    assert decision.reason
 
 
-# -- Hooks wiring --------------------------------------------------------------
+def test_unmatched_tools_fail_closed_with_an_audit_reason(s04, tmp_path: Path) -> None:
+    policy = s04.PermissionPolicy(s04.WorkspaceScope(tmp_path))
 
-def test_pretooluse_permission_hook_blocks_denied_calls(s04) -> None:
-    class Block:
-        name = "bash"
-        input = {"command": "sudo rm -rf /"}
+    decision = policy.decide(request(s04, "send_email", {"to": "a@example.com"}))
 
-    outcome = s04.permission_hook(Block())
-    assert outcome is not None and outcome.startswith("block:")
+    assert decision.action is s04.PermissionAction.DENY
+    assert decision.rule_id == "default.deny"
+    assert "no permission rule matched" in decision.reason
 
 
-def test_hooks_registry_contains_builtin_hooks(s04) -> None:
-    assert s04.permission_hook in s04.HOOKS["PreToolUse"]
-    assert s04.audit_hook in s04.HOOKS["PreToolUse"]
-    assert s04.output_size_hook in s04.HOOKS["PostToolUse"]
+def test_path_scope_allows_inside_and_denies_escape(s04, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (workspace / "notes.md").write_text("hello", encoding="utf-8")
+    (workspace / "link").symlink_to(outside, target_is_directory=True)
+    policy = s04.PermissionPolicy(s04.WorkspaceScope(workspace))
+
+    inside = policy.decide(request(s04, "read_file", {"path": "notes.md"}))
+    traversal = policy.decide(request(s04, "read_file", {"path": "../outside/secret"}))
+    absolute = policy.decide(request(s04, "write_file", {"path": "/etc/hosts", "content": "x"}))
+    symlink = policy.decide(request(s04, "write_file", {"path": "link/new.txt", "content": "x"}))
+
+    assert inside.action is s04.PermissionAction.ALLOW
+    for decision in [traversal, absolute, symlink]:
+        assert decision.action is s04.PermissionAction.DENY
+        assert decision.rule_id == "path.outside_workspace"
+        assert "workspace" in decision.reason
+
+
+def test_policy_only_decides_and_never_prompts(s04, tmp_path: Path, monkeypatch) -> None:
+    policy = s04.PermissionPolicy(s04.WorkspaceScope(tmp_path))
+    monkeypatch.setattr("builtins.input", lambda _prompt: pytest.fail("policy prompted"))
+
+    decision = policy.decide(
+        request(s04, "write_file", {"path": "notes.md", "content": "hello"})
+    )
+
+    assert decision.action is s04.PermissionAction.ASK
+    assert decision.rule_id == "path.write_requires_approval"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected", "rule_id"),
+    [
+        ("ls -la", "ASK", "bash.requires_approval"),
+        ("git diff --stat", "ASK", "bash.requires_approval"),
+        ("cat /etc/passwd", "ASK", "bash.requires_approval"),
+        ("python3 script.py", "ASK", "bash.requires_approval"),
+        ("rm old.log", "ASK", "bash.requires_approval"),
+        ("ls > files.txt", "ASK", "bash.requires_approval"),
+    ],
+)
+def test_shell_policy_never_claims_path_safety_from_the_first_token(
+    s04,
+    tmp_path: Path,
+    command: str,
+    expected: str,
+    rule_id: str,
+) -> None:
+    policy = s04.PermissionPolicy(s04.WorkspaceScope(tmp_path))
+
+    decision = policy.decide(request(s04, "bash", {"command": command}))
+
+    assert decision.action.name == expected
+    assert decision.rule_id == rule_id
+
+
+def test_approval_resolution_is_separate_and_deny_cannot_be_overridden(
+    s04,
+    tmp_path: Path,
+) -> None:
+    policy = s04.PermissionPolicy(s04.WorkspaceScope(tmp_path))
+    asked: list[str] = []
+    ask_decision = policy.decide(
+        request(s04, "write_file", {"path": "notes.md", "content": "hello"})
+    )
+
+    approved = s04.resolve_permission(
+        ask_decision,
+        lambda decision: asked.append(decision.rule_id) or True,
+    )
+    rejected = s04.resolve_permission(ask_decision, lambda _decision: False)
+    cancelled = s04.resolve_permission(
+        ask_decision,
+        lambda _decision: (_ for _ in ()).throw(RuntimeError("approval UI closed")),
+    )
+    denied = s04.resolve_permission(
+        policy.decide(request(s04, "unknown", {})),
+        lambda _decision: pytest.fail("deny must not ask for approval"),
+    )
+
+    assert approved.allowed is True
+    assert approved.approval_status is s04.ApprovalStatus.APPROVED
+    assert rejected.allowed is False
+    assert rejected.approval_status is s04.ApprovalStatus.REJECTED
+    assert cancelled.allowed is False
+    assert cancelled.approval_status is s04.ApprovalStatus.CANCELLED
+    assert denied.allowed is False
+    assert denied.approval_status is s04.ApprovalStatus.NOT_REQUIRED
+    assert asked == ["path.write_requires_approval"]
+
+
+def test_governed_runner_records_decision_reason_and_execution_result(
+    s04,
+    tmp_path: Path,
+) -> None:
+    audit = s04.AuditTrail()
+    hooks = s04.build_hooks(audit)
+    writes: list[tuple[str, str]] = []
+    runner = s04.GovernedToolRunner(
+        policy=s04.PermissionPolicy(s04.WorkspaceScope(tmp_path)),
+        handlers={
+            "write_file": lambda path, content: writes.append((path, content)) or "written",
+        },
+        approver=lambda _decision: True,
+        hooks=hooks,
+    )
+
+    result = runner.run(
+        request(s04, "write_file", {"path": "notes.md", "content": "hello"})
+    )
+
+    assert result.status is s04.ToolExecutionStatus.SUCCEEDED
+    assert result.content == "written"
+    assert writes == [("notes.md", "hello")]
+    decision_record = next(record for record in audit.records if record.event == "permission")
+    result_record = next(record for record in audit.records if record.event == "result")
+    assert decision_record.rule_id == "path.write_requires_approval"
+    assert decision_record.reason == result.permission.decision.reason
+    assert decision_record.outcome == "approved"
+    assert result_record.outcome == "succeeded"
+
+
+def test_blocked_and_failed_execution_are_results_not_control_flow(s04, tmp_path: Path) -> None:
+    audit = s04.AuditTrail()
+    runner = s04.GovernedToolRunner(
+        policy=s04.PermissionPolicy(s04.WorkspaceScope(tmp_path)),
+        handlers={
+            "write_file": lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("disk full")),
+        },
+        approver=lambda _decision: True,
+        hooks=s04.build_hooks(audit),
+    )
+
+    blocked = runner.run(request(s04, "unknown", {}))
+    failed = runner.run(
+        request(s04, "write_file", {"path": "notes.md", "content": "hello"})
+    )
+
+    assert blocked.status is s04.ToolExecutionStatus.BLOCKED
+    assert blocked.to_protocol_block()["is_error"] is True
+    assert "default.deny" in blocked.content
+    assert failed.status is s04.ToolExecutionStatus.FAILED
+    assert failed.to_protocol_block()["is_error"] is True
+    assert "disk full" in failed.content
 
 
 def test_s04_run_bash_reports_os_errors(s04, monkeypatch) -> None:
-    def fake_run(*args, **kwargs):
+    def fake_run(*_args, **_kwargs):
         raise OSError("spawn failed")
 
     monkeypatch.setattr(s04.subprocess, "run", fake_run)

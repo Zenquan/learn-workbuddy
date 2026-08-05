@@ -223,7 +223,7 @@ flowchart LR
 | [s04 Permission Hooks](./s04_permission_hooks/) | 先划边界，再给自由 | permission rule / hook evaluator |
 | [s05 Electron Shell](./s05_electron_shell/) | 一个进程不够，要分层 | main / renderer / preload |
 | [s06 Sidecar Server](./s06_sidecar_server/) | 主进程不跑 agent | local RPC / sidecar lifecycle |
-| [s07 Session Management](./s07_session_management/) | 每个会话独立管理 | session create/load/resume |
+| [s07 Session Management](./s07_session_management/) | 逻辑会话可恢复，运行时必须重建 | session create/resume/close |
 | [s08 Model Routing](./s08_model_routing/) | 用模型管理模型成本 | lite / default / craft |
 | [s09 JSONL Transcript](./s09_jsonl_transcript/) | 追加写入，崩溃可恢复 | event log / replay |
 | [s10 Workspace Memory](./s10_workspace_memory/) | 每天的工作要记下来 | append-only workspace log |

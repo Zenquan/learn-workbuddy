@@ -20,7 +20,7 @@
 | `s04_permission_hooks` | s03_deferred_loading | allow/ask/deny decisions<br>workspace path scope<br>separate user approval<br>auditable execution outcomes | multi-tool execution boundary<br>hook lifecycle |
 | `s05_electron_shell` | s04_permission_hooks | main/renderer/preload split<br>IPC bridge<br>process isolation | agent request boundary |
 | `s06_sidecar_server` | s05_electron_shell | sidecar control plane<br>JSON-RPC routing<br>ring buffer logs | desktop process boundary |
-| `s07_session_management` | s06_sidecar_server | session lifecycle<br>ACP-like HTTP endpoints<br>PTY/pipe model | sidecar-managed runtime |
+| `s07_session_management` | s06_sidecar_server | logical session and runtime separation<br>create/resume/close lifecycle<br>ACP-like HTTP boundary | sidecar-managed runtime |
 | `s08_model_routing` | s07_session_management | lite/default/craft routing<br>cost tracking<br>agent-to-model mapping | session runtime context |
 | `s09_jsonl_transcript` | s08_model_routing | append-only JSONL transcript<br>session replay<br>crash recovery | model turn event shape |
 | `s10_workspace_memory` | s09_jsonl_transcript | workspace daily log<br>topic distillation<br>memory injection | append-only persistence |

@@ -1,0 +1,85 @@
+"""S09 transcript evidence and replay-state contracts."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(scope="module")
+def s09():
+    name = "s09_jsonl_transcript_test_module"
+    spec = importlib.util.spec_from_file_location(name, ROOT / "s09_jsonl_transcript" / "code.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    yield module
+    sys.modules.pop(name, None)
+
+
+def test_append_wraps_copied_event_with_monotonic_evidence_envelope(s09, tmp_path: Path) -> None:
+    transcript = s09.JSONLTranscript(tmp_path / "session.jsonl")
+    source = {"type": "message", "role": "user", "content": "hello"}
+    transcript.append(source)
+    transcript.append({"type": "message", "role": "assistant", "content": "hi"})
+
+    records = [json.loads(line) for line in transcript.path.read_text().splitlines()]
+    assert [record["sequence"] for record in records] == [1, 2]
+    assert all(record["schema_version"] == 1 for record in records)
+    assert all(record["recorded_at"].endswith("+00:00") for record in records)
+    assert source == {"type": "message", "role": "user", "content": "hello"}
+
+
+def test_replay_state_is_derived_not_persisted_runtime_state(s09, tmp_path: Path) -> None:
+    transcript = s09.JSONLTranscript(tmp_path / "session.jsonl")
+    transcript.append({"type": "message", "role": "user", "content": "fix it"})
+    transcript.append({"type": "reasoning", "content": "inspect first"})
+    transcript.append({"type": "ai-title", "title": "Fix issue"})
+    state = transcript.replay_state()
+
+    assert isinstance(state, s09.ReplayState)
+    assert state.messages == [{"role": "user", "content": "fix it"}]
+    assert state.title == "Fix issue"
+    assert state.reasoning_count == 1
+    assert state.next_sequence == 4
+    assert "messages" not in transcript.path.read_text()  # no runtime snapshot event
+
+
+def test_fresh_instance_replays_then_continues_sequence(s09, tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    s09.JSONLTranscript(path).append({"type": "message", "role": "user", "content": "one"})
+    replacement = s09.JSONLTranscript(path)
+    assert replacement.replay_state().next_sequence == 2
+    replacement.append({"type": "message", "role": "assistant", "content": "two"})
+    assert [event["sequence"] for event in replacement._read_all_events()] == [1, 2]
+
+
+def test_only_unterminated_corrupt_tail_is_ignored(s09, tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    transcript = s09.JSONLTranscript(path)
+    transcript.append({"type": "message", "role": "user", "content": "safe"})
+    with path.open("ab") as handle:
+        handle.write(b'{"type":')
+    state = transcript.replay_state()
+    assert state.ignored_partial_tail is True
+    assert state.total_events == 1
+
+
+def test_complete_corrupt_record_and_sequence_gap_fail_closed(s09, tmp_path: Path) -> None:
+    corrupt = tmp_path / "corrupt.jsonl"
+    corrupt.write_text("{broken}\n", encoding="utf-8")
+    with pytest.raises(s09.TranscriptCorruptionError, match="complete JSON"):
+        s09.JSONLTranscript(corrupt).replay_state()
+
+    gap = tmp_path / "gap.jsonl"
+    gap.write_text(json.dumps({"sequence": 2, "type": "message"}) + "\n", encoding="utf-8")
+    with pytest.raises(s09.TranscriptCorruptionError, match="expected sequence 1"):
+        s09.JSONLTranscript(gap).replay_state()

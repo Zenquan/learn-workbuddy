@@ -35,7 +35,7 @@ Usage:
 # chapter declares what it inherits and what it adds.
 PROGRESSION = {'chapter': 's09_jsonl_transcript',
  'builds_on': ['s08_model_routing'],
- 'adds': ['append-only JSONL transcript', 'session replay', 'crash recovery'],
+ 'adds': ['sequenced transcript evidence', 'derived replay state', 'partial-tail recovery'],
  'preserves': ['model turn event shape']}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
@@ -53,6 +53,10 @@ import time
 import hashlib
 import tempfile
 import argparse
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 # --- Constants ---
 
@@ -67,6 +71,28 @@ TYPE_FILE_SNAPSHOT = "file-history-snapshot"
 TYPE_AI_TITLE = "ai-title"
 
 
+class TranscriptCorruptionError(RuntimeError):
+    """A complete persisted record is malformed or out of sequence."""
+
+
+@dataclass(frozen=True)
+class ReplayState:
+    """Ephemeral runtime state derived from immutable transcript evidence.
+
+    This object is safe to discard and rebuild.  It is deliberately not called
+    memory: it belongs to one session and contains no retention or relevance
+    policy.
+    """
+
+    messages: list[dict] = field(default_factory=list)
+    title: str | None = None
+    file_snapshots: list[dict] = field(default_factory=list)
+    total_events: int = 0
+    reasoning_count: int = 0
+    next_sequence: int = 1
+    ignored_partial_tail: bool = False
+
+
 class JSONLTranscript:
     """Append-only JSONL transcript for a single session.
 
@@ -76,32 +102,60 @@ class JSONLTranscript:
     File location: ~/.workbuddy/projects/<workspace>/<session>.jsonl
     """
 
-    def __init__(self, filepath: str):
-        self.filepath = filepath
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    def __init__(self, filepath: str | Path):
+        self.path = Path(filepath)
+        self.filepath = str(self.path)  # compatibility with the original demo
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ignored_partial_tail = False
 
     def append(self, event: dict) -> None:
         """Append one event as a single JSON line. Never overwrite."""
-        if "timestamp" not in event:
-            event["timestamp"] = int(time.time())
-        with open(self.filepath, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        existing = self._read_all_events()
+        sequence = existing[-1]["sequence"] + 1 if existing else 1
+        envelope = {
+            "schema_version": 1,
+            "sequence": sequence,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            **deepcopy(event),
+        }
+        encoded = (json.dumps(envelope, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        descriptor = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            written = os.write(descriptor, encoded)
+            if written != len(encoded):
+                raise OSError(f"short transcript write: {written}/{len(encoded)} bytes")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _read_all_events(self) -> list[dict]:
         """Read all events from the JSONL file."""
-        if not os.path.exists(self.filepath):
+        if not self.path.exists():
             return []
-        events = []
-        with open(self.filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    # Skip corrupted lines (e.g. crash mid-write)
-                    pass
+        events: list[dict] = []
+        lines = self.path.read_text(encoding="utf-8").splitlines(keepends=True)
+        self._ignored_partial_tail = False
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                partial_tail = line_number == len(lines) and not line.endswith("\n")
+                if partial_tail:
+                    self._ignored_partial_tail = True
+                    break
+                raise TranscriptCorruptionError(
+                    f"{self.path.name}:{line_number}: invalid complete JSON record"
+                ) from exc
+            expected = len(events) + 1
+            sequence = event.get("sequence", expected)  # read legacy teaching logs
+            if sequence != expected:
+                raise TranscriptCorruptionError(
+                    f"{self.path.name}:{line_number}: expected sequence {expected}, got {sequence}"
+                )
+            event.setdefault("sequence", sequence)
+            events.append(event)
         return events
 
     def replay(self, max_items: int = SESSION_MAX_ITEMS) -> list[dict]:
@@ -125,6 +179,35 @@ class JSONLTranscript:
                 messages.append(msg)
         return messages
 
+    def replay_state(self, max_items: int = SESSION_MAX_ITEMS) -> ReplayState:
+        """Fold evidence into disposable state for a replacement runtime."""
+        events = self._read_all_events()
+        recent = events[-max_items:]
+        messages = [
+            message
+            for event in recent
+            if (message := self._event_to_message(event)) is not None
+        ]
+        title = None
+        snapshots: list[dict] = []
+        reasoning_count = 0
+        for event in events:
+            if event.get("type") == TYPE_AI_TITLE:
+                title = event.get("title")
+            elif event.get("type") == TYPE_FILE_SNAPSHOT:
+                snapshots.append({"path": event.get("path"), "hash": event.get("hash")})
+            elif event.get("type") == TYPE_REASONING:
+                reasoning_count += 1
+        return ReplayState(
+            messages=messages,
+            title=title,
+            file_snapshots=snapshots,
+            total_events=len(events),
+            reasoning_count=reasoning_count,
+            next_sequence=len(events) + 1,
+            ignored_partial_tail=self._ignored_partial_tail,
+        )
+
     def recover(self) -> dict:
         """Simulate crash recovery: open file, replay, reconstruct state.
 
@@ -132,33 +215,16 @@ class JSONLTranscript:
         This is what happens when a session process crashes and restarts:
         open the JSONL, replay everything, pick up where we left off.
         """
-        events = self._read_all_events()
-        messages = self.replay()
-
-        # Extract metadata (non-message events)
-        title = None
-        file_snapshots = []
-        reasoning_count = 0
-
-        for event in events:
-            etype = event.get("type")
-            if etype == TYPE_AI_TITLE:
-                title = event.get("title")
-            elif etype == TYPE_FILE_SNAPSHOT:
-                file_snapshots.append({
-                    "path": event.get("path"),
-                    "hash": event.get("hash"),
-                })
-            elif etype == TYPE_REASONING:
-                reasoning_count += 1
-
+        state = self.replay_state()
         return {
-            "messages": messages,
-            "title": title,
-            "file_snapshots": file_snapshots,
-            "total_events": len(events),
-            "message_count": len(messages),
-            "reasoning_count": reasoning_count,
+            "messages": state.messages,
+            "title": state.title,
+            "file_snapshots": state.file_snapshots,
+            "total_events": state.total_events,
+            "message_count": len(state.messages),
+            "reasoning_count": state.reasoning_count,
+            "next_sequence": state.next_sequence,
+            "ignored_partial_tail": state.ignored_partial_tail,
         }
 
     @staticmethod

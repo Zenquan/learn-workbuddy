@@ -16,7 +16,7 @@
 
   <!-- Title -->
   <text x="400" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#202124">JSONL 对话持久化</text>
-  <text x="400" y="60" text-anchor="middle" font-size="13" fill="#5f6368">每行一条 JSON 记录，append-only 追加写入</text>
+  <text x="400" y="60" text-anchor="middle" font-size="13" fill="#5f6368">带 sequence 的证据只追加，ReplayState 随时可重建</text>
 
   <!-- ===== File container ===== -->
   <rect x="60" y="85" width="460" height="390" rx="10" fill="#ffffff" stroke="#1a73e8" stroke-width="2"/>
@@ -90,8 +90,8 @@
   <!-- Replay arrow -->
   <path d="M 610 348 Q 580 365, 610 388" fill="none" stroke="#ea4335" stroke-width="2.5" marker-end="url(#arrow-red)"/>
   <text x="665" y="360" text-anchor="middle" font-size="11" fill="#5f6368">从 JSONL 重放</text>
-  <text x="665" y="378" text-anchor="middle" font-size="11" fill="#5f6368">逐行重建状态</text>
-  <text x="665" y="396" text-anchor="middle" font-size="11" font-weight="600" fill="#ea4335">replay → 恢复</text>
+  <text x="665" y="378" text-anchor="middle" font-size="11" fill="#5f6368">校验 sequence / 完整行</text>
+  <text x="665" y="396" text-anchor="middle" font-size="11" font-weight="600" fill="#ea4335">fold → ReplayState</text>
 
   <!-- ===== Right top: Features ===== -->
   <rect x="540" y="85" width="230" height="100" rx="10" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.5"/>

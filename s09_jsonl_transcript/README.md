@@ -1,6 +1,6 @@
-# s09: JSONL Transcript — 对话是流, 追加不覆盖, 崩了能回放
+# s09: JSONL Transcript — 证据只追加，运行时状态可重建
 
-> *"对话是流, 追加不覆盖, 崩了能回放"* — append-only JSONL 会话持久化。
+> *"日志是证据，replay state 是派生结果"* — append-only JSONL 会话持久化。
 >
 > **Harness 层**: 持久化 — 对话的源真相。
 
@@ -12,31 +12,32 @@
 
 ```mermaid
 flowchart LR
-    A["Agent Event"] --> B["JSONL Append"]
-    B --> C["Replay Reader"]
-    C --> D["Recover State"]
-    D --> E["messages[]"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    A["Agent Event"] --> B["sequence + schema envelope"]
+    B --> C["JSONL append + fsync"]
+    C --> D["validated replay fold"]
+    D --> E["ReplayState"]
+    E --> F["replacement runtime"]
+    C -. "immutable evidence" .-> D
 ```
 
 ## 学习前置知识
 
 - JSONL 是一行一个 JSON 事件, 适合追加写入。
 - Transcript 是事实流, SQLite 更适合索引和查询。
-- 崩溃恢复依赖事件边界清楚。
+- 崩溃恢复依赖事件顺序、完整行边界和明确的失败策略。
+- Transcript 是 session 证据，不是跨会话选择性 Memory。
 
 ## 本章抓住的 WorkBuddy-style 机制
 
 - 把用户消息、助手消息、工具调用、工具结果都写成事件。
-- 通过 replay 重建会话上下文。
+- 通过 replay fold 派生可丢弃、可重建的运行时状态。
 - 为 s21 的数据库分工打基础。
 
 ## 常见误区
 
 - 只保存最终回答, 无法复盘工具调用和错误。
 - 把大输出直接写入上下文, 会拖垮后续 prompt。
-- JSONL 乱序或半行写入不处理, 恢复会不可靠。
+- 对任意坏行都静默跳过，会把证据损坏伪装成一次成功恢复。
 ## 问题
 
 s11 解决了"用哪个模型"。现在模型能对话了，但对话内容存哪？
@@ -139,13 +140,17 @@ WorkBuddy 的做法：**对话内容存 JSONL，元数据存 SQLite**。
 
 ```python
 def append(self, event: dict) -> None:
-    if "timestamp" not in event:
-        event["timestamp"] = int(time.time())
-    with open(self.filepath, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    envelope = {
+        "schema_version": 1,
+        "sequence": self.next_sequence(),
+        "recorded_at": utc_now(),
+        **deepcopy(event),
+    }
+    os.write(fd, (json.dumps(envelope) + "\n").encode())
+    os.fsync(fd)
 ```
 
-`"a"` 模式保证：文件不存在就创建，存在就追加到末尾。操作系统级别的原子写入——要么整行写进去，要么一行都不写。崩溃时最多丢最后一行（写了一半的行），不会损坏已有数据。
+`O_APPEND` 保证写入从当前文件末尾开始；单次 `os.write` 避免多个写入者先 seek 到同一偏移。它并不承诺断电时“一整行或零行”，因此 reader 仍必须处理未结束的最后一行。成功返回前执行 `fsync`，让 durable boundary 清楚可测。
 
 这就是 "追加不覆盖" 的含义：**文件只长不缩，已有的行永不改变**。
 
@@ -238,7 +243,15 @@ def recover(self):
     }
 ```
 
-崩溃恢复的关键：**JSONL 文件就是源真相**。不需要 WAL（Write-Ahead Log），不需要事务日志，不需要 binlog。文件本身就是日志。读它就行。
+崩溃恢复的关键：**JSONL 是不可变证据，`ReplayState` 是对证据做 fold 得到的派生状态。** 新进程不会反序列化旧进程里的 client、锁、端口或 abort flag；这些资源必须重新创建。
+
+### 损坏处理为什么只放过 partial tail
+
+最后一行没有换行且 JSON 不完整，通常表示进程在一次 append 中途退出，可以忽略并报告 `ignored_partial_tail=True`。但中间坏行、完整坏行或 sequence 跳号都意味着证据链不再可信，reader 会抛出 `TranscriptCorruptionError`，而不是悄悄继续。
+
+### Transcript 不是 Memory
+
+Transcript 按 session 保存发生过的事件，目标是忠实和可回放；s10 Workspace Memory 则跨 session 选择稳定项目事实，目标是相关性与长期保留。关闭 runtime 不删除 transcript，replay 也不会把 transcript 自动晋升成 memory。
 
 ---
 

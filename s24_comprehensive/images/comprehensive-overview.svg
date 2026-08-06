@@ -21,7 +21,7 @@
   <rect width="1100" height="720" fill="url(#bg)"/>
 
   <text x="550" y="38" text-anchor="middle" class="title">24 课全景：从 Agent Loop 到桌面 Harness</text>
-  <text x="550" y="62" text-anchor="middle" class="subtitle">每个章节只新增一个机制，最终组合成一个可运行、可记忆、可审计、可扩展的 WorkBuddy-style 桌面 Agent</text>
+  <text x="550" y="62" text-anchor="middle" class="subtitle">单章形成稳定契约，综合章负责连线而不改变 loop、permission、transcript 与 memory 语义</text>
 
   <rect x="422" y="92" width="256" height="104" rx="18" fill="#1a73e8"/>
   <text x="550" y="126" text-anchor="middle" font-size="20" font-weight="800" fill="#ffffff">s01 Agent Loop</text>

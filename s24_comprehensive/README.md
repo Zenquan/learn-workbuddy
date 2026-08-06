@@ -1,6 +1,6 @@
 # s24: Comprehensive — 机制很多, 循环一个
 
-> *"机制很多, 循环一个"* — 24 个机制全部围绕同一个 `while True`。
+> *"机制很多，契约只有一份"* — 综合章消费前面章节的稳定边界，不另造一套简化语义。
 >
 > **Harness 层**: 综合 — 循环属于 agent, 机制属于 harness。
 
@@ -12,30 +12,32 @@
 
 ```mermaid
 flowchart LR
-    A["User Request"] --> B["Mini WorkBuddy Runtime"]
-    B --> C["Agent + Tools + Memory"]
-    C --> D["Server/API"]
-    D --> E["Transcript + Audit"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    A["User Request"] --> B["Session Runtime"]
+    B --> C["Prompt + Model Turn"]
+    C --> D{"tool_use blocks?"}
+    D -->|"yes"| E["Registry → Permission → Execute"]
+    E --> F["tool_result + Transcript + Audit"]
+    F --> C
+    D -->|"no"| G["Present Result"]
+    B -. "logical state" .-> H["SQLite + scoped Memory"]
 ```
 
 ## 学习前置知识
 
 - 完整 harness 是多个小机制组合, 不是一个大框架魔法。
 - Python 教学实现复刻的是架构机制, 不是 Electron/Node 源码。
-- 最终 demo 应该能展示端到端数据流和安全边界。
+- 最终 demo 应该能展示端到端数据流、安全边界，以及各章契约没有在集成时退化。
 
 ## 本章抓住的 WorkBuddy-style 机制
 
-- 串起 agent loop、工具、权限、记忆、压缩、SQLite、审计和 HTTP API。
+- 串起 block-driven loop、单一工具注册表、显式权限、作用域记忆、JSONL transcript、SQLite 和审计。
 - 用 clean-room Python 证明 WorkBuddy-style harness 的核心可以从零搭建。
 - 把前 23 章收束成一个可运行 mini WorkBuddy。
 
 ## 常见误区
 
 - 只做聊天界面没有 sidecar/session/memory/audit, 不算 harness。
-- 只堆功能不做验证, 教程无法复现。
+- 单章里是 `ASK`，综合章却自动批准，属于集成语义漂移。
 - 公开表达混淆源码提取和教学实现, 会带来信任和合规风险。
 ## 问题
 
@@ -140,7 +142,7 @@ s24  comprehensive           → 所有机制回到一个循环
 | s07 | Session Mgmt | 每个会话一个子进程 | 循环的生命周期 |
 | s08 | Model Routing | 用 AI 管理 AI | API 调用前, 模型选择 |
 | s09 | JSONL Transcript | 对话写盘追加不覆盖 | 每轮循环后, 持久化 |
-| s10 | Workspace Memory | 每天的工作记下来 | 会话结束后 |
+| s10 | Workspace Memory | 项目事实按 scope 隔离 | 实质工作完成后 |
 | s11 | User Memory | 跨项目偏好放用户级 | Prompt 组装时 |
 | s12 | Cloud Memory | 有些记忆在云端 | Prompt 组装时 |
 | s13 | Output Externalization | 大输出写磁盘留指针 | 工具执行后, 入上下文前 |
@@ -201,9 +203,10 @@ def comprehensive_agent_loop(messages, session):
         # ── 6. Usage Tracking (s21) ──
         db.track_usage(session.id, model, response.usage)
 
-        # ── 7. Check stop ──
+        # ── 7. Inspect normalized content blocks (s01) ──
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
             # ── 8. Result Presentation (s19, s20) ──
             present_result(response.content)
             # ── 9. Memory Update (s10) ──
@@ -212,8 +215,7 @@ def comprehensive_agent_loop(messages, session):
 
         # ── 10. Tool Dispatch (s02) + Deferred Loading (s03) ──
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
+        for block in tool_blocks:
                 # ── 10a. Deferred Tool? (s03) ──
                 if block.name in DEFERRED_TOOLS:
                     tool_schema = tool_search(block.name)  # ToolSearch
@@ -223,7 +225,8 @@ def comprehensive_agent_loop(messages, session):
                     continue
 
                 # ── 10b. Permission Check (s04) ──
-                if not check_permission(block.name, block.input):
+                decision = check_permission(block.name)
+                if decision is DENY:
                     results.append(denied_result(block.id))
                     continue
 
@@ -399,6 +402,14 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 ---
 
 ## 运行
+
+先运行不需要 API key 的两轮 tool-loop walkthrough。第一轮故意让 provider stop reason 与 content block 矛盾，用来证明循环由规范化 block 驱动：
+
+```bash
+python3 s24_comprehensive/code.py --walkthrough
+```
+
+输出应包含 `tool_use → tool_result → final text`。写工具仍然是 `ASK`，walkthrough 不会自动批准写入。
 
 ```bash
 python s24_comprehensive/code.py

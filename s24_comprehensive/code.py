@@ -49,10 +49,13 @@ from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
 from mini_workbuddy.chapter_demo import prepare_chapter_provider as _wb_prepare_chapter_provider
 _wb_prepare_chapter_provider()
-import os, sys, time, json, hashlib, sqlite3, subprocess
-from datetime import datetime
+import os, sys, time, json, hashlib, sqlite3, subprocess, tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
 from itertools import islice
 from pathlib import Path
+from typing import Callable
 
 try:
     import readline
@@ -63,7 +66,6 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from mini_workbuddy.paths import tutorial_workbuddy_home
 
@@ -71,8 +73,13 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ.get("MODEL_ID")
+OFFLINE_WALKTHROUGH = "--walkthrough" in sys.argv
+if OFFLINE_WALKTHROUGH:
+    Anthropic = None
+else:
+    from anthropic import Anthropic
+client = None if Anthropic is None else Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+MODEL = os.environ.get("MODEL_ID") or ("offline-walkthrough" if OFFLINE_WALKTHROUGH else None)
 if not MODEL:
     raise SystemExit(
         "MODEL_ID is not set. Copy .env.example to .env and fill in "
@@ -83,12 +90,12 @@ if not MODEL:
 # LAYER 1: Persistence (s21 SQLite + s23 Audit)
 # ============================================================
 
-DB_DIR = tutorial_workbuddy_home()
+DB_DIR = (Path(tempfile.mkdtemp(prefix="learn-workbuddy-s24-"))
+          if OFFLINE_WALKTHROUGH else tutorial_workbuddy_home())
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "workbuddy.db"
 AUDIT_DIR = DB_DIR / "audit-log"
 AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-WORKSPACE_LOG = DB_DIR / "workspace-log.md"
 USER_MEMORY = DB_DIR / "MEMORY.md"
 GENESIS_HASH = "0" * 64
 
@@ -215,33 +222,77 @@ class AuditLog:
         return [json.loads(l) for l in self.path.read_text().strip().split("\n") if l]
 
 
+class Transcript:
+    """s09 adapter: durable evidence is separate from live messages[]."""
+
+    def __init__(self, session_id: str):
+        self.path = DB_DIR / "transcripts" / f"{session_id}.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, event: dict) -> None:
+        sequence = 1
+        if self.path.exists():
+            sequence += sum(1 for line in self.path.read_text().splitlines() if line)
+        record = {"schema_version": 1, "sequence": sequence,
+                  "recorded_at": datetime.now(timezone.utc).isoformat(), **event}
+        encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+        descriptor = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 # ============================================================
 # LAYER 2: Memory (s10 Workspace + s11 User + s12 Cloud)
 # ============================================================
 
 class Memory:
-    """s10-s12: Three-layer memory system."""
+    """s10-s12 adapter: workspace facts stay scoped; user memory is global."""
 
-    def __init__(self):
-        # s10: Workspace memory — append-only daily log
-        self.workspace_log = WORKSPACE_LOG
+    def __init__(self, cwd: Path | None = None):
+        self.cwd = (cwd or Path.cwd()).resolve()
+        self.workspace_id = hashlib.sha256(str(self.cwd).encode()).hexdigest()[:16]
+        self.workspace_dir = DB_DIR / "projects" / self.workspace_id / "memory"
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.workspace_log = self.workspace_dir / f"{datetime.now(timezone.utc).date()}.jsonl"
         # s11: User memory — persistent preferences
         self.user_memory = USER_MEMORY
         self._init_files()
 
     def _init_files(self):
-        if not self.workspace_log.exists():
-            self.workspace_log.write_text(f"# Workspace Log\n\n## {datetime.now().strftime('%Y-%m-%d')}\n")
         if not self.user_memory.exists():
             self.user_memory.write_text("# User Memory\n\n## Preferences\n- Prefers concise responses\n- Uses Python\n\n")
 
     def append_workspace(self, entry: str):
-        """s10: Append-only workspace log."""
-        with open(self.workspace_log, "a") as f:
-            f.write(f"- [{datetime.now().strftime('%H:%M')}] {entry}\n")
+        """s10: Append one scoped JSONL fact; distillation remains owned by s10."""
+        fact = {
+            "type": "workspace_fact",
+            "workspace_id": self.workspace_id,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "content": entry,
+        }
+        encoded = (json.dumps(fact, ensure_ascii=False) + "\n").encode()
+        descriptor = os.open(self.workspace_log, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def get_workspace(self) -> str:
-        return self.workspace_log.read_text()[-2000:]  # Last 2KB
+        if not self.workspace_log.exists():
+            return ""
+        facts = []
+        for line in self.workspace_log.read_text().splitlines()[-6:]:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("workspace_id") == self.workspace_id:
+                facts.append(f"- {payload.get('content', '')}")
+        return "\n".join(facts)
 
     def get_user_memory(self) -> str:
         """s11: User-level preferences."""
@@ -367,51 +418,87 @@ def run_bash(command: str) -> str:
         return f"Error: {e}"
 
 
-# s02: Tool dispatch map
-TOOL_HANDLERS = {
-    "bash": lambda inp: run_bash(inp["command"]),
-    "read_file": lambda inp: Path(inp["path"]).read_text()[:10000] if Path(inp["path"]).exists() else "File not found",
-    "write_file": lambda inp: (Path(inp["path"]).write_text(inp["content"]), "File written")[1],
-    "list_files": lambda inp: "\n".join(str(p) for p in islice(Path(inp.get("path", ".")).iterdir(), 50)),
+class PermissionDecision(str, Enum):
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    """One source for prompt schema, handler, and permission policy."""
+
+    name: str
+    description: str
+    input_schema: dict
+    permission: PermissionDecision
+    handler: Callable[[dict], str]
+
+
+def _scoped_path(raw: str) -> Path:
+    path = (Path.cwd() / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
+    try:
+        path.relative_to(Path.cwd().resolve())
+    except ValueError as exc:
+        raise PermissionError(f"path escapes workspace: {raw}") from exc
+    return path
+
+
+def _read_file(inputs: dict) -> str:
+    path = _scoped_path(inputs["path"])
+    return path.read_text()[:10_000] if path.exists() else "File not found"
+
+
+def _write_file(inputs: dict) -> str:
+    _scoped_path(inputs["path"]).write_text(inputs["content"])
+    return "File written"
+
+
+def _list_files(inputs: dict) -> str:
+    return "\n".join(str(path) for path in islice(_scoped_path(inputs.get("path", ".")).iterdir(), 50))
+
+
+TOOL_REGISTRY = {
+    item.name: item for item in [
+        ToolDefinition("bash", "Run a shell command. Sandboxed and audited.",
+                       {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+                       PermissionDecision.ALLOW, lambda inputs: run_bash(inputs["command"])),
+        ToolDefinition("read_file", "Read a workspace file.",
+                       {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                       PermissionDecision.ALLOW, _read_file),
+        ToolDefinition("write_file", "Write a workspace file after approval.",
+                       {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+                       PermissionDecision.ASK, _write_file),
+        ToolDefinition("list_files", "List a workspace directory.",
+                       {"type": "object", "properties": {"path": {"type": "string"}}},
+                       PermissionDecision.ALLOW, _list_files),
+    ]
 }
 
-TOOLS = [
-    {"name": "bash", "description": "Run a shell command. Sandboxed and audited.",
-     "input_schema": {"type": "object",
-                      "properties": {"command": {"type": "string"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read a file's contents.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"},
-                                     "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "list_files", "description": "List files in a directory.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"}}}},
-]
-
-# s04: Permission rules
-PERMISSIONS = {
-    "bash": "allow",         # with sandbox
-    "read_file": "allow",
-    "write_file": "confirm",  # requires user confirmation
-    "list_files": "allow",
-}
+# Compatibility views are derived; they cannot drift from the registry.
+TOOL_HANDLERS = {name: definition.handler for name, definition in TOOL_REGISTRY.items()}
+TOOLS = [{"name": item.name, "description": item.description, "input_schema": item.input_schema}
+         for item in TOOL_REGISTRY.values()]
 
 
-def check_permission(tool_name: str, tool_input: dict) -> tuple[bool, str]:
-    """s04: Permission check before tool execution."""
-    perm = PERMISSIONS.get(tool_name, "deny")
-    if perm == "allow":
-        return True, "allowed"
-    if perm == "confirm":
-        # In real WorkBuddy, this shows a UI dialog. Here we auto-allow with audit.
-        return True, "auto-confirmed (teaching mode)"
-    return False, "denied"
+def check_permission(tool_name: str) -> PermissionDecision:
+    definition = TOOL_REGISTRY.get(tool_name)
+    return definition.permission if definition else PermissionDecision.DENY
+
+
+def execute_tool(tool_name: str, tool_input: dict,
+                 approve: Callable[[str, dict], bool] | None = None) -> str:
+    """Execute only after the registry policy (and real ASK decision) permits it."""
+    definition = TOOL_REGISTRY.get(tool_name)
+    decision = check_permission(tool_name)
+    if definition is None or decision is PermissionDecision.DENY:
+        return f"Permission denied: unknown or denied tool {tool_name}"
+    if decision is PermissionDecision.ASK and (approve is None or not approve(tool_name, tool_input)):
+        return "Permission denied: user approval required"
+    try:
+        return definition.handler(tool_input)
+    except (OSError, PermissionError, KeyError) as exc:
+        return f"Tool failed: {exc}"
 
 
 # ============================================================
@@ -478,7 +565,7 @@ class ComprehensiveAgent:
     orbits around the loop without changing its structure.
     """
 
-    def __init__(self):
+    def __init__(self, approval_resolver: Callable[[str, dict], bool] | None = None):
         # s21: Database
         self.db = Database()
         # s23: Audit log
@@ -489,6 +576,8 @@ class ComprehensiveAgent:
         self.prompt = PromptAssembler(self.memory)
         # Session
         self.session_id = self.db.create_session(MODEL)
+        self.transcript = Transcript(self.session_id)
+        self.approval_resolver = approval_resolver
         self.messages = []
         self.total_cost = 0.0
 
@@ -503,6 +592,7 @@ class ComprehensiveAgent:
         self.memory.append_workspace(f"User: {user_input[:100]}")
 
         self.messages.append({"role": "user", "content": user_input})
+        self.transcript.append({"type": "message", "role": "user", "content": user_input})
 
         # ── THE LOOP (s01) ──
         iterations = 0
@@ -528,27 +618,30 @@ class ComprehensiveAgent:
             self.total_cost += cost
 
             self.messages.append({"role": "assistant", "content": response.content})
+            self.transcript.append({"type": "model_response", "blocks": len(response.content)})
 
-            # Check stop
-            if response.stop_reason != "tool_use":
+            # s01: response blocks drive the loop; stop_reason is diagnostic.
+            tool_blocks = [block for block in response.content
+                           if getattr(block, "type", None) == "tool_use"]
+            if not tool_blocks:
+                if response.stop_reason == "tool_use":
+                    self.audit.append("protocol_error", {"stop_reason": "tool_use"}, "no tool block")
                 break
 
             # s02+s04+s23: Tool dispatch with permission + sandbox + audit
             results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
+            for block in tool_blocks:
 
                 tool_name = block.name
                 tool_input = block.input
 
                 # s04: Permission check
-                allowed, reason = check_permission(tool_name, tool_input)
-                if not allowed:
+                decision = check_permission(tool_name)
+                if decision is PermissionDecision.DENY:
                     self.audit.append("permission_denied",
-                                      {"tool": tool_name, "reason": reason}, "blocked")
+                                      {"tool": tool_name, "reason": decision.value}, "blocked")
                     results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": f"Permission denied: {reason}"})
+                                    "content": "Permission denied"})
                     continue
 
                 # s23: Audit before execution
@@ -557,11 +650,7 @@ class ComprehensiveAgent:
                                   "started")
 
                 # s02: Dispatch
-                handler = TOOL_HANDLERS.get(tool_name)
-                if handler:
-                    output = handler(tool_input)
-                else:
-                    output = f"Unknown tool: {tool_name}"
+                output = execute_tool(tool_name, tool_input, self.approval_resolver)
 
                 # s21: Record tool usage
                 self.db.record_tool(self.session_id, tool_name)
@@ -569,6 +658,8 @@ class ComprehensiveAgent:
                 # s23: Audit after execution
                 self.audit.append("tool_result",
                                   {"tool": tool_name}, output[:200])
+                self.transcript.append({"type": "function_call_result", "callId": block.id,
+                                        "name": tool_name, "output": output})
 
                 # Print tool activity
                 safety = "SAFE"
@@ -646,11 +737,39 @@ class ComprehensiveAgent:
         self.audit.append("session_close", {"session_id": self.session_id}, "closed")
 
 
+def offline_walkthrough() -> None:
+    """Keyless two-turn trace for the integrated loop contracts."""
+    from types import SimpleNamespace
+
+    scripted = [
+        SimpleNamespace(
+            stop_reason="end_turn",  # deliberately contradictory diagnostic
+            content=[SimpleNamespace(type="tool_use", id="call_1", name="list_files",
+                                     input={"path": "."})],
+        ),
+        SimpleNamespace(stop_reason="end_turn",
+                        content=[SimpleNamespace(type="text", text="walkthrough complete")]),
+    ]
+    print("s24 offline walkthrough")
+    for turn, response in enumerate(scripted, start=1):
+        tool_blocks = [block for block in response.content if block.type == "tool_use"]
+        print(f"turn {turn}: blocks={[block.type for block in response.content]}")
+        if not tool_blocks:
+            print(response.content[0].text)
+            break
+        for block in tool_blocks:
+            output = execute_tool(block.name, block.input)
+            print(f"tool_result {block.id}: {output.splitlines()[0] if output else '(empty)'}")
+
+
 # ============================================================
 # Entry Point
 # ============================================================
 
 if __name__ == "__main__":
+    if OFFLINE_WALKTHROUGH:
+        offline_walkthrough()
+        raise SystemExit(0)
     print("╔══════════════════════════════════════════════════════════╗")
     print("║  s24: Comprehensive — 机制很多, 循环一个                  ║")
     print("║  All 20 mechanisms integrated into one agent loop        ║")

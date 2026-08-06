@@ -80,11 +80,12 @@ def test_s23_chapter_detects_full_audit_wipe(tmp_path, monkeypatch) -> None:
 
 def test_s24_list_files_tool_accepts_directory_iterators(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("WORKBUDDY_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
     s24 = _load_chapter("s24_comprehensive")
     (tmp_path / "alpha.txt").write_text("a", encoding="utf-8")
     (tmp_path / "beta.txt").write_text("b", encoding="utf-8")
 
-    output = s24.TOOL_HANDLERS["list_files"]({"path": str(tmp_path)})
+    output = s24.TOOL_HANDLERS["list_files"]({"path": "."})
 
     assert "alpha.txt" in output
     assert "beta.txt" in output

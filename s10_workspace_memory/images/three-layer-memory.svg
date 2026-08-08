@@ -56,11 +56,11 @@
 
   <rect x="30" y="370" width="620" height="170" rx="12" fill="#FAEEDA" stroke="#EF9F27" stroke-width="0.5"/>
   <text class="th" x="50" y="395">Layer 3 — 工作区记忆 (Workspace Memory)</text>
-  <text class="ts" x="50" y="412">仅当前项目 · 3,000 字符/会话 · 追加日志 + 策展笔记</text>
+  <text class="ts" x="50" y="412">仅当前项目 · 显式蒸馏门槛 · 追加日志 + 策展视图</text>
   <g class="c-amber">
     <rect x="50" y="425" width="280" height="52" rx="8" fill="#FAC775" stroke="#BA7517" stroke-width="0.5"/>
-    <text class="th" x="190" y="445" text-anchor="middle" dominant-baseline="central">YYYY-MM-DD.md</text>
-    <text class="ts" x="190" y="463" text-anchor="middle" dominant-baseline="central">每日工作日志 · 仅追加</text>
+    <text class="th" x="190" y="445" text-anchor="middle" dominant-baseline="central">daily/*.jsonl</text>
+    <text class="ts" x="190" y="463" text-anchor="middle" dominant-baseline="central">结构化事实 · 仅追加</text>
   </g>
   <g class="c-amber">
     <rect x="350" y="425" width="270" height="52" rx="8" fill="#FAC775" stroke="#BA7517" stroke-width="0.5"/>
@@ -69,6 +69,6 @@
   </g>
   <g class="c-amber">
     <rect x="50" y="485" width="570" height="40" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
-    <text class="ts" x="335" y="505" text-anchor="middle" dominant-baseline="central">.workbuddy/memory/ — 30 天后蒸馏到 MEMORY.md，删除旧日志</text>
+    <text class="ts" x="335" y="505" text-anchor="middle" dominant-baseline="central">.learn_workbuddy/memory/ — 门槛蒸馏到 MEMORY.md，原始证据保留</text>
   </g>
 </svg>

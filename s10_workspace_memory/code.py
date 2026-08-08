@@ -1,463 +1,759 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-"""
-s10_workspace_memory.py - Workspace Memory System
+"""s10_workspace_memory - project-scoped log-and-distill memory.
 
-Simulates WorkBuddy's Layer 3 memory: project-local daily logs and
-curated long-term notes.
+Session transcripts (s09) preserve what happened in one conversation.  This
+chapter adds a different contract: select durable project facts, keep their
+append-only evidence, and derive a compact view that a later session can load.
 
-Production harnesses often use:
-    - {project}/.workbuddy/memory/YYYY-MM-DD.md — daily logs (append-only)
-    - {project}/.workbuddy/memory/MEMORY.md — curated notes (≤3,000 chars/session)
-    - Written after substantive work (building, fixing, writing reports)
-    - NOT written for trivial exchanges (greetings, simple lookups)
-    - Daily logs >30 days distilled into MEMORY.md by topic, then deleted
-    - Memory update happens in tool-call phase, before final text reply
-    - Memory is supplemental — does NOT replace the normal reply
-
-Teaching version uses:
-    - Real file I/O to .workbuddy/memory/ directory
-    - Real Anthropic API calls with memory-aware system prompt
-    - Simulated distillation with topic-based summarization
-    - 3,000 char limit enforcement on MEMORY.md writes
+The implementation is intentionally local and provider-neutral.  Distillation
+uses explicit rules instead of an API call, so scope, idempotency, atomic
+writes, and restart recovery can all be exercised offline.
 
 Usage:
+    python s10_workspace_memory/code.py --demo
     python s10_workspace_memory/code.py
 """
 
+from __future__ import annotations
 
-
-# Machine-readable learning path metadata. Tests enforce that every
-# chapter declares what it inherits and what it adds.
-PROGRESSION = {'chapter': 's10_workspace_memory',
- 'builds_on': ['s09_jsonl_transcript'],
- 'adds': ['workspace daily log', 'topic distillation', 'memory injection'],
- 'preserves': ['append-only persistence']}
-
-# Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
-import sys as _wb_sys
-from pathlib import Path as _wb_Path
-_WB_ROOT = _wb_Path(__file__).resolve().parents[1]
-if str(_WB_ROOT) not in _wb_sys.path:
-    _wb_sys.path.insert(0, str(_WB_ROOT))
-from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_chapter_demo
-_wb_maybe_run_chapter_demo(__file__, PROGRESSION)
-from mini_workbuddy.chapter_demo import prepare_chapter_provider as _wb_prepare_chapter_provider
-_wb_prepare_chapter_provider()
-import os, sys, time, json, subprocess, re
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
-from datetime import datetime, timedelta
+from typing import Iterable, Mapping
 
-try:
-    import readline
-    readline.parse_and_bind('set bind-tty-special-chars off')
-    readline.parse_and_bind('set input-meta on')
-    readline.parse_and_bind('set output-meta on')
-    readline.parse_and_bind('set convert-meta off')
-except ImportError:
-    pass
+
+# Machine-readable learning path metadata.  The chapter keeps s09's
+# append-only evidence principle, but memory is a selective derived view rather
+# than a second conversation transcript.
+PROGRESSION = {
+    "chapter": "s10_workspace_memory",
+    "builds_on": ["s09_jsonl_transcript"],
+    "adds": [
+        "workspace-scoped fact log",
+        "policy-driven memory distillation",
+        "atomic curated memory view",
+    ],
+    "preserves": ["append-only evidence and restart recovery"],
+}
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from mini_workbuddy.chapter_demo import maybe_run_chapter_demo
+from mini_workbuddy.chapter_demo import prepare_chapter_provider
+
+maybe_run_chapter_demo(__file__, PROGRESSION)
+prepare_chapter_provider()
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+
+try:
+    import readline
+
+    readline.parse_and_bind("set bind-tty-special-chars off")
+    readline.parse_and_bind("set input-meta on")
+    readline.parse_and_bind("set output-meta on")
+    readline.parse_and_bind("set convert-meta off")
+except ImportError:
+    pass
+
+
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+if os.getenv("ANTHROPIC_BASE_URL"):
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+
+SCHEMA_VERSION = 1
+DEFAULT_RETENTION_DAYS = 30
+MAX_FACT_CHARS = 2_000
+MAX_CONTEXT_FACTS = 6
 WORKDIR = Path.cwd()
-MEMORY_DIR = WORKDIR / ".workbuddy" / "memory"
-MEMORY_FILE = MEMORY_DIR / "MEMORY.md"
-RETENTION_DAYS = 30
-MAX_MEMORY_WRITE = 3000  # chars per session write
 
 
-# ═══════════════════════════════════════════════════════════════
-# WorkspaceMemory — Layer 3 memory: project-local
-# ═══════════════════════════════════════════════════════════════
+class MemoryErrorBase(RuntimeError):
+    """Base class for failures at the workspace-memory boundary."""
+
+
+class MemoryScopeError(MemoryErrorBase):
+    """Raised when persisted memory belongs to another workspace."""
+
+
+class MemoryCorruptionError(MemoryErrorBase):
+    """Raised for malformed durable records that cannot be ignored safely."""
+
+
+class FactKind(str, Enum):
+    """Small vocabulary that makes retention policy explicit.
+
+    Decisions, conventions, and pitfalls are usually useful in later sessions.
+    Outcomes are useful in the recent log but normally age out instead of being
+    promoted to long-term memory.
+    """
+
+    DECISION = "decision"
+    CONVENTION = "convention"
+    PITFALL = "pitfall"
+    OUTCOME = "outcome"
+
+
+@dataclass(frozen=True)
+class MemoryFact:
+    """One immutable fact in a workspace's append-only daily log."""
+
+    fact_id: str
+    workspace_id: str
+    recorded_at: str
+    kind: str
+    content: str
+    source: str = "agent"
+    importance: int = 3
+    evidence: Mapping[str, str] = field(default_factory=dict)
+    schema_version: int = SCHEMA_VERSION
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "MemoryFact":
+        try:
+            return cls(
+                fact_id=str(payload["fact_id"]),
+                workspace_id=str(payload["workspace_id"]),
+                recorded_at=str(payload["recorded_at"]),
+                kind=str(payload["kind"]),
+                content=str(payload["content"]),
+                source=str(payload.get("source", "agent")),
+                importance=int(payload.get("importance", 3)),
+                evidence=dict(payload.get("evidence") or {}),
+                schema_version=int(payload.get("schema_version", 1)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MemoryCorruptionError(f"invalid memory fact: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class DistillPolicy:
+    """Explainable gate from raw facts to curated project memory."""
+
+    minimum_age_days: int = DEFAULT_RETENTION_DAYS
+    minimum_importance: int = 4
+    repeat_threshold: int = 2
+    stable_kinds: frozenset[str] = frozenset(
+        {FactKind.DECISION.value, FactKind.CONVENTION.value, FactKind.PITFALL.value}
+    )
+
+    def __post_init__(self) -> None:
+        if self.minimum_age_days < 0:
+            raise ValueError("minimum_age_days must be >= 0")
+        if not 1 <= self.minimum_importance <= 5:
+            raise ValueError("minimum_importance must be between 1 and 5")
+        if self.repeat_threshold < 1:
+            raise ValueError("repeat_threshold must be >= 1")
+
+
+@dataclass
+class CuratedMemoryEntry:
+    """Compact long-term statement with links back to source facts."""
+
+    key: str
+    kind: str
+    content: str
+    first_seen: str
+    last_seen: str
+    evidence_ids: list[str]
+    occurrences: int
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "CuratedMemoryEntry":
+        try:
+            evidence_ids = [str(item) for item in payload.get("evidence_ids", [])]
+            return cls(
+                key=str(payload["key"]),
+                kind=str(payload["kind"]),
+                content=str(payload["content"]),
+                first_seen=str(payload["first_seen"]),
+                last_seen=str(payload["last_seen"]),
+                evidence_ids=evidence_ids,
+                occurrences=int(payload.get("occurrences", len(evidence_ids))),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MemoryCorruptionError(f"invalid curated entry: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class DistillReport:
+    """Observable result returned to the scheduler, CLI, or audit layer."""
+
+    scanned: int
+    eligible: int
+    created: int
+    updated: int
+    skipped: int
+
+
+def _as_utc(value: datetime | None) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc)
+
+
+def _parse_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise MemoryCorruptionError(f"invalid recorded_at timestamp: {value!r}") from exc
+    return _as_utc(parsed)
+
+
+def _normal_form(content: str) -> str:
+    """Collapse cosmetic differences before grouping repeated facts."""
+
+    return re.sub(r"\s+", " ", content).strip().casefold()
+
+
+def _entry_key(kind: str, content: str) -> str:
+    material = f"{kind}\0{_normal_form(content)}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:16]
+
 
 class WorkspaceMemory:
-    """
-    Manages project-local memory files.
+    """Durable project memory with an append log and a derived compact view.
 
-    Real WorkBuddy structure:
-        {project}/.workbuddy/memory/
-        ├── 2026-07-01.md   (daily log, append-only)
-        ├── 2026-07-02.md
-        └── MEMORY.md       (curated long-term notes)
+    Layout under each project root::
 
-    Key rules:
-    1. Daily logs are APPEND-ONLY — never overwrite
-    2. Write after substantive work only (not trivial exchanges)
-    3. MEMORY.md writes capped at 3,000 chars per session
-    4. Logs older than 30 days → distilled into MEMORY.md → deleted
+        .learn_workbuddy/memory/
+        ├── daily/YYYY-MM-DD.jsonl   # immutable source facts
+        ├── curated.json             # canonical compact state
+        └── MEMORY.md                # human/prompt-facing derived view
+
+    The teaching namespace deliberately avoids writing into a real product's
+    state directory.  Resolving ``project_dir`` before deriving ``workspace_id``
+    also prevents two relative paths to the same project from creating
+    different logical scopes.
     """
 
     def __init__(self, project_dir: Path):
-        self.project_dir = project_dir
-        self.memory_dir = project_dir / ".workbuddy" / "memory"
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self.project_dir = Path(project_dir).expanduser().resolve()
+        self.workspace_id = hashlib.sha256(
+            str(self.project_dir).encode("utf-8")
+        ).hexdigest()[:16]
+        self.memory_dir = self.project_dir / ".learn_workbuddy" / "memory"
+        self.daily_dir = self.memory_dir / "daily"
         self.memory_file = self.memory_dir / "MEMORY.md"
+        self.curated_file = self.memory_dir / "curated.json"
+        self.daily_dir.mkdir(parents=True, exist_ok=True)
+
+    def daily_log_path(self, day: date) -> Path:
+        """Return the scoped path for one UTC day's append-only fact log."""
+
+        return self.daily_dir / f"{day.isoformat()}.jsonl"
 
     def today_log_path(self) -> Path:
-        """Get today's daily log file path."""
-        return self.memory_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+        return self.daily_log_path(datetime.now(timezone.utc).date())
 
-    def append_daily_log(self, entry: str):
+    def append_daily_log(
+        self,
+        content: str,
+        *,
+        kind: str | FactKind = FactKind.OUTCOME,
+        importance: int = 3,
+        source: str = "agent",
+        evidence: Mapping[str, str] | None = None,
+        recorded_at: datetime | None = None,
+        fact_id: str | None = None,
+    ) -> MemoryFact:
+        """Append one validated fact as exactly one JSONL record.
+
+        ``O_APPEND`` plus one ``os.write`` keeps concurrent writers from
+        seeking to and overwriting the same offset.  The subsequent ``fsync``
+        makes successful return mean the record reached the filesystem.  A
+        crash may still leave a partial final line; readers ignore only that
+        unterminated tail and reject corruption in the middle of a log.
         """
-        Append to today's daily log. NEVER overwrite.
 
-        Production harness: fs.appendFile(logFile, entry + '\\n')
-        The 'a' flag ensures append mode.
-        """
-        log_path = self.today_log_path()
-        timestamp = datetime.now().strftime("%H:%M")
+        text = re.sub(r"\s+", " ", content).strip()
+        if not text:
+            raise ValueError("memory fact content must not be empty")
+        if len(text) > MAX_FACT_CHARS:
+            raise ValueError(f"memory fact exceeds {MAX_FACT_CHARS} characters")
+        if not 1 <= importance <= 5:
+            raise ValueError("importance must be between 1 and 5")
 
-        # Format entry as a log section
-        formatted = f"\n## {timestamp} — {entry}\n"
+        kind_value = kind.value if isinstance(kind, FactKind) else str(kind)
+        if kind_value not in {item.value for item in FactKind}:
+            raise ValueError(f"unknown fact kind: {kind_value}")
 
-        # APPEND mode — the critical part
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(formatted)
-
-        print(f"\033[90m[memory] Appended to {log_path.name}\033[0m")
-
-    def read_memory_md(self) -> str:
-        """Read MEMORY.md (curated long-term notes)."""
-        if not self.memory_file.exists():
-            return ""
-        return self.memory_file.read_text(encoding="utf-8")
-
-    def append_memory_md(self, content: str):
-        """
-        Append to MEMORY.md with 3,000 char limit per session.
-
-        Production harness: each session can append up to 3,000 chars.
-        This is NOT the file size limit — it's per-write limit.
-        Prevents agent from over-writing and staying concise.
-        """
-        # Enforce 3,000 char limit
-        if len(content) > MAX_MEMORY_WRITE:
-            content = content[:MAX_MEMORY_WRITE] + "\n... (truncated at 3000 chars)"
-            print(f"\033[33m[memory] MEMORY.md write truncated to {MAX_MEMORY_WRITE} chars\033[0m")
-
-        with open(self.memory_file, "a", encoding="utf-8") as f:
-            f.write(content + "\n")
-
-        print(f"\033[90m[memory] Appended {len(content)} chars to MEMORY.md\033[0m")
-
-    def read_today_log(self) -> str:
-        """Read today's daily log."""
-        path = self.today_log_path()
-        if not path.exists():
-            return ""
-        return path.read_text(encoding="utf-8")
+        timestamp = _as_utc(recorded_at)
+        fact = MemoryFact(
+            fact_id=fact_id or uuid.uuid4().hex,
+            workspace_id=self.workspace_id,
+            recorded_at=timestamp.isoformat().replace("+00:00", "Z"),
+            kind=kind_value,
+            content=text,
+            source=source,
+            importance=importance,
+            evidence=dict(evidence or {}),
+        )
+        encoded = (json.dumps(asdict(fact), ensure_ascii=False, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        path = self.daily_log_path(timestamp.date())
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            written = os.write(descriptor, encoded)
+            if written != len(encoded):
+                raise OSError(f"short memory write: {written}/{len(encoded)} bytes")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return fact
 
     def list_logs(self) -> list[Path]:
-        """List all daily log files, sorted by date."""
-        logs = sorted(self.memory_dir.glob("*.md"))
-        # Exclude MEMORY.md from daily logs list
-        return [l for l in logs if l.name != "MEMORY.md" and re.match(r'\d{4}-\d{2}-\d{2}', l.name)]
+        return sorted(self.daily_dir.glob("????-??-??.jsonl"))
 
-    def distill_old_logs(self) -> int:
-        """
-        Distill logs older than 30 days into MEMORY.md, then delete them.
+    def _read_log(self, path: Path) -> list[MemoryFact]:
+        if not path.exists():
+            return []
 
-        Production harness:
-        1. Read old daily log
-        2. Call LLM to summarize by topic
-        3. Append summary to MEMORY.md (≤3,000 chars)
-        4. Delete original log file
-
-        Returns number of logs distilled.
-        """
-        cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
-        old_logs = []
-
-        for log_path in self.list_logs():
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        facts: list[MemoryFact] = []
+        for index, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
             try:
-                log_date = datetime.strptime(log_path.stem, "%Y-%m-%d")
-                if log_date < cutoff:
-                    old_logs.append(log_path)
-            except ValueError:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                is_partial_tail = index == len(lines) and not line.endswith("\n")
+                if is_partial_tail:
+                    break
+                raise MemoryCorruptionError(f"{path.name}:{index}: invalid JSON") from exc
+            fact = MemoryFact.from_dict(payload)
+            if fact.schema_version != SCHEMA_VERSION:
+                raise MemoryCorruptionError(
+                    f"{path.name}:{index}: unsupported schema {fact.schema_version}"
+                )
+            if fact.workspace_id != self.workspace_id:
+                raise MemoryScopeError(
+                    f"{path.name}:{index} belongs to workspace {fact.workspace_id}"
+                )
+            facts.append(fact)
+        return facts
+
+    def read_daily_facts(self, day: date | None = None) -> list[MemoryFact]:
+        target = day or datetime.now(timezone.utc).date()
+        return self._read_log(self.daily_log_path(target))
+
+    def read_all_facts(self) -> list[MemoryFact]:
+        facts = [fact for path in self.list_logs() for fact in self._read_log(path)]
+        return sorted(facts, key=lambda item: (item.recorded_at, item.fact_id))
+
+    def _atomic_write_text(self, path: Path, content: str) -> None:
+        """Replace a complete file or leave the previous version untouched."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            # fsync the directory entry as well as the file contents.  Without
+            # this step, a power loss may preserve the temporary file data but
+            # lose the rename that made it canonical.
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _load_curated(self) -> list[CuratedMemoryEntry]:
+        if not self.curated_file.exists():
+            return []
+        try:
+            payload = json.loads(self.curated_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MemoryCorruptionError("curated.json is not valid JSON") from exc
+        if payload.get("workspace_id") != self.workspace_id:
+            raise MemoryScopeError("curated memory belongs to another workspace")
+        if payload.get("schema_version") != SCHEMA_VERSION:
+            raise MemoryCorruptionError("unsupported curated memory schema")
+        return [CuratedMemoryEntry.from_dict(item) for item in payload.get("entries", [])]
+
+    def _render_memory(self, entries: Iterable[CuratedMemoryEntry]) -> str:
+        groups: dict[str, list[CuratedMemoryEntry]] = {
+            kind.value: [] for kind in FactKind if kind is not FactKind.OUTCOME
+        }
+        for entry in entries:
+            groups.setdefault(entry.kind, []).append(entry)
+
+        labels = {
+            FactKind.DECISION.value: "Decisions",
+            FactKind.CONVENTION.value: "Conventions",
+            FactKind.PITFALL.value: "Pitfalls",
+        }
+        lines = [
+            "# Workspace Memory",
+            "",
+            "Derived from append-only project facts. Edit the source log or policy, not this view.",
+        ]
+        for kind in (
+            FactKind.DECISION.value,
+            FactKind.CONVENTION.value,
+            FactKind.PITFALL.value,
+        ):
+            items = sorted(groups.get(kind, []), key=lambda item: (item.content, item.key))
+            if not items:
+                continue
+            lines.extend(["", f"## {labels[kind]}", ""])
+            for item in items:
+                lines.append(
+                    f"- {item.content} "
+                    f"(seen {item.occurrences}x; evidence: {len(item.evidence_ids)})"
+                )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _save_curated(self, entries: list[CuratedMemoryEntry]) -> None:
+        ordered = sorted(entries, key=lambda item: (item.kind, item.key))
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "workspace_id": self.workspace_id,
+            "entries": [asdict(item) for item in ordered],
+        }
+        # curated.json is canonical.  MEMORY.md is a replaceable projection for
+        # humans and prompt assembly; both are written through atomic rename.
+        self._atomic_write_text(
+            self.curated_file,
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        self._atomic_write_text(self.memory_file, self._render_memory(ordered))
+
+    def read_memory_md(self) -> str:
+        if not self.curated_file.exists():
+            # A pre-migration teaching workspace may only have MEMORY.md.
+            return self.memory_file.read_text(encoding="utf-8") if self.memory_file.exists() else ""
+
+        # curated.json is canonical.  If a process stopped after committing it
+        # but before refreshing MEMORY.md, the next read repairs the projection
+        # instead of injecting stale memory into a new session.
+        rendered = self._render_memory(self._load_curated())
+        current = self.memory_file.read_text(encoding="utf-8") if self.memory_file.exists() else None
+        if current != rendered:
+            self._atomic_write_text(self.memory_file, rendered)
+        return rendered
+
+    def distill(
+        self,
+        *,
+        policy: DistillPolicy | None = None,
+        as_of: datetime | None = None,
+    ) -> DistillReport:
+        """Promote eligible facts without deleting their source evidence.
+
+        A stable fact becomes long-term memory when it is old enough and is
+        either explicitly important or independently repeated.  Existing
+        evidence ids make reruns idempotent.  Repeated observations update the
+        same deterministic entry instead of producing near-duplicate bullets.
+        """
+
+        active_policy = policy or DistillPolicy()
+        cutoff = _as_utc(as_of) - timedelta(days=active_policy.minimum_age_days)
+        existing = self._load_curated()
+        by_key = {entry.key: entry for entry in existing}
+        processed_ids = {
+            evidence_id for entry in existing for evidence_id in entry.evidence_ids
+        }
+
+        aged = [
+            fact
+            for fact in self.read_all_facts()
+            if _parse_timestamp(fact.recorded_at) < cutoff
+        ]
+        candidates = [
+            fact
+            for fact in aged
+            if fact.kind in active_policy.stable_kinds and fact.fact_id not in processed_ids
+        ]
+        groups: dict[str, list[MemoryFact]] = {}
+        for fact in candidates:
+            groups.setdefault(_entry_key(fact.kind, fact.content), []).append(fact)
+
+        created = 0
+        updated = 0
+        eligible = 0
+        skipped = len(aged) - len(candidates)
+        changed = False
+        for key, facts in groups.items():
+            current = by_key.get(key)
+            qualifies = (
+                current is not None
+                or max(fact.importance for fact in facts) >= active_policy.minimum_importance
+                or len(facts) >= active_policy.repeat_threshold
+            )
+            if not qualifies:
+                skipped += len(facts)
                 continue
 
-        if not old_logs:
-            print(f"\033[90m[memory] No logs older than {RETENTION_DAYS} days to distill.\033[0m")
-            return 0
+            eligible += len(facts)
+            timestamps = sorted(fact.recorded_at for fact in facts)
+            new_ids = {fact.fact_id for fact in facts}
+            if current is None:
+                representative = sorted(
+                    facts,
+                    key=lambda fact: (-fact.importance, fact.recorded_at, fact.fact_id),
+                )[0]
+                by_key[key] = CuratedMemoryEntry(
+                    key=key,
+                    kind=representative.kind,
+                    content=representative.content,
+                    first_seen=timestamps[0],
+                    last_seen=timestamps[-1],
+                    evidence_ids=sorted(new_ids),
+                    occurrences=len(new_ids),
+                )
+                created += 1
+            else:
+                merged_ids = sorted(set(current.evidence_ids) | new_ids)
+                current.first_seen = min(current.first_seen, timestamps[0])
+                current.last_seen = max(current.last_seen, timestamps[-1])
+                current.evidence_ids = merged_ids
+                current.occurrences = len(merged_ids)
+                updated += 1
+            changed = True
 
-        client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-        MODEL = os.environ.get("MODEL_ID")
-        if not MODEL:
+        if changed:
+            self._save_curated(list(by_key.values()))
+
+        return DistillReport(
+            scanned=len(aged),
+            eligible=eligible,
+            created=created,
+            updated=updated,
+            skipped=skipped,
+        )
+
+    def get_context_for_agent(self, *, recent_limit: int = MAX_CONTEXT_FACTS) -> str:
+        """Build a bounded prompt block from curated and recent memory."""
+
+        parts: list[str] = []
+        curated = self.read_memory_md().strip()
+        if curated:
+            parts.append(curated)
+
+        recent = self.read_all_facts()[-recent_limit:] if recent_limit > 0 else []
+        if recent:
+            lines = ["# Recent Workspace Facts", ""]
+            lines.extend(
+                f"- [{fact.kind}] {fact.content} ({fact.recorded_at[:10]})"
+                for fact in recent
+            )
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts) if parts else "(no workspace memory yet)"
+
+
+class MemoryAwareAgent:
+    """Minimal provider loop showing where workspace memory enters a harness.
+
+    The memory store is independent of the provider.  The loop loads a bounded
+    view before each turn and exposes one structured ``write_memory`` tool.
+    Tool-use blocks, rather than a provider stop string, determine whether
+    another tool-result round is required.
+    """
+
+    def __init__(self, cwd: Path, memory: WorkspaceMemory):
+        self.cwd = Path(cwd).resolve()
+        self.memory = memory
+        self.client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+        self.model = os.getenv("MODEL_ID", "")
+        if not self.model:
             raise SystemExit(
                 "MODEL_ID is not set. Copy .env.example to .env and fill in "
                 "ANTHROPIC_API_KEY and MODEL_ID (see README quick start)."
             )
-
-        distilled_count = 0
-        for log_path in old_logs:
-            content = log_path.read_text(encoding="utf-8")
-            if not content.strip():
-                log_path.unlink()
-                continue
-
-            # Use LLM to distill by topic
-            prompt = f"""Summarize this work log by topic. Keep only essential facts,
-decisions, and file changes. Be extremely concise. Max 500 chars.
-
-Log date: {log_path.stem}
-Content:
-{content[:8000]}
-
-Format: - topic: summary (date)"""
-
-            resp = client.messages.create(
-                model=MODEL, max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}])
-
-            summary = ""
-            for block in resp.content:
-                if getattr(block, "type", None) == "text":
-                    summary += block.text
-
-            # Append to MEMORY.md
-            header = f"\n### Distilled from {log_path.stem}\n"
-            self.append_memory_md(header + summary)
-
-            # Delete original log
-            log_path.unlink()
-            distilled_count += 1
-            print(f"\033[90m[memory] Distilled {log_path.name} → MEMORY.md (deleted original)\033[0m")
-
-        return distilled_count
-
-    def get_context_for_agent(self) -> str:
-        """
-        Build memory context string for the agent's system prompt.
-
-        Includes:
-        - MEMORY.md (curated long-term notes)
-        - Today's daily log (recent context)
-        """
-        parts = []
-
-        long_term = self.read_memory_md()
-        if long_term.strip():
-            parts.append(f"## Long-term Memory (MEMORY.md)\n{long_term.strip()}")
-
-        today_log = self.read_today_log()
-        if today_log.strip():
-            parts.append(f"## Today's Work Log\n{today_log.strip()}")
-
-        return "\n\n".join(parts) if parts else "(no workspace memory yet)"
-
-
-# ═══════════════════════════════════════════════════════════════
-# Agent with Workspace Memory
-# ═══════════════════════════════════════════════════════════════
-
-class MemoryAwareAgent:
-    """
-    Agent that writes workspace memory after substantive work.
-
-    Real WorkBuddy flow:
-    1. User sends message
-    2. Agent runs tool calls (bash, read_file, etc.)
-    3. After tool phase ends → update memory
-    4. Then generate final text reply
-    5. Memory is supplemental — doesn't replace reply
-    """
-
-    # Tools that count as "substantive work"
-    SUBSTANTIVE_TOOLS = {"bash", "write_file", "edit_file"}
-
-    def __init__(self, cwd: Path, memory: WorkspaceMemory):
-        self.cwd = cwd
-        self.memory = memory
-        self.client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-        self.model = os.environ["MODEL_ID"]
         self.messages: list[dict] = []
-        self._did_substantive_work = False
-        self._work_summary: list[str] = []
 
     def _build_system(self) -> str:
-        """Build system prompt with memory context."""
-        mem_ctx = self.memory.get_context_for_agent()
-        return f"""You are a coding agent at {self.cwd}. Be concise.
+        return f"""You are a coding agent working in {self.cwd}.
 
-## Workspace Memory
-{mem_ctx}
+## Workspace memory
+{self.memory.get_context_for_agent()}
 
-## Memory Rules
-After doing substantive work (writing code, fixing bugs, making decisions),
-you MUST write a memory entry summarizing what you did. Use the write_memory tool.
-Do NOT write memory for trivial exchanges (greetings, simple lookups).
-Memory entries should record: what changed, why, and which files."""
+Use write_memory only for durable project decisions, conventions, pitfalls,
+or completed outcomes. Do not store greetings, guesses, secrets, or raw tool
+output. Memory supplements the user-facing reply; it never replaces it."""
 
-    def _build_tools(self) -> list[dict]:
+    @staticmethod
+    def _build_tools() -> list[dict]:
         return [
             {
                 "name": "bash",
-                "description": "Run a shell command.",
-                "input_schema": {"type": "object",
+                "description": "Run a shell command inside the workspace.",
+                "input_schema": {
+                    "type": "object",
                     "properties": {"command": {"type": "string"}},
-                    "required": ["command"]},
+                    "required": ["command"],
+                },
             },
             {
                 "name": "write_memory",
-                "description": "Write a memory entry to today's workspace log. "
-                               "Use after completing substantive work.",
-                "input_schema": {"type": "object",
-                    "properties": {"entry": {"type": "string",
-                        "description": "What was done, why, and which files. Past tense."}},
-                    "required": ["entry"]},
+                "description": "Append one durable, project-scoped memory fact.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "kind": {
+                            "type": "string",
+                            "enum": [item.value for item in FactKind],
+                        },
+                        "importance": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 5,
+                        },
+                    },
+                    "required": ["content", "kind", "importance"],
+                },
             },
         ]
 
     def chat(self, user_message: str) -> str:
-        """Run one agent turn with memory integration."""
-        self._did_substantive_work = False
-        self._work_summary = []
-
-        system = self._build_system()
-        tools = self._build_tools()
         self.messages.append({"role": "user", "content": user_message})
+        final_text = ""
 
         while True:
-            resp = self.client.messages.create(
-                model=self.model, system=system, messages=self.messages,
-                tools=tools, max_tokens=8000)
-            self.messages.append({"role": "assistant", "content": resp.content})
+            response = self.client.messages.create(
+                model=self.model,
+                system=self._build_system(),
+                messages=self.messages,
+                tools=self._build_tools(),
+                max_tokens=8_000,
+            )
+            self.messages.append({"role": "assistant", "content": response.content})
+            final_text = "".join(
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text"
+            )
+            tool_blocks = [
+                block
+                for block in response.content
+                if getattr(block, "type", None) == "tool_use"
+            ]
+            if not tool_blocks:
+                return final_text
 
-            if resp.stop_reason != "tool_use":
-                break
-
-            tool_results = []
-            for block in resp.content:
-                if block.type == "tool_use":
-                    if block.name == "bash":
-                        cmd = block.input.get("command", "")
-                        print(f"\033[90m[tool] bash: {cmd[:80]}\033[0m")
-                        out = self._run_bash(cmd)
-                        tool_results.append({"type": "tool_result",
-                                             "tool_use_id": block.id, "content": out})
-                        self._did_substantive_work = True
-                        self._work_summary.append(f"Ran: {cmd[:100]}")
-
-                    elif block.name == "write_memory":
-                        entry = block.input.get("entry", "")
-                        self.memory.append_daily_log(entry)
-                        tool_results.append({"type": "tool_result",
-                                             "tool_use_id": block.id,
-                                             "content": "Memory entry written."})
-
-            self.messages.append({"role": "user", "content": tool_results})
-
-        # Extract final text
-        final = ""
-        for block in self.messages[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                final += block.text
-        return final
+            results = []
+            for block in tool_blocks:
+                if block.name == "write_memory":
+                    fact = self.memory.append_daily_log(
+                        str(block.input.get("content", "")),
+                        kind=str(block.input.get("kind", FactKind.OUTCOME.value)),
+                        importance=int(block.input.get("importance", 3)),
+                        source="model_tool",
+                    )
+                    output = f"memory fact appended: {fact.fact_id}"
+                elif block.name == "bash":
+                    output = self._run_bash(str(block.input.get("command", "")))
+                else:
+                    output = f"Error: unknown tool {block.name}"
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": output,
+                    }
+                )
+            self.messages.append({"role": "user", "content": results})
 
     def _run_bash(self, command: str) -> str:
-        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
-        if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
+        """Keep the inherited demo tool narrow; s04 owns permission policy."""
+
+        dangerous = ("rm -rf /", "sudo", "shutdown", "reboot")
+        if any(fragment in command for fragment in dangerous):
+            return "Error: command blocked by the teaching safety guard"
         try:
-            r = subprocess.run(command, shell=True, cwd=str(self.cwd),
-                               capture_output=True, text=True, timeout=120)
-            out = (r.stdout + r.stderr).strip()
-            return out[:50000] if out else "(no output)"
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
         except subprocess.TimeoutExpired:
-            return "Error: Timeout (120s)"
-        except Exception as e:
-            return f"Error: {e}"
+            return "Error: timeout after 120 seconds"
+        output = (result.stdout + result.stderr).strip()
+        return output[:50_000] if output else "(no output)"
 
 
-# ═══════════════════════════════════════════════════════════════
-# Entry Point
-# ═══════════════════════════════════════════════════════════════
+def _print_report(report: DistillReport) -> None:
+    print(
+        "distill: "
+        f"scanned={report.scanned}, eligible={report.eligible}, "
+        f"created={report.created}, updated={report.updated}, skipped={report.skipped}"
+    )
 
-def main():
-    print("╔═══════════════════════════════════════════════════════════╗")
-    print("║  s10: Workspace Memory — 日志追加, 主题蒸馏                ║")
-    print("║  每天的工作要记下来, 只追加不覆盖                            ║")
-    print("╚═══════════════════════════════════════════════════════════╝")
-    print()
 
+def main() -> None:
+    print("s10: Workspace Memory — append facts, distill durable knowledge")
     memory = WorkspaceMemory(WORKDIR)
     agent = MemoryAwareAgent(WORKDIR, memory)
-
-    print(f"记忆目录: {memory.memory_dir}")
-    print(f"长期记忆: {'存在' if memory.memory_file.exists() else '尚无'}")
-    print(f"今日日志: {'存在' if memory.today_log_path().exists() else '尚无'}")
-    print()
-    print("命令:")
-    print("  /memory    — 查看 MEMORY.md (长期策展笔记)")
-    print("  /today     — 查看今日日志")
-    print("  /logs      — 列出所有日志文件")
-    print("  /distill   — 蒸馏 30 天前的日志到 MEMORY.md")
-    print("  /reset     — 清空对话历史 (保留记忆文件)")
-    print("  直接输入   — 与 agent 对话 (agent 会自动写记忆)")
-    print("  q          — 退出\n")
+    print(f"workspace: {memory.project_dir}")
+    print(f"memory:    {memory.memory_dir}")
+    print("commands: /memory /today /logs /distill /reset q")
 
     while True:
         try:
-            query = input("\033[36ms10 >> \033[0m").strip()
+            query = input("s10 >> ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if query.lower() in ("q", "exit", "quit"):
+        if query.lower() in {"q", "quit", "exit"}:
             break
         if not query:
             continue
-
         if query == "/memory":
-            content = memory.read_memory_md()
-            if content:
-                print(f"\n\033[33m{'─'*60}")
-                print("MEMORY.md (长期策展笔记)")
-                print(f"{'─'*60}\n{content}\033[0m\n")
-            else:
-                print("\n\033[90m(尚无 MEMORY.md — 运行 /distill 蒸馏旧日志)\033[0m\n")
+            print(memory.read_memory_md() or "(no curated workspace memory)")
             continue
-
         if query == "/today":
-            content = memory.read_today_log()
-            if content:
-                print(f"\n\033[33m{'─'*60}")
-                print(f"今日日志 ({memory.today_log_path().name})")
-                print(f"{'─'*60}\n{content}\033[0m\n")
-            else:
-                print("\n\033[90m(今日尚无日志 — 做点实质工作后会自动记录)\033[0m\n")
+            facts = memory.read_daily_facts()
+            for fact in facts:
+                print(f"[{fact.kind}] {fact.content} ({fact.importance}/5)")
+            if not facts:
+                print("(no facts today)")
             continue
-
         if query == "/logs":
-            logs = memory.list_logs()
-            if logs:
-                print(f"\n\033[33m日志文件 ({len(logs)} 个):\033[0m")
-                for log in logs:
-                    size = log.stat().st_size
-                    print(f"  {log.name}  ({size} bytes)")
-                print()
-            else:
-                print("\n\033[90m(尚无日志文件)\033[0m\n")
+            for path in memory.list_logs():
+                print(f"{path.name}: {len(memory._read_log(path))} facts")
+            if not memory.list_logs():
+                print("(no daily logs)")
             continue
-
         if query == "/distill":
-            print("\n\033[90m[memory] 开始蒸馏 30 天前的日志...\033[0m")
-            count = memory.distill_old_logs()
-            print(f"\033[90m[memory] 蒸馏完成: {count} 个日志已处理\033[0m\n")
+            _print_report(memory.distill())
             continue
-
         if query == "/reset":
-            agent.messages = []
-            print("\033[90m[agent] 对话历史已清空 (记忆文件保留)\033[0m\n")
+            agent.messages.clear()
+            print("conversation reset; workspace memory retained")
             continue
-
-        # Normal chat
-        result = agent.chat(query)
-        print(f"\n\033[32m{result}\033[0m\n")
-
-    print("\n\033[90mGoodbye. 记忆文件保留在 .workbuddy/memory/\033[0m")
+        print(agent.chat(query))
 
 
 if __name__ == "__main__":

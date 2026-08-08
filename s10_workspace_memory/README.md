@@ -1,10 +1,8 @@
-# s10: Workspace Memory — 每天的工作要记下来, 只追加不覆盖
+# s10: Workspace Memory — 从工作日志蒸馏可恢复的项目记忆
 
-> *"每天的工作要记下来, 只追加不覆盖"* — 日志追加, 主题蒸馏, 30 天保留。
+> Transcript 保存一次会话发生了什么；Workspace Memory 选择下次仍值得知道什么。
 >
-> **Harness 层**: 记忆 — 三层记忆的最内层。
-
----
+> **Harness 层**：项目作用域、记忆写入策略、蒸馏策略与 prompt 注入。
 
 ![工作区记忆系统](./images/workspace-memory.svg)
 
@@ -12,302 +10,190 @@
 
 ```mermaid
 flowchart LR
-    A["Session Summary"] --> B["Daily Log"]
-    B --> C["Workspace Index"]
-    C --> D["Prompt Context"]
-    D --> E["Next Session"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    A["Tool / Agent outcome"] --> B["validate MemoryFact"]
+    B --> C["daily/*.jsonl append"]
+    C --> D["DistillPolicy gate"]
+    D -->|"important or repeated"| E["curated.json"]
+    D -->|"not stable"| C
+    E --> F["MEMORY.md projection"]
+    F --> G["bounded prompt context"]
+    C -. "evidence retained" .-> E
 ```
 
-## 学习前置知识
+## 本章设计目标
 
-- 工作区记忆是项目局部知识, 不应该污染全局用户记忆。
-- Append-only 日志适合事实记录, MEMORY.md 适合策展结论。
-- 记忆写入需要节制, 不是所有对话都值得保存。
+s09 的 JSONL transcript 属于某个 session，是完整执行证据；本章不是复制一份聊天记录，而是建立项目级的选择性记忆：
 
-## 本章抓住的 WorkBuddy-style 机制
+- 同一项目的不同会话可以恢复同一份记忆；不同项目绝不串线。
+- 原始事实只追加，蒸馏不会删除证据。
+- 只有稳定、足够旧且重要或重复出现的事实进入长期视图。
+- 策展状态通过原子替换更新，失败时仍保留上一份完整文件。
+- 不依赖 API key 就能验证记忆策略。
 
-- 每日日志记录实质工作, 长期规则蒸馏到项目 MEMORY.md。
-- 把公开架构研究中的三层记忆中“工作区层”做成本地实现。
-- 演示记忆注入 prompt 的时机和字数预算。
+这也是它相对 s09 的主要增量：**transcript 负责忠实记录，memory 负责有损选择。**
 
-## 常见误区
+## 存储布局与所有权
 
-- 把临时输出都写入长期记忆, 会让记忆腐烂。
-- 跨项目规则写进工作区, 会导致迁移困难。
-- 没有蒸馏策略, 每日日志会越来越难检索。
-## 问题
-
-s01-s07 的 agent 有能力，但没记性。每次打开同一个项目，之前做了什么全忘了：
-
-- 上次修了哪个 bug？
-- 为什么这么改的？
-- 项目里哪些文件是核心？
-
-你会说：不是有 git log 吗？git 记录了"改了什么"，但不记录"为什么"和"想了什么"。而且 agent 的对话历史在关闭会话后就没了。
-
-WorkBuddy 的三层记忆系统解决这个问题。工作区记忆是第三层——最局部、最项目相关的记忆。
-
----
-
-## 解决方案
-
-```
-项目根目录/
-├── .workbuddy/
-│   └── memory/
-│       ├── 2026-07-01.md    ← 每日日志 (追加, 不覆盖)
-│       ├── 2026-07-02.md
-│       ├── 2026-07-03.md
-│       ├── ...
-│       └── MEMORY.md        ← 长期策展笔记 (≤3,000 字符/会话)
+```text
+project/
+└── .learn_workbuddy/
+    └── memory/
+        ├── daily/
+        │   ├── 2026-08-07.jsonl
+        │   └── 2026-08-08.jsonl
+        ├── curated.json
+        └── MEMORY.md
 ```
 
-| 文件 | 用途 | 写入时机 | 限制 |
-|------|------|---------|------|
-| `YYYY-MM-DD.md` | 当日工作日志 | 完成实质工作后 | 追加, 不覆盖 |
-| `MEMORY.md` | 长期笔记 | 蒸馏旧日志时更新 | ≤3,000 字符/会话 |
+| 文件 | 身份 | 写入方式 | 能否作为证据 |
+|---|---|---|---|
+| `daily/*.jsonl` | 原始事实日志 | `O_APPEND` 单记录追加 | 是 |
+| `curated.json` | 策展状态的机器真相 | 临时文件 + `os.replace` | 可追溯到 evidence id |
+| `MEMORY.md` | 面向人和 prompt 的派生视图 | 从策展状态原子重建 | 否，随时可重建 |
 
----
+教学实现使用 `.learn_workbuddy` 命名空间，避免练习代码碰到真实产品状态。`WorkspaceMemory` 会先解析项目绝对路径，再生成 `workspace_id`；日志和策展文件在读取时都校验该 id。
 
-## 工作原理
+## 一条事实如何进入长期记忆
 
-### 每日日志 — 追加模式
+### 1. 记录结构化事实
 
-每天一个文件，命名 `YYYY-MM-DD.md`。完成实质工作后追加一条记录，**永远不覆盖已有内容**。
+`MemoryFact` 不接收一大段自由格式总结，而是要求明确字段：
 
-```markdown
-## 2026-07-08 14:30 — Fixed auth bug
-
-- Problem: Login failed on Safari due to cookie SameSite=None
-- Root cause: Cookie set without Secure flag in auth.js:42
-- Fix: Added `secure: true` to cookie options
-- Files: src/auth.js, src/middleware/cookie.js
+```python
+memory.append_daily_log(
+    "SQLite must run in WAL mode.",
+    kind=FactKind.DECISION,
+    importance=5,
+    source="agent",
+    evidence={"file": "storage.py"},
+)
 ```
 
-追加而非覆盖的原因：
+`kind` 只有四类：
 
-1. **审计轨迹** — 可以追溯什么时间做了什么
-2. **冲突避免** — 多个会话写同一文件不会互相覆盖
-3. **简洁** — 当天的事在当天文件里，不用翻多个文件
+| 类型 | 例子 | 默认是否可蒸馏 |
+|---|---|---|
+| `decision` | 选择 SQLite WAL | 是 |
+| `convention` | 路径必须相对 workspace | 是 |
+| `pitfall` | 不可把 token 写入记忆 | 是 |
+| `outcome` | 本次测试通过 | 否，只留在近期日志 |
 
-### 什么算"实质工作"
+内容、重要度和类型在持久化之前验证。每个 JSON 对象编码为一行，再以一次 `os.write` 追加；成功返回前执行 `fsync`。
 
-| 记 | 不记 |
-|---|------|
-| 写了代码 | 打招呼 |
-| 修了 bug | 简单查询（"这个函数叫什么"） |
-| 写了报告 | 格式化文本 |
-| 做了架构决策 | 查看文件内容 |
-| 调试了问题 | 列出目录 |
+### 2. 通过显式策略蒸馏
 
-规则：**如果做了会产生文件变化或决策的事，就记。否则不记。**
+默认策略的逻辑是：
 
-### MEMORY.md — 长期策展
-
-每日日志是原始记录。但 30 天前的日志太旧了，翻起来费劲。WorkBuddy 的做法：
-
-```
-每日日志 (>30天) ──蒸馏──► MEMORY.md ──然后──► 删除原始日志
+```text
+年龄达到 30 天
+AND 类型属于 decision / convention / pitfall
+AND (importance >= 4 OR 规范化后重复出现 >= 2 次)
 ```
 
-蒸馏 = 按主题归纳，保留精华，丢弃细节：
+这套规则刻意不让 LLM 直接决定“什么值得永远记住”。生产系统可以在候选提取阶段使用模型，但保留条件、作用域和证据关系仍应由 harness 控制。
 
-```
-# 原始日志 (2026-06-01.md, 已删除)
-## 10:00 — Set up ESLint
-- Installed eslint, eslint-config-prettier
-- Created .eslintrc.json with airbnb config
-- Fixed 23 lint errors in src/
-- Added pre-commit hook with husky
+每条策展记忆的 key 由 `kind + 规范化内容` 稳定生成，`evidence_ids` 指向原始事实。因此重复运行 distill 是幂等的，新证据只会更新同一个条目。
 
-# 蒸馏后进入 MEMORY.md
-- ESLint: airbnb config, husky pre-commit hook (2026-06)
-```
+### 3. 保留原始证据
 
-### 3,000 字符限制
+蒸馏是建立派生视图，不是日志清理：
 
-每次会话中，向 MEMORY.md 追加的内容**不超过 3,000 字符**。这不是文件总大小限制，是单次写入限制。原因：
-
-- 防止 agent 过度写作，偏离"记忆"本质
-- 保持 MEMORY.md 精炼——这是快速参考，不是长篇报告
-- 如果一次有太多要记的，说明应该分成多次会话
-
-### 记忆 vs 交付物
-
-```
-用户: "帮我修复 login bug"
-                    │
-                    ▼
-         ┌──── agent 工作 ────┐
-         │                     │
-         ▼                     ▼
-    交付物 (回复)          记忆 (日志)
-    "已修复，改了 auth.js"   追加到 2026-07-08.md
-    ↑ 用户看到的             ↑ agent 下次看到的
+```text
+daily fact log ──select──> curated.json ──render──> MEMORY.md
+       │                    │
+       └──── retained ──────┘  evidence_ids
 ```
 
-记忆是**补充**，不替代正常回复。用户先看到交付物，agent 同时在后台更新记忆。
+删除旧日志会让长期结论失去来源，也让错误蒸馏无法重新计算。真正的存储清理由单独的 retention/backup 策略负责，不和 memory distill 混在一起。
 
-### 写入时机
+### 4. 原子更新与重启恢复
 
-记忆更新发生在 **tool-call 阶段**，在最终文本回复之前：
+直接以 `"w"` 打开 `MEMORY.md`，进程崩溃时可能只剩半个文件。本章采用同目录临时文件：
 
-```
-agent loop:
-  1. 用户消息进来
-  2. 模型决定调用工具 (bash, read_file, ...)
-  3. 执行工具 → 得到结果
-  4. 模型继续推理...
-  5. ┌── 工具阶段结束 ──┐
-     │  ★ 更新记忆 ★   │  ← 在这里写日志
-     └──────────────────┘
-  6. 模型生成最终文本回复
-  7. 回复展示给用户
-```
+1. 写入完整内容；
+2. `flush + fsync`；
+3. `os.replace` 原子替换目标并 `fsync` 所在目录；
+4. 失败时清理临时文件，旧版本保持不变。
 
----
+`curated.json` 是 canonical state，`MEMORY.md` 是可重建投影。如果进程在两次替换之间退出，下一次读取会以 canonical state 修复陈旧投影。新建一个 `WorkspaceMemory(project_dir)` 实例即可从磁盘恢复事实、策展条目和 prompt context；不会反序列化任何进程内对象。
 
-## WorkBuddy 架构对照
+## Prompt 注入边界
 
-### 记忆目录结构
+`get_context_for_agent()` 只注入两部分：
 
-```
-WorkBuddy 的工作区记忆:
-    {project_root}/.workbuddy/memory/
-    ├── 2026-07-01.md    每日日志
-    ├── 2026-07-02.md
-    ├── ...
-    └── MEMORY.md        长期策展笔记
-```
+- 紧凑的 `MEMORY.md`；
+- 最近最多 6 条 workspace facts。
 
-### 写入逻辑
+它不会把所有 daily log 或 session transcript 整体塞回上下文。Memory 的价值不在“存得越多”，而在召回时有明确预算和优先级。
 
-WorkBuddy 的记忆写入在 agent loop 的 tool-call 阶段触发：
+`MemoryAwareAgent` 在每个模型回合前读取这个 bounded view，并提供结构化 `write_memory` 工具。是否继续工具循环由响应中的 `tool_use` block 决定，不依赖 provider 的某个 stop-reason 字符串。
 
-```javascript
-// agent bridge (simplified) — 记忆更新发生在 tool 阶段
-async function runAgentLoop(session) {
-    while (true) {
-        const response = await callLLM(session.messages);
+## 主要代码流程
 
-        if (response.stop_reason !== 'tool_use') {
-            // 工具阶段结束 → 更新记忆
-            if (session.didSubstantiveWork) {
-                await updateWorkspaceMemory(session);
-            }
-            // 然后返回最终文本
-            return response;
-        }
+```text
+append_daily_log
+  -> validate kind / importance / content
+  -> attach workspace_id + fact_id + UTC timestamp
+  -> append one JSONL record + fsync
 
-        // 执行工具调用
-        for (const block of response.content) {
-            if (block.type === 'tool_use') {
-                const result = await executeTool(block);
-                if (isSubstantive(block.name, result)) {
-                    session.didSubstantiveWork = true;
-                }
-            }
-        }
-    }
-}
+distill
+  -> load facts older than cutoff
+  -> reject unstable kinds
+  -> group normalized repeated facts
+  -> apply importance/repetition gate
+  -> merge by deterministic key and evidence id
+  -> atomically replace curated.json and MEMORY.md
 
-async function updateWorkspaceMemory(session) {
-    const memoryDir = path.join(session.cwd, '.workbuddy', 'memory');
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    const logFile = path.join(memoryDir, `${today}.md`);
-
-    // 追加模式 — 'a' flag, never 'w'
-    const entry = formatMemoryEntry(session.workDone);
-    await fs.appendFile(logFile, entry + '\n');
-}
+restart
+  -> resolve the same project scope
+  -> validate workspace_id and schema
+  -> reload daily facts + curated state
+  -> rebuild bounded prompt context
 ```
 
-### 蒸馏逻辑
+## 离线运行与验证
 
-```javascript
-// 定期蒸馏 — 30天前的日志
-async function distillOldLogs(cwd) {
-    const memoryDir = path.join(cwd, '.workbuddy', 'memory');
-    const files = await fs.readdir(memoryDir);
-    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+所有章节通用的无 key 演示：
 
-    for (const file of files) {
-        if (!file.match(/^\d{4}-\d{2}-\d{2}\.md$/)) continue;
-
-        const fileDate = new Date(file.slice(0, 10));
-        if (fileDate.getTime() < cutoff) {
-            // 读取旧日志
-            const content = await fs.readFile(path.join(memoryDir, file), 'utf-8');
-
-            // 按主题蒸馏
-            const distilled = await distillByTopic(content);
-
-            // 追加到 MEMORY.md (不超过 3000 字符)
-            await fs.appendFile(
-                path.join(memoryDir, 'MEMORY.md'),
-                distilled.slice(0, 3000) + '\n'
-            );
-
-            // 删除原始日志
-            await fs.unlink(path.join(memoryDir, file));
-        }
-    }
-}
+```bash
+python3 s10_workspace_memory/code.py --demo
 ```
 
-### 三层记忆全景
+只运行本章行为测试：
 
-工作区记忆是最局部的——只属于当前项目。换一个项目，这些记忆就不相关了。下图展示完整的三层记忆架构及其数据流：
+```bash
+python3 -m pytest -q tests/test_workspace_memory.py
+```
+
+测试覆盖：项目隔离、追加顺序、蒸馏门槛、幂等、证据保留、原子替换失败和跨实例恢复。
+
+配置模型后可运行交互路径：
+
+```bash
+python3 s10_workspace_memory/code.py
+```
+
+## 三层记忆中的位置
 
 ![三层记忆系统架构](./images/three-layer-memory.svg)
 
-```
-Layer 1 (最远): 云端 Profile      ~/.workbuddy/cloud/profile  (s12)
-Layer 2 (中):   用户级 MEMORY.md  ~/.workbuddy/MEMORY.md       (s11)
-Layer 3 (最近): 工作区记忆          {project}/.workbuddy/memory/ (本课)
-```
+工作区记忆属于当前项目；s11 才会处理跨项目的用户偏好，s12 再讨论远端 profile/recall。三层不能只按“文件放在哪里”区分，更重要的是 owner、写入权限、保留策略和召回时机不同。
 
----
+## 常见误区
 
-## 代码 walkthrough
-
-`code.py` 模拟工作区记忆系统：
-
-1. **WorkspaceMemory 类** — 管理每日日志和 MEMORY.md
-2. **追加写入** — 使用 `'a'` 模式，永不覆盖
-3. **实质工作判断** — 根据工具调用类型决定是否记录
-4. **蒸馏模拟** — 30 天前的日志按主题归纳到 MEMORY.md
-5. **3,000 字符限制** — 单次写入不超过限制
-6. **Agent 集成** — 在 tool-call 阶段后、最终回复前更新记忆
-
----
-
-## 运行
-
-```bash
-python s10_workspace_memory/code.py
-```
-
-观察重点：
-- 完成实质工作后，`.workbuddy/memory/YYYY-MM-DD.md` 是否有追加记录？
-- 同一天多次操作，日志是否追加而非覆盖？
-- `/memory` 命令是否显示 MEMORY.md 内容？
-- `/distill` 命令是否将旧日志蒸馏到 MEMORY.md？
-
----
+- **把 transcript 当 memory**：完整轨迹会迅速挤满上下文。
+- **模型说重要就永久保存**：缺少 harness gate，记忆会被猜测和提示注入污染。
+- **蒸馏后删除日志**：丢失证据，无法重算和审计。
+- **直接覆盖策展文件**：崩溃可能损坏长期状态。
+- **只按字符串路径隔离**：相对路径、软链接可能让同一项目得到多个 scope。
+- **把一次测试通过写成长期规则**：outcome 应留在近期日志，不自动晋升。
 
 ## 练习
 
-1. 修改蒸馏逻辑，按"文件路径"而非"主题"组织 MEMORY.md（如 `## src/auth.js` 下汇总所有相关记录）
-2. 添加"记忆搜索"功能——agent 可以搜索历史日志中的关键词
-3. 实现多项目记忆隔离——不同 cwd 的会话写入不同 `.workbuddy/memory/` 目录
-
----
+1. 为 `DistillPolicy` 增加来源置信度，让用户确认的事实比工具推断更容易晋升。
+2. 为 curated entry 增加 supersedes 关系，处理“旧决策被新决策替代”。
+3. 在不加载全部日志的前提下实现按日期倒序读取最近事实。
 
 ## 下一课
 
-工作区记忆解决了"项目内"的记忆。但有些偏好是跨项目的——"我喜欢用 tabs"、"别写注释"、"用中文回复"。这些放哪？s11 讲用户级记忆和身份系统。
-
-s11 User Memory → MEMORY.md + SOUL/IDENTITY/USER/BOOTSTRAP。
+s11 将 owner 从 workspace 提升到 user：偏好需要跨项目复用，同时必须去重并避免项目规则污染全局画像。

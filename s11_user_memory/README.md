@@ -1,327 +1,257 @@
-# s11: User Memory — 跨项目的偏好, 放用户级
+# s11: User Memory — Profile 与 Preference 的用户级边界
 
-> *"跨项目的偏好, 放用户级"* — MEMORY.md + SOUL/IDENTITY/USER/BOOTSTRAP。
+> 工作区记忆回答“这个项目长期有效的事实是什么”；用户记忆回答“这个人跨项目仍然有效的稳定信息与明确偏好是什么”。
 >
-> **Harness 层**: 记忆 — 三层记忆的中层。
+> **Harness 层**：Memory ownership、显式状态变更与 Prompt context。
 
 ---
 
 ![用户级记忆](./images/user-memory.svg)
 
+## 本章解决什么问题
+
+s10 已经能把项目决策、约定和踩坑经验蒸馏成工作区记忆，但以下信息不属于任何项目：
+
+- 用户希望被如何称呼；
+- 用户所在时区；
+- 所有项目都使用中文回复；
+- 默认采用简洁说明；
+- 编辑器统一使用 tabs。
+
+如果把这些内容写进每个项目，会产生复制、漂移和跨用户污染。如果把对话中出现过的所有描述直接追加到一个 `MEMORY.md`，同一个偏好更新后又会同时存在新旧版本。
+
+本章把用户记忆设计成两个不同的契约：
+
+| 类型 | 回答的问题 | 更新方式 | 例子 |
+|---|---|---|---|
+| Profile | “这个用户是谁？” | 显式字段 patch | `name`、`call_them`、`timezone` |
+| Preference | “跨项目默认怎样做？” | 按稳定 key 创建、替换或删除 | `response.language=Chinese` |
+
+两者都属于用户作用域，但不能混成任意 Markdown：Profile 需要字段级更新，Preference 需要冲突替换和幂等重试。
+
+## 设计目标
+
+本章的核心不是“多存一个文件”，而是让 Harness 能回答五个问题：
+
+1. **Owner 是谁？** 每份状态都带稳定 `user_scope`，同一根目录可安全承载多个用户。
+2. **写入是否明确？** 只有 `update_user_profile` 和 `save_user_preference` 等显式工具能改变状态。
+3. **重复调用会怎样？** 相同 key/value 是 no-op，不增长文件、不增加 revision。
+4. **偏好变化会怎样？** 相同 key 的新 value 替换旧 value，Prompt 中不会同时出现冲突规则。
+5. **进程重启后信谁？** JSON 是 canonical state，Markdown 只是可读与 Prompt-facing projection，可从 JSON 修复。
+
 ## 代码架构图
 
 ```mermaid
 flowchart LR
-    A["User Preference"] --> B["Memory File"]
-    B --> C["Deduper"]
-    C --> D["Prompt Injector"]
-    D --> E["Personalized Reply"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    U["Explicit user request"] --> T{"Memory tool"}
+    T -->|"profile patch"| P["profile.json"]
+    T -->|"key + value"| D["Preference deduper"]
+    D -->|"create / update"| J["preferences.json"]
+    D -->|"same key + value"| N["UNCHANGED / no disk write"]
+    P --> UP["persona/user.md"]
+    J --> MP["MEMORY.md"]
+    UP --> C["User context block"]
+    MP --> C
+    C --> A["Agent prompt assembly"]
 ```
 
-## 学习前置知识
+这里有一条重要边界：`UserMemory` 不接收 workspace path，也不读取 s10 的日志。用户上下文和工作区上下文可以在 s15 组装 Prompt 时合并，但存储、更新策略和所有权仍然分开。
 
-- 用户级记忆服务于跨项目偏好和身份, 生命周期比工作区更长。
-- 身份、偏好、规则要分开, 否则更新和覆盖都困难。
-- 本地用户记忆不同于服务端画像。
+## 存储结构
 
-## 本章抓住的 WorkBuddy-style 机制
+教学实现默认写入 `~/.learn_workbuddy/user-memory/`，不会碰真实产品目录：
 
-- 用 persona、identity、user、bootstrap 和 MEMORY.md 演示用户级上下文。
-- 把用户偏好注入多个项目, 同时保留工作区覆盖能力。
-- 为 s12 的云端 profile 做对照。
-
-## 常见误区
-
-- 把用户所有历史都塞进用户记忆, 会让 prompt 变脏。
-- 没有冲突检测, 新旧偏好会互相打架。
-- 把本地可编辑记忆和服务端自动画像混为一谈。
-## 问题
-
-s10 的工作区记忆解决了"项目内"的记忆。但有些偏好是跨项目的：
-
-- "用 tabs 不用 spaces"
-- "回复用中文"
-- "我叫老王"
-- "我在深圳，时区 UTC+8"
-
-这些信息放在工作区记忆里不对——换个项目就没了。放在云端 Profile 里也不够——云端是隐式学习的，不够精确。有些规则是**必须严格遵守**的，不能靠概率推断。
-
-WorkBuddy 的解法：用户级记忆。一个目录 `~/.workbuddy/`，跨所有项目共享，显式写入，强制执行。
-
----
-
-## 解决方案
-
-```
-~/.workbuddy/
-├── MEMORY.md       ← 跨项目记忆 (≤4,000 字符/会话)
-├── persona/core.md         ← 核心性格、价值观、边界
-├── persona/identity.md     ← 名字、物种、风格、emoji
-├── persona/user.md         ← 用户信息: 名字、称呼、城市、备注
-└── persona/bootstrap.md    ← 一次性引导文件 (用完即删)
+```text
+~/.learn_workbuddy/user-memory/
+└── users/
+    └── <scope-id>/
+        ├── profile.json
+        ├── preferences.json
+        ├── MEMORY.md
+        └── persona/
+            ├── core.md
+            ├── identity.md
+            ├── user.md
+            └── bootstrap.md
 ```
 
-| 文件 | 用途 | 写入方式 | 限制 |
-|------|------|---------|------|
-| `MEMORY.md` | 跨项目偏好和规则 | 显式写入 | ≤4,000 字符/会话 |
-| `persona/core.md` | 核心性格 | 身份建立时写入 | 很少修改 |
-| `persona/identity.md` | 名字/物种/emoji | 身份建立时写入 | 偶尔修改 |
-| `persona/user.md` | 用户信息 | 对话中发现后写入 | 按需更新 |
-| `persona/bootstrap.md` | 引导提示 | 首次启动创建 | 用完删除 |
+`scope-id` 是规范化用户标识的稳定摘要。它有两个作用：
 
----
+- 任意账号标识不会直接成为路径，避免 `/`、空格或邮箱出现在目录结构中；
+- canonical JSON 再保存同一个 `user_scope`，即使文件被错误复制到另一个用户目录，也会在读取时拒绝，而不是静默注入错误用户的 Prompt。
 
-## 工作原理
+### Canonical state 与 projection
 
-### persona/core.md — 核心性格
+| 文件 | 角色 | 是否作为真相来源 |
+|---|---|---|
+| `profile.json` | 结构化用户资料 | 是 |
+| `preferences.json` | 带 key、revision、source 的偏好集合 | 是 |
+| `persona/user.md` | 便于人阅读的 Profile 投影 | 否，可重建 |
+| `MEMORY.md` | 便于检查和注入 Prompt 的 Preference 投影 | 否，可重建 |
+| `persona/core.md` | 助手价值与边界 | 独立的 assistant identity |
+| `persona/identity.md` | 助手名字、类型、emoji | 独立的 assistant identity |
+| `persona/bootstrap.md` | 一次性引导说明 | 完成后删除 |
 
-定义 agent 的"灵魂"——价值观、行为准则、边界。这是最底层的性格设定，很少修改。
+这种设计避免了 Markdown 同时承担数据库、编辑协议和 Prompt 三种职责。人可以查看 Markdown，代码用 JSON 完成确定性更新；投影损坏时，由 canonical state 恢复。
 
-```markdown
-# Soul
+## 主要代码流程
 
-Be genuinely helpful, not performatively helpful.
+### 1. Profile：显式 partial update
 
-## Values
-- Honesty over comfort. Don't sugarcoat problems.
-- Action over explanation. Do the thing, don't just describe it.
-- Concise by default. Long answers need justification.
-
-## Boundaries
-- Never guess at URLs or API endpoints.
-- Never modify files without understanding them first.
-- Ask before destructive operations.
-
-## Vibe
-- Direct, warm, slightly dry humor.
-- Treat the user as a competent adult.
+```python
+result = memory.update_profile({
+    "name": "老王",
+    "call_them": "王哥",
+    "timezone": "UTC+8",
+})
 ```
 
-### persona/identity.md — 身份卡片
+更新规则：
 
-```markdown
-# Identity
+- 只修改请求中出现的字段，未出现字段保持不变；
+- `None` 表示明确删除某字段；
+- 不在 schema 中的字段直接报错，避免模型每轮发明新字段；
+- 相同值计入 `unchanged`，不重写文件；
+- 改动发生时原子替换 `profile.json`，再刷新 `persona/user.md`。
 
-Name: WorkBuddy
-Type: Desktop AI companion
-Emoji: 🐝
-Vibe: Reliable, sharp, doesn't waste your time.
+Profile 不是从聊天内容自动抽取的“画像”。只有用户明确提供或明确要求保存的信息才进入这一层。
+
+### 2. Preference：按语义 key 去重
+
+```python
+created = memory.set_preference("response.language", "Chinese")
+unchanged = memory.set_preference("response.language", "Chinese")
+updated = memory.set_preference("response.language", "English")
 ```
 
-### persona/user.md — 用户信息
+三次调用分别返回：
 
-```markdown
-# User
+```text
+CREATED   revision=1  previous=None     current=Chinese
+UNCHANGED revision=1  previous=Chinese  current=Chinese
+UPDATED   revision=2  previous=Chinese  current=English
+```
 
+去重不能只比较整段文本。例如“回复使用中文”和“以后回复使用英文”不是两条并存的长期事实，而是同一个 `response.language` 偏好的两个版本。稳定 key 提供冲突域，value 表示当前状态。
+
+### 3. 显式删除
+
+```python
+memory.delete_preference("response.language")
+```
+
+删除按 key 精确执行，不对自然语言做模糊匹配。Harness 因此可以向用户展示将删除的具体偏好，也能在审计日志中记录明确目标。
+
+### 4. 多用户隔离
+
+```python
+alice = UserMemory(root, user_id="alice")
+bob = UserMemory(root, user_id="bob")
+
+alice.set_preference("editor.indent", "tabs")
+bob.set_preference("editor.indent", "spaces")
+```
+
+两者共享状态根目录，但落入不同 `scope-id`。读取时还会校验 JSON 内部的 `user_scope`：路径隔离负责正常路由，scope marker 负责发现错误复制或调用方传错用户。
+
+### 5. Prompt context
+
+```text
+## Assistant values
+...
+
+## Assistant identity
+...
+
+## User profile
 Name: 老王
-Call them: 老王
-Pronouns: he/him
-City: 深圳
 Timezone: UTC+8
 
-## Notes
-- Prefers tabs over spaces
-- Likes concise responses in Chinese
-- Works primarily with Python and TypeScript
+## Explicit user preferences (cross-project)
+- `response.language`: Chinese
 ```
 
-### persona/bootstrap.md — 一次性引导
+这一块只包含用户所有的上下文。项目决策不会被写入这里；s15 可以根据当前会话分别加载 user context 和 workspace context，再决定顺序、预算和覆盖策略。
 
-首次启动时存在。引导 agent 通过对话了解用户，建立身份，然后**删除自己**。
+## 为什么不能自动记住每句话
 
-```
-~/.workbuddy/persona/bootstrap.md 存在?
-  │
-  ├── YES → 进入引导对话
-  │         │
-  │         ├── 了解用户名字、偏好
-  │         ├── 确定 agent 性格和名字
-  │         ├── 写入 persona/core.md, persona/identity.md, persona/user.md
-  │         └── 删除 persona/bootstrap.md
-  │
-  └── NO → 正常启动 (身份已建立)
-```
+长期记忆会进入未来 Prompt。自动把聊天内容提升为用户事实会带来三个问题：
 
-引导对话示例：
+- **误归因**：用户引用别人的观点，不代表那是用户偏好；
+- **时效不明**：一次性要求可能被错误升级为永久规则；
+- **不可解释**：调用方无法说明某条记忆为何产生，也难以提供撤销入口。
 
-```
-Agent: 嗨，我是你的 AI 助手。第一次见面，先认识一下？
-       你希望我怎么称呼你？
-User:  老王
-Agent: 老王，好的。你在哪个城市？这样我能知道你的时区。
-User:  深圳
-Agent: 你希望我平时说话风格怎样？直接还是委婉？
-User:  直接点
-Agent: 明白了。你想给我起个名字吗？
-User:  就叫你小蜂吧
-Agent: [写入 persona/user.md, persona/identity.md, persona/core.md]
-Agent: [删除 persona/bootstrap.md]
-Agent: 好了老王，我是小蜂 🐝。以后有什么事直接说。
+因此本章采用保守策略：模型可以建议调用记忆工具，但系统提示要求只有在用户明确表达长期意图时才能写入。真正的生产 Harness 还可以在工具执行前增加 ASK 权限、审计和可视化确认。
+
+## 与 s10、s12 的边界
+
+| 层 | Owner | 内容 | 典型读取时机 |
+|---|---|---|---|
+| s10 Workspace Memory | workspace | 项目决策、约定、踩坑 | 进入对应项目时 |
+| s11 User Memory | user | 稳定 Profile、明确跨项目偏好 | 用户会话启动时 |
+| s12 Remote Recall | remote account/service | 长期历史候选与远端 Profile | 当前 query 需要时 |
+
+它们可以在最终 Prompt 中同时出现，但不能共用一个无作用域的 `MEMORY.md`。存储层先保证所有权正确，检索与 Prompt assembly 再决定本轮使用哪些内容。
+
+## 原子写与重启恢复
+
+Profile 与 Preference 都会经历：
+
+```text
+validate -> serialize -> write temp file -> fsync -> os.replace
 ```
 
-### MEMORY.md vs 云端 Profile
+如果写临时文件时进程失败，旧 canonical file 仍然存在；成功替换后，不会留下“写了一半的 JSON”。新进程重新创建 `UserMemory(root, user_id=...)` 即可恢复状态，不依赖内存缓存。
 
-| 特性 | MEMORY.md (用户级) | 云端 Profile |
-|------|-------------------|-------------|
-| 写入方式 | 显式 | 隐式学习 |
-| 精确度 | 精确规则 | 概率推断 |
-| 执行力度 | 必须遵守 | 尽量参考 |
-| 跨项目 | ✅ | ✅ |
-| 示例 | "用 tabs" | "用户似乎喜欢简洁回复" |
+`MEMORY.md` 被人工改坏或处于旧版本时，`read_memory()` 会根据 `preferences.json` 重新生成投影。这体现了 Harness 中常见的原则：可读视图可以修复，canonical state 必须有清晰边界。
 
-MEMORY.md 是**显式合同**。云端 Profile 是**模糊印象**。两者互补，不矛盾。
+## 离线验证
 
-### 4,000 字符限制
+本章测试覆盖：
 
-每次会话向 MEMORY.md 追加的内容不超过 4,000 字符（比工作区的 3,000 多 1,000，因为跨项目信息更多）。
+- Profile partial update、删除和跨重启读取；
+- Preference create/update/unchanged revision 语义；
+- 同 key 只保留当前值；
+- 两个用户共享 root 时仍然隔离；
+- 错误复制的跨 scope JSON 被拒绝；
+- Prompt context 不包含 workspace state；
+- `MEMORY.md` 可从 canonical preferences 修复。
 
-```javascript
-// WorkBuddy 中的限制检查
-const MAX_USER_MEMORY_WRITE = 4000;
-if (newContent.length > MAX_USER_MEMORY_WRITE) {
-    newContent = newContent.slice(0, MAX_USER_MEMORY_WRITE);
-    log.warn('User memory write truncated to 4000 chars');
-}
-```
-
-### 三层记忆全景
-
-```
-Layer 1 (最远): 云端 Profile       服务端 (s12)
-Layer 2 (中):   用户级 ← 本课      ~/.workbuddy/
-Layer 3 (最近): 工作区记忆          {project}/.workbuddy/memory/ (s10)
-```
-
-用户级记忆是中间层——比云端更精确，比工作区更通用。
-
----
-
-## WorkBuddy 架构对照
-
-### 文件位置
-
-```
-~/.workbuddy/
-├── MEMORY.md       (跨项目记忆, ≤4,000 chars/session)
-├── persona/core.md         (核心性格)
-├── persona/identity.md     (身份卡片)
-├── persona/user.md         (用户信息)
-└── persona/bootstrap.md    (一次性引导, 用完即删)
-```
-
-### 启动时加载身份
-
-```javascript
-// agent bridge (simplified) — 启动时加载身份文件
-async function loadIdentity() {
-    const wbDir = path.join(os.homedir(), '.workbuddy');
-
-    // 检查是否需要 bootstrap
-    const bootstrapPath = path.join(wbDir, 'persona/bootstrap.md');
-    if (await fileExists(bootstrapPath)) {
-        // 首次启动 — 进入引导对话
-        return { needsBootstrap: true, prompt: await fs.readFile(bootstrapPath, 'utf-8') };
-    }
-
-    // 加载身份文件
-    const [soul, identity, user, memory] = await Promise.all([
-        fs.readFile(path.join(wbDir, 'persona/core.md')).catch(() => ''),
-        fs.readFile(path.join(wbDir, 'persona/identity.md')).catch(() => ''),
-        fs.readFile(path.join(wbDir, 'persona/user.md')).catch(() => ''),
-        fs.readFile(path.join(wbDir, 'MEMORY.md')).catch(() => ''),
-    ]);
-
-    return { soul, identity, user, memory, needsBootstrap: false };
-}
-```
-
-### Bootstrap 流程
-
-```javascript
-// 引导对话完成后
-async function completeBootstrap(userInfo) {
-    const wbDir = path.join(os.homedir(), '.workbuddy');
-
-    // 写入身份文件
-    await fs.writeFile(path.join(wbDir, 'persona/core.md'), formatSoul(userInfo));
-    await fs.writeFile(path.join(wbDir, 'persona/identity.md'), formatIdentity(userInfo));
-    await fs.writeFile(path.join(wbDir, 'persona/user.md'), formatUser(userInfo));
-
-    // 删除 persona/bootstrap.md — 用完即删
-    await fs.unlink(path.join(wbDir, 'persona/bootstrap.md'));
-
-    // 下次启动时不再引导
-}
-```
-
-### 身份注入系统提示
-
-```javascript
-// 系统提示组装 (s15 会详细讲)
-function buildSystemPrompt(identity, workspaceMemory) {
-    return `
-${identity.soul}
-
-# Identity
-${identity.identity}
-
-# User
-${identity.user}
-
-# User-level Memory (mandatory rules)
-${identity.memory}
-
-# Workspace Memory (project context)
-${workspaceMemory}
-`;
-}
-```
-
-用户级 MEMORY.md 标注为 "mandatory rules"——与工作区记忆的 "project context" 形成对比。前者必须遵守，后者是参考。
-
----
-
-## 代码 walkthrough
-
-`code.py` 模拟用户级记忆和身份系统：
-
-1. **UserMemory 类** — 教学版默认管理 `~/.learn_workbuddy/user-memory/` 下的文件；真实产品路径用 `~/.workbuddy/` 解释概念
-2. **Bootstrap 流程** — 检测 persona/bootstrap.md，引导对话，写入身份，删除引导文件
-3. **身份加载** — 读取 SOUL/IDENTITY/USER/MEMORY 注入系统提示
-4. **4,000 字符限制** — 写入 MEMORY.md 时截断
-5. **Agent 对话** — 身份感知的 agent，遵守用户级规则
-
----
-
-## 运行
+运行：
 
 ```bash
+python3 -m pytest -q tests/test_user_memory.py
+python3 scripts/verify.py
+```
+
+## 运行教学示例
+
+离线查看本章在学习路径中新增的契约：
+
+```bash
+python s11_user_memory/code.py --demo
+```
+
+运行交互式模型示例：
+
+```bash
+MODEL_ID=<model> ANTHROPIC_API_KEY=<key> python s11_user_memory/code.py
+```
+
+可通过环境变量切换本地教学用户和状态根目录：
+
+```bash
+WORKBUDDY_USER_ID=alice \
+WORKBUDDY_HOME=/tmp/learn-workbuddy \
 python s11_user_memory/code.py
 ```
 
-教学运行时不会写真实 `~/.workbuddy/`。默认目录是 `~/.learn_workbuddy/user-memory/`，也可以用
-`WORKBUDDY_HOME=/tmp/learn-workbuddy python s11_user_memory/code.py` 指定临时目录。
-
-首次运行会进入引导对话。观察重点：
-- persona/bootstrap.md 是否在引导完成后被删除？
-- persona/core.md / persona/identity.md / persona/user.md 是否正确写入？
-- 第二次运行是否跳过引导，直接用已建立的身份数据？
-- `/memory` 命令是否显示 MEMORY.md 内容？
-
----
-
 ## 练习
 
-1. 添加"身份更新"功能——用户可以说"以后叫我大王"来更新 persona/user.md
-2. 实现 MEMORY.md 的冲突检测——新规则与旧规则矛盾时提醒用户
-3. 添加 `--reset-identity` 命令行参数，重新创建 persona/bootstrap.md 重启引导流程
-
----
+1. 给 `set_preference` 增加可选的 `expires_at`，让临时跨项目偏好自动失效。
+2. 在不改变存储所有权的前提下，为 Preference 增加来源事件 ID，连接 s09 transcript 证据。
+3. 在 s15 Prompt assembly 中实现明确的优先级：本轮用户指令 > workspace override > user default。
 
 ## 下一课
 
-用户级记忆和工作区记忆都是本地文件。但有些跨设备的偏好——你在公司电脑设的规则，回家电脑上也想要——需要云端同步。s12 讲云端记忆和 `recall_history` 服务端检索。
-
-s12 Cloud Memory → 服务端 Profile + recall_history。
+s11 已经定义“存下来的用户状态是什么”。s12 将继续区分 stored memory 与 recalled context：远端长期历史不是全部注入 Prompt，而是按当前 query 返回带 source 和 score 的候选视图。

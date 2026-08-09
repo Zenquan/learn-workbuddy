@@ -1,90 +1,106 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-"""
-s11_user_memory.py - User-Level Memory and Identity System
+"""s11_user_memory - explicit, user-scoped profile and preferences.
 
-Simulates WorkBuddy's Layer 2 memory: cross-project preferences stored
-at ~/.workbuddy/ with identity files (SOUL/IDENTITY/USER/BOOTSTRAP).
+s10 keeps durable facts owned by one workspace.  This chapter adds the next
+ownership boundary: facts about a person that should follow that person across
+projects.  The canonical state is structured JSON; ``persona/user.md`` and
+``MEMORY.md`` are readable projections used for inspection and prompt assembly.
 
-Production harnesses often use:
-    - ~/.workbuddy/MEMORY.md    — cross-project memory (≤4,000 chars/session)
-    - ~/.workbuddy/persona/core.md      — core personality, values, boundaries
-    - ~/.workbuddy/persona/identity.md  — name, creature type, vibe, emoji
-    - ~/.workbuddy/persona/user.md      — user's name, pronouns, city, notes
-    - ~/.workbuddy/persona/bootstrap.md — one-time setup file, deleted after identity established
-    - Bootstrap flow: conversation → write SOUL/IDENTITY/USER → delete persona/bootstrap.md
-    - User-level memory is explicitly written (not implicitly learned)
-    - Used for precise, mandatory rules that must be followed exactly
-
-Teaching version uses:
-    - Real file I/O to ~/.workbuddy/ directory
-    - Real Anthropic API for bootstrap conversation
-    - Simulated identity file management
-    - 4,000 char limit enforcement on MEMORY.md writes
+The core is deliberately provider-neutral so profile updates, preference
+deduplication, scope isolation, atomic writes, and restart recovery can all be
+tested offline.  The two small agent adapters at the end only demonstrate how
+an LLM can call those explicit state transitions.
 
 Usage:
+    python s11_user_memory/code.py --demo
     python s11_user_memory/code.py
 """
 
+from __future__ import annotations
 
-
-# Machine-readable learning path metadata. Tests enforce that every
-# chapter declares what it inherits and what it adds.
-PROGRESSION = {'chapter': 's11_user_memory',
- 'builds_on': ['s10_workspace_memory'],
- 'adds': ['user-level memory', 'preference dedupe', 'identity prompt blocks'],
- 'preserves': ['workspace memory layer']}
-
-# Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
-import sys as _wb_sys
-from pathlib import Path as _wb_Path
-_WB_ROOT = _wb_Path(__file__).resolve().parents[1]
-if str(_WB_ROOT) not in _wb_sys.path:
-    _wb_sys.path.insert(0, str(_WB_ROOT))
-from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_chapter_demo
-_wb_maybe_run_chapter_demo(__file__, PROGRESSION)
-from mini_workbuddy.chapter_demo import prepare_chapter_provider as _wb_prepare_chapter_provider
-_wb_prepare_chapter_provider()
-import os, sys, time, json, subprocess
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from datetime import datetime
+from typing import Mapping
 
-try:
-    import readline
-    readline.parse_and_bind('set bind-tty-special-chars off')
-    readline.parse_and_bind('set input-meta on')
-    readline.parse_and_bind('set output-meta on')
-    readline.parse_and_bind('set convert-meta off')
-except ImportError:
-    pass
+
+# Machine-readable learning path metadata.  User memory preserves s10's
+# durable/derived-state distinction, but changes the owner from a workspace to
+# an explicit user scope.
+PROGRESSION = {
+    "chapter": "s11_user_memory",
+    "builds_on": ["s10_workspace_memory"],
+    "adds": [
+        "user-scoped profile",
+        "explicit preference updates",
+        "idempotent preference dedupe",
+    ],
+    "preserves": ["workspace memory remains a separate ownership layer"],
+}
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from mini_workbuddy.chapter_demo import maybe_run_chapter_demo
+from mini_workbuddy.chapter_demo import prepare_chapter_provider
+
+maybe_run_chapter_demo(__file__, PROGRESSION)
+prepare_chapter_provider()
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from mini_workbuddy.paths import tutorial_workbuddy_home
 
+
+try:
+    import readline
+
+    readline.parse_and_bind("set bind-tty-special-chars off")
+    readline.parse_and_bind("set input-meta on")
+    readline.parse_and_bind("set output-meta on")
+    readline.parse_and_bind("set convert-meta off")
+except ImportError:
+    pass
+
+
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+if os.getenv("ANTHROPIC_BASE_URL"):
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
 
 WORKDIR = Path.cwd()
-# Use an isolated tutorial directory to avoid touching real ~/.workbuddy.
-WB_DIR = tutorial_workbuddy_home() / "user-memory"
-MAX_USER_MEMORY_WRITE = 4000  # chars per session write
+# The tutorial namespace cannot collide with a real product's ~/.workbuddy.
+USER_MEMORY_ROOT = tutorial_workbuddy_home() / "user-memory"
+SCHEMA_VERSION = 1
+MAX_PREFERENCE_CHARS = 4_000
+PROFILE_FIELDS = frozenset(
+    {"name", "call_them", "pronouns", "city", "timezone", "notes"}
+)
+PREFERENCE_KEY = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 
-# Default files
+
 BOOTSTRAP_TEMPLATE = """# Bootstrap
 
-This is your first conversation. Get to know the user:
-1. Ask their name and how they'd like to be called
-2. Ask their city (for timezone awareness)
-3. Ask their preferred communication style (direct vs. gentle)
-4. Ask what name they'd like to call you (the AI assistant)
-5. Ask for an emoji they associate with you
+This is your first conversation. Learn only stable user-level information:
+1. Ask the user's name and how they would like to be addressed
+2. Ask their city or timezone when it is useful
+3. Ask for one explicit cross-project communication preference
+4. Ask what name and emoji they would like to give the assistant
 
-After the conversation, use the save_identity tool to write identity files,
-then use the delete_bootstrap tool to remove this file.
-
-Keep it natural — don't ask all questions at once. Have a real conversation.
+After the conversation, call save_identity once. The harness writes the user
+profile and preference explicitly, then removes this one-time file.
 """
+
 
 DEFAULT_SOUL = """# Soul
 
@@ -106,152 +122,465 @@ Be genuinely helpful, not performatively helpful.
 """
 
 
-# ═══════════════════════════════════════════════════════════════
-# UserMemory — Layer 2: cross-project identity and preferences
-# ═══════════════════════════════════════════════════════════════
+class UserMemoryError(RuntimeError):
+    """Base class for failures at the user-memory boundary."""
+
+
+class UserScopeError(UserMemoryError):
+    """Raised when persisted state belongs to a different user scope."""
+
+
+class UserMemoryValidationError(UserMemoryError):
+    """Raised before invalid profile or preference data reaches disk."""
+
+
+class WriteStatus(str, Enum):
+    """Observable result of an explicit preference mutation."""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    DELETED = "deleted"
+
+
+@dataclass(frozen=True)
+class Preference:
+    """One addressable cross-project rule owned by a user."""
+
+    key: str
+    value: str
+    source: str
+    updated_at: str
+    revision: int = 1
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "Preference":
+        try:
+            return cls(
+                key=str(payload["key"]),
+                value=str(payload["value"]),
+                source=str(payload.get("source", "explicit")),
+                updated_at=str(payload["updated_at"]),
+                revision=int(payload.get("revision", 1)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise UserMemoryValidationError(f"invalid preference record: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class PreferenceWrite:
+    """Result returned to tools, tests, and audit code after a mutation."""
+
+    status: WriteStatus
+    key: str
+    previous_value: str | None
+    current_value: str | None
+    revision: int
+
+
+@dataclass(frozen=True)
+class ProfileWrite:
+    """Fields changed and fields already current in one explicit profile patch."""
+
+    changed: tuple[str, ...] = field(default_factory=tuple)
+    unchanged: tuple[str, ...] = field(default_factory=tuple)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _scope_id(user_id: str) -> str:
+    normalized = user_id.strip().casefold()
+    if not normalized:
+        raise UserMemoryValidationError("user_id must not be empty")
+    # A stable digest makes arbitrary account identifiers safe as path names
+    # while keeping the original identifier out of prompts and file listings.
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _preference_key(value: str) -> str:
+    key = value.strip().casefold()
+    if not PREFERENCE_KEY.fullmatch(key):
+        raise UserMemoryValidationError(
+            "preference key must use lowercase words separated by '.', '_' or '-'"
+        )
+    return key
+
+
+def _clean_text(value: object, *, field_name: str, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if not text:
+        raise UserMemoryValidationError(f"{field_name} must not be empty")
+    if len(text) > max_chars:
+        raise UserMemoryValidationError(
+            f"{field_name} exceeds the {max_chars}-character teaching limit"
+        )
+    return text
+
 
 class UserMemory:
+    """Durable profile and preferences isolated by explicit user scope.
+
+    Layout under the tutorial state root::
+
+        user-memory/users/<scope-id>/
+        ├── profile.json              # canonical user facts
+        ├── preferences.json          # canonical keyed rules
+        ├── MEMORY.md                 # derived prompt/readable preference view
+        └── persona/
+            ├── core.md               # assistant values and boundaries
+            ├── identity.md           # assistant name/type/emoji
+            ├── user.md               # derived readable profile view
+            └── bootstrap.md          # one-time setup, deleted on completion
+
+    ``user_id`` is mandatory in the storage model even when the interactive
+    lesson defaults it to ``local-user``.  A workspace path is intentionally
+    absent: project facts belong to s10 and must never leak into this layer.
     """
-    Manages user-level memory files at ~/.workbuddy/ (simulated at .workbuddy_user/).
 
-    File structure:
-        .workbuddy_user/
-        ├── MEMORY.md       — cross-project preferences (≤4,000 chars/session)
-        ├── persona/core.md         — core personality
-        ├── persona/identity.md     — name, type, emoji, vibe
-        ├── persona/user.md         — user's info
-        └── persona/bootstrap.md    — one-time setup (deleted after identity established)
-    """
+    def __init__(self, base_dir: Path | None = None, *, user_id: str = "local-user"):
+        self.root_dir = Path(base_dir or USER_MEMORY_ROOT).expanduser().resolve()
+        self.user_id = user_id.strip()
+        self.scope_id = _scope_id(self.user_id)
+        self.base_dir = self.root_dir / "users" / self.scope_id
+        self.persona_dir = self.base_dir / "persona"
+        self.profile_path = self.base_dir / "profile.json"
+        self.preferences_path = self.base_dir / "preferences.json"
+        self.memory_path = self.base_dir / "MEMORY.md"
+        self.soul_path = self.persona_dir / "core.md"
+        self.identity_path = self.persona_dir / "identity.md"
+        self.user_path = self.persona_dir / "user.md"
+        self.bootstrap_path = self.persona_dir / "bootstrap.md"
+        self.persona_dir.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, base_dir: Path = None):
-        self.base_dir = base_dir or WB_DIR
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-
-    @property
-    def soul_path(self) -> Path: return self.base_dir / "persona/core.md"
-    @property
-    def identity_path(self) -> Path: return self.base_dir / "persona/identity.md"
-    @property
-    def user_path(self) -> Path: return self.base_dir / "persona/user.md"
-    @property
-    def memory_path(self) -> Path: return self.base_dir / "MEMORY.md"
-    @property
-    def bootstrap_path(self) -> Path: return self.base_dir / "persona/bootstrap.md"
-
-    # ── Bootstrap detection ───────────────────────────────────
+    # ── Bootstrap lifecycle ───────────────────────────────────
 
     def needs_bootstrap(self) -> bool:
-        """Check if persona/bootstrap.md exists (first-time setup needed)."""
+        """Return whether the one-time setup instruction still exists."""
+
         return self.bootstrap_path.exists()
 
-    def create_bootstrap(self):
-        """Create persona/bootstrap.md for first-time setup."""
-        self.bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
-        self.bootstrap_path.write_text(BOOTSTRAP_TEMPLATE, encoding="utf-8")
+    def create_bootstrap(self) -> None:
+        """Create the setup instruction without overwriting an interrupted run."""
+
+        if not self.bootstrap_path.exists():
+            self.bootstrap_path.write_text(BOOTSTRAP_TEMPLATE, encoding="utf-8")
 
     def read_bootstrap(self) -> str:
-        if not self.bootstrap_path.exists():
-            return ""
-        return self.bootstrap_path.read_text(encoding="utf-8")
+        return self._read_text(self.bootstrap_path)
 
-    def delete_bootstrap(self):
-        """Delete persona/bootstrap.md — called after identity is established."""
-        if self.bootstrap_path.exists():
-            self.bootstrap_path.unlink()
-            print(f"\033[90m[identity] persona/bootstrap.md deleted (identity established)\033[0m")
+    def delete_bootstrap(self) -> None:
+        """Finish bootstrap only after both user and assistant identity exist."""
 
-    # ── Identity files ────────────────────────────────────────
+        if not self.is_identity_established():
+            raise UserMemoryValidationError(
+                "cannot complete bootstrap before profile and assistant identity are saved"
+            )
+        self.bootstrap_path.unlink(missing_ok=True)
 
-    def save_identity(self, soul: str, identity: str, user_info: str):
-        """Write identity files after bootstrap conversation."""
-        self.soul_path.parent.mkdir(parents=True, exist_ok=True)
-        self.soul_path.write_text(soul, encoding="utf-8")
-        self.identity_path.write_text(identity, encoding="utf-8")
-        self.user_path.write_text(user_info, encoding="utf-8")
-        print(f"\033[90m[identity] Written: persona/core.md, persona/identity.md, persona/user.md\033[0m")
+    # ── Profile: stable facts about the person ────────────────
 
-    def load_identity(self) -> dict:
-        """Load all identity files for system prompt injection."""
+    def read_profile(self) -> dict[str, str]:
+        payload = self._read_scoped_json(self.profile_path, default_key="profile")
+        profile = payload.get("profile", {})
+        if not isinstance(profile, dict):
+            raise UserMemoryValidationError("profile must be a JSON object")
+        return {str(key): str(value) for key, value in profile.items()}
+
+    def update_profile(self, changes: Mapping[str, object]) -> ProfileWrite:
+        """Apply an explicit partial update; omitted fields remain untouched.
+
+        A ``None`` value removes a field.  Unknown fields are rejected instead
+        of silently becoming prompt data, which keeps the profile contract
+        inspectable and prevents an LLM from inventing a new schema per turn.
+        """
+
+        unknown = sorted(set(changes) - PROFILE_FIELDS)
+        if unknown:
+            raise UserMemoryValidationError(
+                f"unknown profile fields: {', '.join(unknown)}"
+            )
+
+        profile = self.read_profile()
+        changed: list[str] = []
+        unchanged: list[str] = []
+        for key, raw_value in changes.items():
+            if raw_value is None:
+                if key in profile:
+                    del profile[key]
+                    changed.append(key)
+                else:
+                    unchanged.append(key)
+                continue
+            value = _clean_text(raw_value, field_name=key, max_chars=1_000)
+            if profile.get(key) == value:
+                unchanged.append(key)
+            else:
+                profile[key] = value
+                changed.append(key)
+
+        if changed:
+            self._write_scoped_json(self.profile_path, "profile", profile)
+            self._write_profile_projection(profile)
+        return ProfileWrite(tuple(sorted(changed)), tuple(sorted(unchanged)))
+
+    # ── Preferences: addressable, explicit cross-project rules ─
+
+    def list_preferences(self) -> list[Preference]:
+        payload = self._read_scoped_json(
+            self.preferences_path, default_key="preferences"
+        )
+        records = payload.get("preferences", [])
+        if not isinstance(records, list):
+            raise UserMemoryValidationError("preferences must be a JSON array")
+        preferences = [Preference.from_dict(item) for item in records]
+        if len({item.key for item in preferences}) != len(preferences):
+            raise UserMemoryValidationError("duplicate preference keys in canonical state")
+        return sorted(preferences, key=lambda item: item.key)
+
+    def set_preference(
+        self,
+        key: str,
+        value: str,
+        *,
+        source: str = "explicit",
+        updated_at: str | None = None,
+    ) -> PreferenceWrite:
+        """Create or replace one preference using its stable semantic key.
+
+        Repeating the same key/value pair is a true no-op: no revision bump and
+        no disk rewrite.  A different value is an update, not a second line in
+        MEMORY.md, so stale and current rules cannot both reach the prompt.
+        """
+
+        normalized_key = _preference_key(key)
+        normalized_value = _clean_text(
+            value, field_name="preference value", max_chars=MAX_PREFERENCE_CHARS
+        )
+        normalized_source = _clean_text(source, field_name="source", max_chars=100)
+        preferences = {item.key: item for item in self.list_preferences()}
+        previous = preferences.get(normalized_key)
+
+        if previous and previous.value == normalized_value:
+            return PreferenceWrite(
+                WriteStatus.UNCHANGED,
+                normalized_key,
+                previous.value,
+                previous.value,
+                previous.revision,
+            )
+
+        revision = previous.revision + 1 if previous else 1
+        preferences[normalized_key] = Preference(
+            key=normalized_key,
+            value=normalized_value,
+            source=normalized_source,
+            updated_at=updated_at or _now_iso(),
+            revision=revision,
+        )
+        self._store_preferences(preferences.values())
+        return PreferenceWrite(
+            WriteStatus.UPDATED if previous else WriteStatus.CREATED,
+            normalized_key,
+            previous.value if previous else None,
+            normalized_value,
+            revision,
+        )
+
+    def delete_preference(self, key: str) -> PreferenceWrite:
+        """Delete by key so removal is explicit and cannot match fuzzy text."""
+
+        normalized_key = _preference_key(key)
+        preferences = {item.key: item for item in self.list_preferences()}
+        previous = preferences.pop(normalized_key, None)
+        if previous is None:
+            return PreferenceWrite(
+                WriteStatus.UNCHANGED, normalized_key, None, None, 0
+            )
+        self._store_preferences(preferences.values())
+        return PreferenceWrite(
+            WriteStatus.DELETED,
+            normalized_key,
+            previous.value,
+            None,
+            previous.revision,
+        )
+
+    def read_memory(self) -> str:
+        """Return the derived preference view, repairing stale projections."""
+
+        expected = self._render_preferences(self.list_preferences())
+        if self._read_text(self.memory_path) != expected:
+            self._atomic_write_text(self.memory_path, expected)
+        return expected
+
+    def append_memory(self, content: str) -> PreferenceWrite:
+        """Compatibility helper that still deduplicates free-form rules.
+
+        New integrations should call ``set_preference`` with a meaningful key.
+        For older callers, a content digest provides deterministic identity, so
+        retrying the same write cannot grow MEMORY.md indefinitely.
+        """
+
+        value = _clean_text(
+            content, field_name="preference value", max_chars=MAX_PREFERENCE_CHARS
+        )
+        digest = hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()[:12]
+        return self.set_preference(f"legacy.{digest}", value, source="legacy-explicit")
+
+    # ── Assistant identity and prompt assembly ────────────────
+
+    def save_identity(
+        self,
+        *,
+        soul: str,
+        assistant_identity: str,
+        profile: Mapping[str, object],
+    ) -> None:
+        """Persist assistant identity separately from facts about the user."""
+
+        self._atomic_write_text(self.soul_path, soul.strip() + "\n")
+        self._atomic_write_text(
+            self.identity_path, assistant_identity.strip() + "\n"
+        )
+        self.update_profile(profile)
+
+    def load_identity(self) -> dict[str, str]:
+        """Load readable prompt blocks without exposing canonical JSON."""
+
+        profile = self.read_profile()
+        if profile and not self.user_path.exists():
+            self._write_profile_projection(profile)
         return {
-            "soul": self._read(self.soul_path),
-            "identity": self._read(self.identity_path),
-            "user": self._read(self.user_path),
-            "memory": self._read(self.memory_path),
+            "soul": self._read_text(self.soul_path),
+            "identity": self._read_text(self.identity_path),
+            "user": self._read_text(self.user_path),
+            "memory": self.read_memory(),
         }
 
     def is_identity_established(self) -> bool:
-        """Check if identity files exist (bootstrap completed)."""
-        return self.soul_path.exists() and self.identity_path.exists() and self.user_path.exists()
-
-    # ── MEMORY.md (cross-project preferences) ─────────────────
-
-    def read_memory(self) -> str:
-        return self._read(self.memory_path)
-
-    def append_memory(self, content: str):
-        """
-        Append to MEMORY.md with 4,000 char limit per session.
-
-        Production harness: each session can append up to 4,000 chars.
-        This is NOT the total file size — it's per-write.
-        """
-        if len(content) > MAX_USER_MEMORY_WRITE:
-            content = content[:MAX_USER_MEMORY_WRITE] + "\n... (truncated at 4000 chars)"
-            print(f"\033[33m[identity] MEMORY.md write truncated to {MAX_USER_MEMORY_WRITE} chars\033[0m")
-
-        with open(self.memory_path, "a", encoding="utf-8") as f:
-            f.write(content + "\n")
-        print(f"\033[90m[identity] Appended {len(content)} chars to MEMORY.md\033[0m")
-
-    # ── Context for agent ─────────────────────────────────────
+        return bool(self.read_profile()) and self.soul_path.exists() and self.identity_path.exists()
 
     def get_context_for_agent(self) -> str:
-        """Build identity context string for system prompt."""
+        """Build only user-owned prompt blocks; workspace context is a caller concern."""
+
         if not self.is_identity_established():
-            return "(identity not yet established)"
-
-        id = self.load_identity()
-        parts = []
-
-        if id["soul"]:
-            parts.append(f"## Soul\n{id['soul']}")
-        if id["identity"]:
-            parts.append(f"## Identity\n{id['identity']}")
-        if id["user"]:
-            parts.append(f"## User\n{id['user']}")
-        if id["memory"]:
-            parts.append(f"## User-level Memory (MANDATORY — must follow these rules)\n{id['memory']}")
-
+            return "(user identity not yet established)"
+        identity = self.load_identity()
+        parts = [
+            f"## Assistant values\n{identity['soul'].strip()}",
+            f"## Assistant identity\n{identity['identity'].strip()}",
+            f"## User profile\n{identity['user'].strip()}",
+        ]
+        if identity["memory"]:
+            parts.append(
+                "## Explicit user preferences (cross-project)\n"
+                + identity["memory"].strip()
+            )
         return "\n\n".join(parts)
 
-    def _read(self, path: Path) -> str:
+    # ── Persistence helpers ───────────────────────────────────
+
+    def _read_scoped_json(self, path: Path, *, default_key: str) -> dict[str, object]:
         if not path.exists():
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "user_scope": self.scope_id,
+                default_key: {} if default_key == "profile" else [],
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise UserMemoryValidationError(f"cannot read {path.name}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise UserMemoryValidationError(f"{path.name} root must be a JSON object")
+        if payload.get("user_scope") != self.scope_id:
+            raise UserScopeError(f"{path.name} belongs to another user scope")
+        return payload
+
+    def _write_scoped_json(
+        self, path: Path, key: str, value: object
+    ) -> None:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "user_scope": self.scope_id,
+            key: value,
+        }
+        self._atomic_write_text(
+            path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        )
+
+    def _store_preferences(self, preferences) -> None:
+        ordered = sorted(preferences, key=lambda item: item.key)
+        self._write_scoped_json(
+            self.preferences_path,
+            "preferences",
+            [asdict(item) for item in ordered],
+        )
+        self._atomic_write_text(self.memory_path, self._render_preferences(ordered))
+
+    def _write_profile_projection(self, profile: Mapping[str, str]) -> None:
+        labels = {
+            "name": "Name",
+            "call_them": "Call them",
+            "pronouns": "Pronouns",
+            "city": "City",
+            "timezone": "Timezone",
+            "notes": "Notes",
+        }
+        lines = ["# User", ""]
+        lines.extend(
+            f"{labels[key]}: {profile[key]}" for key in labels if profile.get(key)
+        )
+        self._atomic_write_text(self.user_path, "\n".join(lines).rstrip() + "\n")
+
+    @staticmethod
+    def _render_preferences(preferences: list[Preference]) -> str:
+        if not preferences:
             return ""
-        return path.read_text(encoding="utf-8")
+        lines = ["# Explicit User Preferences", ""]
+        lines.extend(f"- `{item.key}`: {item.value}" for item in preferences)
+        return "\n".join(lines) + "\n"
 
+    @staticmethod
+    def _read_text(path: Path) -> str:
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
-# ═══════════════════════════════════════════════════════════════
-# BootstrapAgent — first-time identity setup conversation
-# ═══════════════════════════════════════════════════════════════
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        """Replace a complete state/projection file or leave the old file intact."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_name = handle.name
+            os.replace(temp_name, path)
+        finally:
+            if temp_name:
+                Path(temp_name).unlink(missing_ok=True)
+
 
 class BootstrapAgent:
-    """
-    Runs the bootstrap conversation to establish identity.
-
-    Real WorkBuddy flow:
-    1. persona/bootstrap.md exists → enter bootstrap mode
-    2. Agent has a natural conversation to learn about user
-    3. Agent calls save_identity tool → writes SOUL/IDENTITY/USER
-    4. Agent calls delete_bootstrap tool → removes persona/bootstrap.md
-    5. Next session starts normally (no persona/bootstrap.md)
-    """
+    """First-run adapter: conversation -> explicit profile/preference writes."""
 
     def __init__(self, memory: UserMemory):
         self.memory = memory
         self.client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
         self.model = os.environ["MODEL_ID"]
         self.messages: list[dict] = []
-        self._identity_data = None
+        self.completed = False
 
     def _build_system(self) -> str:
         return f"""You are an AI assistant doing a first-time setup conversation.
@@ -261,116 +590,107 @@ class BootstrapAgent:
 # Bootstrap Instructions
 {self.memory.read_bootstrap()}
 
-# Current time
-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Use save_identity only after the user explicitly supplied the profile and
+preference values. Do not infer permanent memory from conversational tone."""
 
-You have tools to save the user's identity and complete bootstrap.
-Use save_identity when you have enough information (name, city, style, your name, emoji).
-Use delete_bootstrap after saving identity."""
-
-    def _build_tools(self) -> list[dict]:
+    @staticmethod
+    def _build_tools() -> list[dict]:
         return [
             {
                 "name": "save_identity",
-                "description": "Save identity files after learning about the user. "
-                               "Call this when you have the user's name, city, style preference, "
-                               "a name for yourself, and an emoji.",
-                "input_schema": {"type": "object", "properties": {
-                    "user_name": {"type": "string", "description": "User's name"},
-                    "call_them": {"type": "string", "description": "How to address the user"},
-                    "city": {"type": "string", "description": "User's city"},
-                    "style": {"type": "string", "description": "Communication style: direct or gentle"},
-                    "assistant_name": {"type": "string", "description": "Name the user chose for you"},
-                    "emoji": {"type": "string", "description": "Emoji the user associates with you"},
-                    "assistant_type": {"type": "string", "description": "What kind of assistant you are"},
-                }, "required": ["user_name", "call_them", "city", "style",
-                                 "assistant_name", "emoji"]},
-            },
-            {
-                "name": "delete_bootstrap",
-                "description": "Delete persona/bootstrap.md after identity is saved. "
-                               "This completes the bootstrap process.",
-                "input_schema": {"type": "object", "properties": {}},
-            },
+                "description": "Save explicit first-run identity, profile and preference data.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "user_name": {"type": "string"},
+                        "call_them": {"type": "string"},
+                        "city": {"type": "string"},
+                        "timezone": {"type": "string"},
+                        "assistant_name": {"type": "string"},
+                        "emoji": {"type": "string"},
+                        "preference_key": {"type": "string"},
+                        "preference_value": {"type": "string"},
+                    },
+                    "required": [
+                        "user_name",
+                        "call_them",
+                        "assistant_name",
+                        "emoji",
+                        "preference_key",
+                        "preference_value",
+                    ],
+                },
+            }
         ]
 
     def chat(self, user_message: str) -> str:
-        """Run one turn of the bootstrap conversation."""
         self.messages.append({"role": "user", "content": user_message})
-
         while True:
-            resp = self.client.messages.create(
-                model=self.model, system=self._build_system(),
-                messages=self.messages, tools=self._build_tools(),
-                max_tokens=4000)
-            self.messages.append({"role": "assistant", "content": resp.content})
-
-            if resp.stop_reason != "tool_use":
+            response = self.client.messages.create(
+                model=self.model,
+                system=self._build_system(),
+                messages=self.messages,
+                tools=self._build_tools(),
+                max_tokens=4_000,
+            )
+            self.messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason != "tool_use":
                 break
+            results = []
+            for block in response.content:
+                if block.type != "tool_use" or block.name != "save_identity":
+                    continue
+                self._complete(block.input)
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": "Identity, profile and preference saved explicitly.",
+                    }
+                )
+            self.messages.append({"role": "user", "content": results})
+        return self._last_text()
 
-            tool_results = []
-            for block in resp.content:
-                if block.type == "tool_use":
-                    if block.name == "save_identity":
-                        self._identity_data = block.input
-                        self._save_identity_files(block.input)
-                        tool_results.append({"type": "tool_result",
-                                             "tool_use_id": block.id,
-                                             "content": "Identity files saved successfully."})
-                    elif block.name == "delete_bootstrap":
-                        self.memory.delete_bootstrap()
-                        tool_results.append({"type": "tool_result",
-                                             "tool_use_id": block.id,
-                                             "content": "persona/bootstrap.md deleted. Bootstrap complete."})
-            self.messages.append({"role": "user", "content": tool_results})
+    def _complete(self, data: Mapping[str, object]) -> None:
+        assistant_name = str(data.get("assistant_name", "WorkBuddy"))
+        emoji = str(data.get("emoji", "🐝"))
+        assistant_identity = (
+            "# Identity\n\n"
+            f"Name: {assistant_name}\n"
+            "Type: Desktop AI companion\n"
+            f"Emoji: {emoji}\n"
+        )
+        profile = {
+            key: data[key]
+            for key in ("user_name", "call_them", "city", "timezone")
+            if data.get(key)
+        }
+        profile["name"] = profile.pop("user_name")
+        self.memory.save_identity(
+            soul=DEFAULT_SOUL,
+            assistant_identity=assistant_identity,
+            profile=profile,
+        )
+        self.memory.set_preference(
+            str(data["preference_key"]), str(data["preference_value"])
+        )
+        self.memory.delete_bootstrap()
+        self.completed = True
 
-        # Extract text
-        final = ""
-        for block in self.messages[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                final += block.text
-        return final
-
-    def _save_identity_files(self, data: dict):
-        """Format and write persona/core.md, persona/identity.md, persona/user.md."""
-        soul = DEFAULT_SOUL
-        default_vibe = "Reliable, sharp, doesn't waste your time."
-        identity = f"""# Identity
-
-Name: {data.get('assistant_name', 'WorkBuddy')}
-Type: {data.get('assistant_type', 'Desktop AI companion')}
-Emoji: {data.get('emoji', '🐝')}
-Vibe: {data.get('style', default_vibe)}
-"""
-        user_info = f"""# User
-
-Name: {data.get('user_name', '')}
-Call them: {data.get('call_them', data.get('user_name', ''))}
-City: {data.get('city', '')}
-Timezone: (derived from city)
-
-## Notes
-- Prefers {data.get('style', 'direct')} communication style
-"""
-        self.memory.save_identity(soul, identity, user_info)
+    def _last_text(self) -> str:
+        return "".join(
+            block.text
+            for block in self.messages[-1]["content"]
+            if getattr(block, "type", None) == "text"
+        )
 
     @property
     def is_complete(self) -> bool:
-        return not self.memory.needs_bootstrap() and self._identity_data is not None
+        return self.completed and not self.memory.needs_bootstrap()
 
-
-# ═══════════════════════════════════════════════════════════════
-# IdentityAwareAgent — uses established identity in conversation
-# ═══════════════════════════════════════════════════════════════
 
 class IdentityAwareAgent:
-    """
-    Agent that uses established identity (SOUL/IDENTITY/USER/MEMORY)
-    in its system prompt.
-
-    Production harness: identity files are injected into the system prompt
-    at session start. MEMORY.md rules are marked as MANDATORY.
-    """
+    """Agent adapter exposing explicit user-memory mutations as tools."""
 
     def __init__(self, memory: UserMemory, cwd: Path):
         self.memory = memory
@@ -380,206 +700,165 @@ class IdentityAwareAgent:
         self.messages: list[dict] = []
 
     def _build_system(self) -> str:
-        identity_ctx = self.memory.get_context_for_agent()
         return f"""You are a coding agent at {self.cwd}.
 
-{identity_ctx}
+{self.memory.get_context_for_agent()}
 
-Follow the user-level memory rules exactly — they are MANDATORY.
-Be concise. Act, don't over-explain."""
+Only persist a profile or preference when the user explicitly asks. User memory
+is cross-project; project decisions belong to workspace memory instead."""
 
-    def _build_tools(self) -> list[dict]:
+    @staticmethod
+    def _build_tools() -> list[dict]:
         return [
             {
                 "name": "bash",
-                "description": "Run a shell command.",
-                "input_schema": {"type": "object",
+                "description": "Run a shell command in the current workspace.",
+                "input_schema": {
+                    "type": "object",
                     "properties": {"command": {"type": "string"}},
-                    "required": ["command"]},
+                    "required": ["command"],
+                },
             },
             {
-                "name": "save_user_memory",
-                "description": "Save a cross-project preference or rule to MEMORY.md. "
-                               "Use for rules that should apply to ALL projects.",
-                "input_schema": {"type": "object",
-                    "properties": {"rule": {"type": "string",
-                        "description": "The rule or preference to remember permanently"}},
-                    "required": ["rule"]},
+                "name": "update_user_profile",
+                "description": "Explicitly patch stable facts about this user.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        key: {"type": "string"} for key in sorted(PROFILE_FIELDS)
+                    },
+                },
+            },
+            {
+                "name": "save_user_preference",
+                "description": "Create or replace one cross-project preference by key.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["key", "value"],
+                },
             },
         ]
 
     def chat(self, user_message: str) -> str:
         self.messages.append({"role": "user", "content": user_message})
-
         while True:
-            resp = self.client.messages.create(
-                model=self.model, system=self._build_system(),
-                messages=self.messages, tools=self._build_tools(),
-                max_tokens=8000)
-            self.messages.append({"role": "assistant", "content": resp.content})
-
-            if resp.stop_reason != "tool_use":
+            response = self.client.messages.create(
+                model=self.model,
+                system=self._build_system(),
+                messages=self.messages,
+                tools=self._build_tools(),
+                max_tokens=8_000,
+            )
+            self.messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason != "tool_use":
                 break
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                output = self._dispatch_tool(block.name, block.input)
+                results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
+                )
+            self.messages.append({"role": "user", "content": results})
+        return "".join(
+            block.text
+            for block in self.messages[-1]["content"]
+            if getattr(block, "type", None) == "text"
+        )
 
-            tool_results = []
-            for block in resp.content:
-                if block.type == "tool_use":
-                    if block.name == "bash":
-                        cmd = block.input.get("command", "")
-                        print(f"\033[90m[tool] bash: {cmd[:80]}\033[0m")
-                        out = self._run_bash(cmd)
-                        tool_results.append({"type": "tool_result",
-                                             "tool_use_id": block.id, "content": out})
-                    elif block.name == "save_user_memory":
-                        rule = block.input.get("rule", "")
-                        self.memory.append_memory(rule)
-                        tool_results.append({"type": "tool_result",
-                                             "tool_use_id": block.id,
-                                             "content": "Rule saved to user-level MEMORY.md."})
-            self.messages.append({"role": "user", "content": tool_results})
-
-        final = ""
-        for block in self.messages[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                final += block.text
-        return final
+    def _dispatch_tool(self, name: str, arguments: Mapping[str, object]) -> str:
+        if name == "bash":
+            return self._run_bash(str(arguments.get("command", "")))
+        if name == "update_user_profile":
+            result = self.memory.update_profile(arguments)
+            return json.dumps(asdict(result), ensure_ascii=False)
+        if name == "save_user_preference":
+            result = self.memory.set_preference(
+                str(arguments.get("key", "")), str(arguments.get("value", ""))
+            )
+            return json.dumps(asdict(result), ensure_ascii=False, default=str)
+        return f"Error: unknown tool {name}"
 
     def _run_bash(self, command: str) -> str:
-        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
-        if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
+        # Tool policy is taught in s04.  This small parity guard only prevents
+        # the memory lesson from accidentally demonstrating obvious host-wide
+        # destructive commands when run standalone.
+        dangerous = ("rm -rf /", "sudo", "shutdown", "reboot")
+        if any(fragment in command for fragment in dangerous):
+            return "Error: dangerous command blocked"
         try:
-            r = subprocess.run(command, shell=True, cwd=str(self.cwd),
-                               capture_output=True, text=True, timeout=120)
-            out = (r.stdout + r.stderr).strip()
-            return out[:50000] if out else "(no output)"
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
         except subprocess.TimeoutExpired:
-            return "Error: Timeout (120s)"
-        except Exception as e:
-            return f"Error: {e}"
+            return "Error: timeout (120s)"
+        output = (result.stdout + result.stderr).strip()
+        return output[:50_000] if output else "(no output)"
 
 
-# ═══════════════════════════════════════════════════════════════
-# Entry Point
-# ═══════════════════════════════════════════════════════════════
-
-def main():
-    print("╔═══════════════════════════════════════════════════════════╗")
-    print("║  s11: User Memory — 跨项目偏好 + 身份系统                  ║")
-    print("║  跨项目的偏好, 放用户级                                    ║")
-    print("╚═══════════════════════════════════════════════════════════╝")
-    print()
-
-    memory = UserMemory()
-
-    print(f"用户级目录: {memory.base_dir}")
-    print(f"身份状态:   {'已建立' if memory.is_identity_established() else '未建立'}")
-    print(f"需引导:     {'是' if memory.needs_bootstrap() else '否'}")
-    print()
-
-    # ── Bootstrap or normal mode ──────────────────────────────
+def main() -> None:
+    user_id = os.getenv("WORKBUDDY_USER_ID", "local-user")
+    memory = UserMemory(user_id=user_id)
+    print("s11: User Memory — explicit profile + cross-project preferences")
+    print(f"user scope: {memory.scope_id}")
+    print(f"state dir:  {memory.base_dir}")
 
     if memory.needs_bootstrap() or not memory.is_identity_established():
-        if not memory.needs_bootstrap():
-            print("\033[90m[identity] No persona/bootstrap.md found, creating one...\033[0m")
-            memory.create_bootstrap()
-
-        print("\033[33m═══ 身份引导模式 ═══\033[0m")
-        print("这是第一次对话，让我们先认识一下。\n")
-
+        memory.create_bootstrap()
         bootstrap = BootstrapAgent(memory)
-
-        # Agent starts the conversation
-        greeting = bootstrap.chat("Hi! I'm starting the app for the first time.")
-        print(f"\033[33m{greeting}\033[0m\n")
-
+        greeting = bootstrap.chat("I am opening the app for the first time.")
+        print(greeting)
         while not bootstrap.is_complete:
             try:
-                user_input = input("\033[36m引导 >> \033[0m").strip()
+                message = input("bootstrap >> ").strip()
             except (EOFError, KeyboardInterrupt):
-                print("\n\033[90m[identity] Bootstrap interrupted. Run again to continue.\033[0m")
                 return
-            if not user_input:
-                continue
-
-            reply = bootstrap.chat(user_input)
-            print(f"\033[33m{reply}\033[0m\n")
-
-        print("\033[32m═══ 引导完成，身份已建立 ═══\033[0m\n")
-
-    # ── Normal conversation with identity ─────────────────────
-
-    # Show identity summary
-    identity = memory.load_identity()
-    if identity["user"]:
-        print(f"\033[90m用户: {identity['user'][:200]}\033[0m")
-    if identity["identity"]:
-        print(f"\033[90m助手: {identity['identity'][:200]}\033[0m")
-    print()
+            if message:
+                print(bootstrap.chat(message))
 
     agent = IdentityAwareAgent(memory, WORKDIR)
-
-    print("命令:")
-    print("  /identity  — 查看身份文件")
-    print("  /memory    — 查看 MEMORY.md (跨项目规则)")
-    print("  /soul      — 查看 persona/core.md")
-    print("  /reset-id  — 重置身份 (重新引导)")
-    print("  直接输入   — 与 agent 对话")
-    print("  q          — 退出\n")
-
+    print("commands: /profile, /memory, /identity, /reset-id, q")
     while True:
         try:
-            query = input("\033[36ms11 >> \033[0m").strip()
+            query = input("s11 >> ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if query.lower() in ("q", "exit", "quit"):
+        if query.lower() in {"q", "quit", "exit"}:
             break
-        if not query:
-            continue
-
-        if query == "/identity":
-            id = memory.load_identity()
-            for key, label in [("soul", "persona/core.md"), ("identity", "persona/identity.md"),
-                               ("user", "persona/user.md"), ("memory", "MEMORY.md")]:
-                content = id[key]
-                if content:
-                    print(f"\n\033[33m{'─'*50}")
-                    print(f"{label}")
-                    print(f"{'─'*50}\n{content}\033[0m")
-            print()
-            continue
-
-        if query == "/memory":
-            content = memory.read_memory()
-            if content:
-                print(f"\n\033[33m{'─'*50}\nMEMORY.md (跨项目规则)\n{'─'*50}\n{content}\033[0m\n")
-            else:
-                print("\n\033[90m(尚无 MEMORY.md — 让 agent 记住你的偏好)\033[0m\n")
-            continue
-
-        if query == "/soul":
-            content = memory._read(memory.soul_path)
-            if content:
-                print(f"\n\033[33m{'─'*50}\npersona/core.md\n{'─'*50}\n{content}\033[0m\n")
-            else:
-                print("\n\033[90m(尚无 persona/core.md)\033[0m\n")
-            continue
-
-        if query == "/reset-id":
-            for p in [memory.soul_path, memory.identity_path, memory.user_path,
-                      memory.memory_path, memory.bootstrap_path]:
-                if p.exists():
-                    p.unlink()
+        if query == "/profile":
+            print(json.dumps(memory.read_profile(), ensure_ascii=False, indent=2))
+        elif query == "/memory":
+            print(memory.read_memory() or "(no explicit preferences)")
+        elif query == "/identity":
+            print(memory.get_context_for_agent())
+        elif query == "/reset-id":
+            # The interactive reset is intentionally scoped to this user.  It
+            # never removes sibling users under the shared root.
+            for path in (
+                memory.profile_path,
+                memory.preferences_path,
+                memory.memory_path,
+                memory.soul_path,
+                memory.identity_path,
+                memory.user_path,
+                memory.bootstrap_path,
+            ):
+                path.unlink(missing_ok=True)
             memory.create_bootstrap()
-            agent.messages = []
-            print("\033[33m[identity] 身份已重置。请重新运行程序进行引导。\033[0m\n")
+            print("identity reset for this user scope; restart to bootstrap")
             break
-
-        # Normal chat
-        result = agent.chat(query)
-        print(f"\n\033[32m{result}\033[0m\n")
-
-    print(f"\n\033[90mGoodbye. 身份文件在 {memory.base_dir}\033[0m")
+        elif query:
+            print(agent.chat(query))
 
 
 if __name__ == "__main__":

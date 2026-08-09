@@ -1,87 +1,81 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#202124"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
     </marker>
     <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#1a73e8"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
     </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
   </defs>
-  <rect width="800" height="500" fill="#f8f9fa"/>
 
-  <text x="400" y="35" text-anchor="middle" font-size="22" font-weight="bold" fill="#202124">用户级记忆</text>
+  <rect width="900" height="560" fill="#f8fafc"/>
+  <text x="450" y="38" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">User Memory：明确的用户所有权</text>
+  <text x="450" y="61" text-anchor="middle" font-size="12" fill="#64748b">Profile 与 Preference 分开建模；Workspace Memory 不进入此存储边界</text>
 
-  <!-- ~/.workbuddy/ directory -->
-  <rect x="200" y="55" width="400" height="55" rx="8" fill="#1a73e8"/>
-  <text x="400" y="83" text-anchor="middle" font-size="16" fill="white" font-weight="bold">~/.workbuddy/</text>
-  <text x="400" y="102" text-anchor="middle" font-size="12" fill="#e8f0fe">用户全局目录 · 所有项目共享</text>
+  <!-- An explicit user request is the only write trigger. -->
+  <rect x="34" y="100" width="174" height="72" rx="10" fill="#ffffff" stroke="#94a3b8" filter="url(#shadow)"/>
+  <text x="121" y="128" text-anchor="middle" font-size="14" font-weight="700" fill="#0f172a">Explicit request</text>
+  <text x="121" y="150" text-anchor="middle" font-size="12" fill="#475569">明确保存 / 更新 / 删除</text>
 
-  <!-- Files -->
-  <rect x="50" y="130" width="160" height="120" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
-  <rect x="50" y="130" width="160" height="30" rx="8" fill="#1a73e8"/>
-  <rect x="50" y="145" width="160" height="15" fill="#1a73e8"/>
-  <text x="130" y="150" text-anchor="middle" font-size="13" fill="white" font-weight="bold">persona.md</text>
-  <text x="70" y="180" font-size="11" fill="#202124">性格人格</text>
-  <text x="70" y="200" font-size="10" fill="#202124">· 沟通风格</text>
-  <text x="70" y="218" font-size="10" fill="#202124">· 语气设定</text>
-  <text x="70" y="236" font-size="10" fill="#202124">· 行为倾向</text>
+  <line x1="208" y1="136" x2="261" y2="136" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <rect x="230" y="130" width="160" height="120" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
-  <rect x="230" y="130" width="160" height="30" rx="8" fill="#1a73e8"/>
-  <rect x="230" y="145" width="160" height="15" fill="#1a73e8"/>
-  <text x="310" y="150" text-anchor="middle" font-size="13" fill="white" font-weight="bold">identity.md</text>
-  <text x="250" y="180" font-size="11" fill="#202124">身份认知</text>
-  <text x="250" y="200" font-size="10" fill="#202124">· 名字与角色</text>
-  <text x="250" y="218" font-size="10" fill="#202124">· 能力边界</text>
-  <text x="250" y="236" font-size="10" fill="#202124">· 核心原则</text>
+  <!-- The tool boundary chooses a typed state transition. -->
+  <rect x="270" y="90" width="218" height="92" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="379" y="120" text-anchor="middle" font-size="15" font-weight="700" fill="#1e3a8a">Memory tool boundary</text>
+  <text x="379" y="145" text-anchor="middle" font-size="12" fill="#1e40af">update_user_profile</text>
+  <text x="379" y="164" text-anchor="middle" font-size="12" fill="#1e40af">save / delete_user_preference</text>
 
-  <rect x="410" y="130" width="160" height="120" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
-  <rect x="410" y="130" width="160" height="30" rx="8" fill="#1a73e8"/>
-  <rect x="410" y="145" width="160" height="15" fill="#1a73e8"/>
-  <text x="490" y="150" text-anchor="middle" font-size="13" fill="white" font-weight="bold">user.md</text>
-  <text x="430" y="180" font-size="11" fill="#202124">用户画像</text>
-  <text x="430" y="200" font-size="10" fill="#202124">· 技术背景</text>
-  <text x="430" y="218" font-size="10" fill="#202124">· 偏好习惯</text>
-  <text x="430" y="236" font-size="10" fill="#202124">· 常用语言</text>
+  <!-- Stable user scope routes all reads and writes. -->
+  <line x1="488" y1="136" x2="542" y2="136" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <rect x="550" y="100" width="316" height="72" rx="10" fill="#1e40af" filter="url(#shadow)"/>
+  <text x="708" y="128" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">users/&lt;scope-id&gt;/</text>
+  <text x="708" y="151" text-anchor="middle" font-size="12" fill="#dbeafe">路径隔离 + JSON user_scope 校验</text>
 
-  <rect x="590" y="130" width="160" height="120" rx="8" fill="#fbbc04" opacity="0.3" stroke="#fbbc04" stroke-width="2"/>
-  <rect x="590" y="130" width="160" height="30" rx="8" fill="#fbbc04"/>
-  <rect x="590" y="145" width="160" height="15" fill="#fbbc04"/>
-  <text x="670" y="150" text-anchor="middle" font-size="13" fill="#202124" font-weight="bold">MEMORY.md</text>
-  <text x="610" y="180" font-size="11" fill="#202124">跨项目记忆</text>
-  <text x="610" y="200" font-size="10" fill="#202124">· 历史决策</text>
-  <text x="610" y="218" font-size="10" fill="#202124">· 全局约定</text>
-  <text x="610" y="236" font-size="10" fill="#202124">· 通用偏好</text>
+  <!-- Two canonical stores have different mutation semantics. -->
+  <line x1="645" y1="172" x2="506" y2="226" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="770" y1="172" x2="782" y2="226" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <!-- 跨项目 label -->
-  <rect x="50" y="280" width="700" height="40" rx="8" fill="#34a853" opacity="0.15" stroke="#34a853" stroke-width="2"/>
-  <text x="400" y="305" text-anchor="middle" font-size="15" fill="#34a853" font-weight="bold">跨项目共享 (cross-project) — 无论在哪个工作区都会加载</text>
+  <rect x="315" y="235" width="270" height="105" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2" filter="url(#shadow)"/>
+  <text x="450" y="264" text-anchor="middle" font-size="15" font-weight="700" fill="#065f46">profile.json</text>
+  <text x="450" y="288" text-anchor="middle" font-size="12" fill="#047857">结构化 stable facts</text>
+  <text x="450" y="309" text-anchor="middle" font-size="12" fill="#047857">partial patch · unknown field reject</text>
+  <text x="450" y="328" text-anchor="middle" font-size="11" fill="#64748b">name · call_them · timezone · notes</text>
 
-  <!-- Arrows to 跨项目 -->
-  <line x1="130" y1="250" x2="200" y2="280" stroke="#34a853" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
-  <line x1="310" y1="250" x2="350" y2="280" stroke="#34a853" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
-  <line x1="490" y1="250" x2="450" y2="280" stroke="#34a853" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
-  <line x1="670" y1="250" x2="600" y2="280" stroke="#34a853" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+  <rect x="610" y="235" width="256" height="105" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="2" filter="url(#shadow)"/>
+  <text x="738" y="264" text-anchor="middle" font-size="15" font-weight="700" fill="#9a3412">preferences.json</text>
+  <text x="738" y="288" text-anchor="middle" font-size="12" fill="#c2410c">keyed current rules</text>
+  <text x="738" y="309" text-anchor="middle" font-size="12" fill="#c2410c">CREATED · UPDATED · UNCHANGED</text>
+  <text x="738" y="328" text-anchor="middle" font-size="11" fill="#64748b">key · value · revision · source</text>
 
-  <!-- Project folders -->
-  <text x="400" y="350" text-anchor="middle" font-size="14" fill="#202124" font-weight="bold">多个项目工作区同时受益</text>
+  <!-- Canonical JSON drives human/prompt-facing projections. -->
+  <line x1="450" y1="340" x2="450" y2="388" stroke="#10b981" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="738" y1="340" x2="738" y2="388" stroke="#f97316" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <rect x="80" y="370" width="180" height="45" rx="8" fill="#7b1fa2" opacity="0.2" stroke="#7b1fa2" stroke-width="1.5"/>
-  <text x="170" y="396" text-anchor="middle" font-size="12" fill="#7b1fa2" font-weight="bold">Project A (.workbuddy/)</text>
+  <rect x="315" y="396" width="270" height="62" rx="9" fill="#ffffff" stroke="#10b981"/>
+  <text x="450" y="422" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">persona/user.md</text>
+  <text x="450" y="443" text-anchor="middle" font-size="11" fill="#64748b">可读 Profile projection · 可重建</text>
 
-  <rect x="310" y="370" width="180" height="45" rx="8" fill="#7b1fa2" opacity="0.2" stroke="#7b1fa2" stroke-width="1.5"/>
-  <text x="400" y="396" text-anchor="middle" font-size="12" fill="#7b1fa2" font-weight="bold">Project B (.workbuddy/)</text>
+  <rect x="610" y="396" width="256" height="62" rx="9" fill="#ffffff" stroke="#f97316"/>
+  <text x="738" y="422" text-anchor="middle" font-size="14" font-weight="700" fill="#9a3412">MEMORY.md</text>
+  <text x="738" y="443" text-anchor="middle" font-size="11" fill="#64748b">当前 Preference projection · 可重建</text>
 
-  <rect x="540" y="370" width="180" height="45" rx="8" fill="#7b1fa2" opacity="0.2" stroke="#7b1fa2" stroke-width="1.5"/>
-  <text x="630" y="396" text-anchor="middle" font-size="12" fill="#7b1fa2" font-weight="bold">Project C (.workbuddy/)</text>
+  <line x1="450" y1="458" x2="524" y2="500" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="738" y1="458" x2="652" y2="500" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="474" y="502" width="230" height="42" rx="9" fill="#0f172a"/>
+  <text x="589" y="528" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">User context block</text>
 
-  <!-- Arrows from 跨项目 to projects -->
-  <line x1="200" y1="320" x2="170" y2="370" stroke="#1a73e8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
-  <line x1="400" y1="320" x2="400" y2="370" stroke="#1a73e8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
-  <line x1="600" y1="320" x2="630" y2="370" stroke="#1a73e8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+  <!-- Workspace memory is intentionally shown outside the ownership boundary. -->
+  <rect x="34" y="250" width="218" height="122" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-dasharray="6 5"/>
+  <text x="143" y="281" text-anchor="middle" font-size="14" font-weight="700" fill="#475569">s10 Workspace Memory</text>
+  <text x="143" y="306" text-anchor="middle" font-size="12" fill="#64748b">project decisions / conventions</text>
+  <text x="143" y="329" text-anchor="middle" font-size="12" fill="#64748b">独立 owner · 独立更新策略</text>
+  <text x="143" y="352" text-anchor="middle" font-size="12" font-weight="700" fill="#b91c1c">不写入 user scope</text>
+  <line x1="252" y1="311" x2="298" y2="311" stroke="#b91c1c" stroke-width="2" stroke-dasharray="5 4"/>
+  <line x1="274" y1="299" x2="286" y2="323" stroke="#b91c1c" stroke-width="2"/>
+  <line x1="286" y1="299" x2="274" y2="323" stroke="#b91c1c" stroke-width="2"/>
 
-  <!-- Layering note -->
-  <rect x="80" y="430" width="640" height="50" rx="8" fill="#202124"/>
-  <text x="400" y="452" text-anchor="middle" font-size="13" fill="white" font-weight="bold">记忆层级: 用户级 (~/.workbuddy/) + 工作区级 (.workbuddy/) → 合并注入 Prompt</text>
-  <text x="400" y="470" text-anchor="middle" font-size="11" fill="#e8f0fe">工作区级覆盖用户级同名配置, 实现灵活定制</text>
+  <text x="34" y="532" font-size="11" fill="#64748b">s15 可在 Prompt assembly 时组合 user context 与 workspace context，但不会合并两层 canonical state。</text>
 </svg>

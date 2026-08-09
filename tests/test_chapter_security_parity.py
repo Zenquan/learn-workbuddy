@@ -99,4 +99,6 @@ def test_s11_user_memory_creates_persona_directory_for_bootstrap(tmp_path, monke
     memory.create_bootstrap()
 
     assert memory.bootstrap_path.exists()
-    assert memory.bootstrap_path.parent == tmp_path / "home" / "user-memory" / "persona"
+    assert memory.bootstrap_path.parent == (
+        tmp_path / "home" / "user-memory" / "users" / memory.scope_id / "persona"
+    )

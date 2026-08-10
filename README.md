@@ -262,6 +262,8 @@ python3 s01_agent_loop/code.py --demo
 python3 s03_deferred_loading/code.py
 python3 s08_model_routing/code.py
 MINI_WORKBUDDY_HOME=.tmp/mini python3 examples/mini_workbuddy_demo/code.py --mode offline
+# 轨迹蒸馏 -> 评测 -> 人工批准 -> 版本化 Skill（完全离线）：
+python3 examples/self_evolving_skills/code.py --approve
 # 一次跑遍所有 harness 层（provider/session/记忆/权限/外部化/JSONL/HTTP/审计），产出 artifacts：
 python3 examples/full_tour/code.py
 python3 scripts/verify.py

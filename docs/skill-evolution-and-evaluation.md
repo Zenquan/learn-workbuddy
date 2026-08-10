@@ -77,6 +77,11 @@ s16 的 `audit_skill()` 目前只扫 `rm -rf /`、`sudo`、`pip install` 这类
 4. **评测意识**：README 里引用上面 6 类基准，说明本项目技能子系统对标的是
    哪几维（Utility + Retrieval/Routing + Safety），比空泛说"好用"有说服力。
 
+保持 24 章主线不变的可运行版本见
+[`examples/self_evolving_skills/`](../examples/self_evolving_skills/)：它把成功 JSONL
+轨迹蒸馏成候选 `SKILL.md`，通过 held-out 回放、安全检查和显式人工审批后才进入
+版本化 Skill 库。
+
 ## 来源
 
 - *Agent Skill Evaluation and Evolution: Frameworks and Benchmarks*（综述）：

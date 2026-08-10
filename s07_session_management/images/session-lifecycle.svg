@@ -132,7 +132,7 @@
     <rect x="762" y="575" width="120" height="42" rx="21" fill="#e2e8f0" stroke="#64748b"/>
     <text x="822" y="601" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">closed</text>
 
-    <path d="M474,575 C510,530 900,530 930,575" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+    <polyline points="474,575 474,555 930,555 930,575" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
     <rect x="914" y="575" width="120" height="42" rx="21" fill="#fee2e2" stroke="#ef4444"/>
     <text x="974" y="601" text-anchor="middle" font-size="12" font-weight="700" fill="#991b1b">error</text>
   </g>

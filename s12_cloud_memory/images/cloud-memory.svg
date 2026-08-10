@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 650" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
       <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
@@ -14,7 +14,7 @@
     </filter>
   </defs>
 
-  <rect width="900" height="560" fill="#f8fafc"/>
+  <rect width="900" height="650" fill="#f8fafc"/>
   <text x="450" y="36" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">Remote Memory：存储记录 ≠ 本轮召回上下文</text>
   <text x="450" y="59" text-anchor="middle" font-size="12" fill="#64748b">持久对象保留 source；召回对象绑定 query、score 与 rank</text>
 
@@ -36,48 +36,48 @@
   <text x="727" y="149" text-anchor="middle" font-size="12" fill="#dbeafe">user-scoped append-only JSONL</text>
 
   <!-- Profile uses a selection policy separate from conversation recall. -->
-  <line x1="680" y1="174" x2="617" y2="222" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
-  <rect x="485" y="230" width="272" height="64" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
-  <text x="621" y="256" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">Latest PROFILE record</text>
-  <text x="621" y="278" text-anchor="middle" font-size="11" fill="#047857">session-start injection with provenance</text>
+  <line x1="727" y1="174" x2="727" y2="192" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <rect x="588" y="200" width="278" height="64" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="727" y="226" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">Latest PROFILE record</text>
+  <text x="727" y="248" text-anchor="middle" font-size="11" fill="#047857">session-start injection with provenance</text>
 
   <!-- Query-scoped recall path. -->
-  <rect x="34" y="246" width="222" height="82" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="2" filter="url(#shadow)"/>
-  <text x="145" y="274" text-anchor="middle" font-size="15" font-weight="700" fill="#9a3412">RecallQuery</text>
-  <text x="145" y="297" text-anchor="middle" font-size="12" fill="#c2410c">query_id · text · scope · limit</text>
-  <text x="145" y="316" text-anchor="middle" font-size="11" fill="#64748b">self-contained for this turn</text>
+  <rect x="34" y="300" width="222" height="82" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="2" filter="url(#shadow)"/>
+  <text x="145" y="328" text-anchor="middle" font-size="15" font-weight="700" fill="#9a3412">RecallQuery</text>
+  <text x="145" y="351" text-anchor="middle" font-size="12" fill="#c2410c">query_id · text · scope · limit</text>
+  <text x="145" y="370" text-anchor="middle" font-size="11" fill="#64748b">self-contained for this turn</text>
 
-  <line x1="256" y1="287" x2="312" y2="287" stroke="#f97316" stroke-width="2" marker-end="url(#arrow)"/>
-  <line x1="727" y1="174" x2="454" y2="249" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
-  <rect x="321" y="238" width="234" height="98" rx="10" fill="#ffffff" stroke="#7c3aed" stroke-width="2" filter="url(#shadow)"/>
-  <text x="438" y="267" text-anchor="middle" font-size="15" font-weight="700" fill="#5b21b6">RecallEngine</text>
-  <text x="438" y="290" text-anchor="middle" font-size="12" fill="#6d28d9">lexical coverage + recency</text>
-  <text x="438" y="310" text-anchor="middle" font-size="12" fill="#6d28d9">no hidden reranker</text>
-  <text x="438" y="328" text-anchor="middle" font-size="11" fill="#64748b">read-only over conversation records</text>
+  <line x1="256" y1="341" x2="312" y2="341" stroke="#f97316" stroke-width="2" marker-end="url(#arrow)"/>
+  <polyline points="600,174 575,190 575,280 438,280 438,292" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <rect x="321" y="300" width="234" height="98" rx="10" fill="#ffffff" stroke="#7c3aed" stroke-width="2" filter="url(#shadow)"/>
+  <text x="438" y="329" text-anchor="middle" font-size="15" font-weight="700" fill="#5b21b6">RecallEngine</text>
+  <text x="438" y="352" text-anchor="middle" font-size="12" fill="#6d28d9">lexical coverage + recency</text>
+  <text x="438" y="372" text-anchor="middle" font-size="12" fill="#6d28d9">no hidden reranker</text>
+  <text x="438" y="390" text-anchor="middle" font-size="11" fill="#64748b">read-only over conversation records</text>
 
-  <line x1="555" y1="287" x2="611" y2="287" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrow)"/>
-  <rect x="620" y="238" width="246" height="98" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#shadow)"/>
-  <text x="743" y="267" text-anchor="middle" font-size="15" font-weight="700" fill="#5b21b6">RecallHit</text>
-  <text x="743" y="290" text-anchor="middle" font-size="12" fill="#6d28d9">query_id · memory_id · source</text>
-  <text x="743" y="310" text-anchor="middle" font-size="12" fill="#6d28d9">score · rank · matched_terms</text>
-  <text x="743" y="328" text-anchor="middle" font-size="11" fill="#64748b">temporary candidate view</text>
+  <line x1="555" y1="341" x2="611" y2="341" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="620" y="300" width="246" height="98" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#shadow)"/>
+  <text x="743" y="329" text-anchor="middle" font-size="15" font-weight="700" fill="#5b21b6">RecallHit</text>
+  <text x="743" y="352" text-anchor="middle" font-size="12" fill="#6d28d9">query_id · memory_id · source</text>
+  <text x="743" y="372" text-anchor="middle" font-size="12" fill="#6d28d9">score · rank · matched_terms</text>
+  <text x="743" y="390" text-anchor="middle" font-size="11" fill="#64748b">temporary candidate view</text>
 
   <!-- Results preserve retrieval metadata into prompt context. -->
-  <line x1="743" y1="336" x2="743" y2="384" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrow)"/>
-  <rect x="599" y="392" width="288" height="62" rx="9" fill="#ffffff" stroke="#7c3aed"/>
-  <text x="743" y="418" text-anchor="middle" font-size="14" font-weight="700" fill="#5b21b6">RecallResult</text>
-  <text x="743" y="439" text-anchor="middle" font-size="11" fill="#64748b">query + selected hits + searched count</text>
+  <line x1="743" y1="398" x2="743" y2="438" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="599" y="446" width="288" height="62" rx="9" fill="#ffffff" stroke="#7c3aed"/>
+  <text x="743" y="472" text-anchor="middle" font-size="14" font-weight="700" fill="#5b21b6">RecallResult</text>
+  <text x="743" y="493" text-anchor="middle" font-size="11" fill="#64748b">query + selected hits + searched count</text>
 
-  <line x1="743" y1="454" x2="661" y2="497" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
-  <line x1="621" y1="294" x2="561" y2="497" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
-  <rect x="452" y="501" width="300" height="44" rx="9" fill="#0f172a"/>
-  <text x="602" y="528" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">Prompt assembly with provenance</text>
+  <line x1="743" y1="508" x2="661" y2="551" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+  <polyline points="866,232 894,232 894,577 760,577" fill="none" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <rect x="452" y="555" width="300" height="44" rx="9" fill="#0f172a"/>
+  <text x="602" y="582" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">Prompt assembly with provenance</text>
 
   <!-- Retrieval is explicitly non-mutating. -->
-  <path d="M 621 369 C 500 405, 357 403, 265 357" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 5"/>
-  <line x1="255" y1="348" x2="275" y2="368" stroke="#dc2626" stroke-width="2"/>
-  <line x1="275" y1="348" x2="255" y2="368" stroke="#dc2626" stroke-width="2"/>
-  <text x="407" y="390" text-anchor="middle" font-size="11" font-weight="700" fill="#b91c1c">Recall does not write hits back to storage</text>
+  <path d="M 590 416 C 500 438, 357 438, 265 411" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 5"/>
+  <line x1="255" y1="402" x2="275" y2="422" stroke="#dc2626" stroke-width="2"/>
+  <line x1="275" y1="402" x2="255" y2="422" stroke="#dc2626" stroke-width="2"/>
+  <text x="407" y="462" text-anchor="middle" font-size="11" font-weight="700" fill="#b91c1c">Recall does not write hits back to storage</text>
 
-  <text x="34" y="532" font-size="11" fill="#64748b">稳定契约优先：未来可替换 embedding 或 reranker，但 Query / Hit / Source / Score 仍保持可观察。</text>
+  <text x="34" y="630" font-size="11" fill="#64748b">稳定契约优先：未来可替换 embedding 或 reranker，但 Query / Hit / Source / Score 仍保持可观察。</text>
 </svg>

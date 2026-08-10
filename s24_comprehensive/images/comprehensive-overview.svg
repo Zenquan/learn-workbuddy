@@ -23,7 +23,7 @@
   <text x="550" y="38" text-anchor="middle" class="title">24 课全景：从 Agent Loop 到桌面 Harness</text>
   <text x="550" y="62" text-anchor="middle" class="subtitle">单章形成稳定契约，综合章负责连线而不改变 loop、permission、transcript 与 memory 语义</text>
 
-  <rect x="422" y="92" width="256" height="104" rx="18" fill="#1a73e8"/>
+  <rect x="382" y="92" width="336" height="104" rx="18" fill="#1a73e8"/>
   <text x="550" y="126" text-anchor="middle" font-size="20" font-weight="800" fill="#ffffff">s01 Agent Loop</text>
   <text x="550" y="149" text-anchor="middle" font-size="13" fill="#d6e4ff">主循环：模型请求工具，Harness 执行并写回结果</text>
   <text x="550" y="172" text-anchor="middle" font-size="12" fill="#d6e4ff">while True -> model -> tool/result -> final answer</text>

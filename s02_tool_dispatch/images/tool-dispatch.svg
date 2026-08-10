@@ -41,7 +41,7 @@
 
   <!-- Schema feedback to model request -->
   <path d="M558 60 L558 48 L118 48 L118 76" fill="none" stroke="#f9ab00" stroke-width="1.7" stroke-dasharray="5,4" marker-end="url(#arrow-gray)"/>
-  <text x="338" y="43" text-anchor="middle" class="edge-label" fill="#a15c00">model_schemas() 也来自同一注册表</text>
+  <text x="330" y="69" text-anchor="middle" class="edge-label" fill="#a15c00">model_schemas() 也来自同一注册表</text>
 
   <!-- Dispatch stages -->
   <line x1="558" y1="170" x2="558" y2="202" stroke="#5f6368" stroke-width="2" marker-end="url(#arrow-gray)"/>

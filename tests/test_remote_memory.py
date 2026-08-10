@@ -1,0 +1,262 @@
+"""Offline contracts for s12 stored memory and query-scoped recall."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(scope="module")
+def s12(tmp_path_factory: pytest.TempPathFactory):
+    stub_dir = ROOT / "tests" / "stubs"
+    state_root = tmp_path_factory.mktemp("s12-import-state")
+    sys.path.insert(0, str(stub_dir))
+    saved_anthropic = sys.modules.pop("anthropic", None)
+    old_model = os.environ.get("MODEL_ID")
+    old_home = os.environ.get("WORKBUDDY_HOME")
+    os.environ["MODEL_ID"] = "offline-test-model"
+    os.environ["WORKBUDDY_HOME"] = str(state_root)
+    module_name = "s12_remote_memory_test_module"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, ROOT / "s12_cloud_memory" / "code.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        sys.path.remove(str(stub_dir))
+        sys.modules.pop(module_name, None)
+        sys.modules.pop("anthropic", None)
+        if saved_anthropic is not None:
+            sys.modules["anthropic"] = saved_anthropic
+        if old_model is None:
+            os.environ.pop("MODEL_ID", None)
+        else:
+            os.environ["MODEL_ID"] = old_model
+        if old_home is None:
+            os.environ.pop("WORKBUDDY_HOME", None)
+        else:
+            os.environ["WORKBUDDY_HOME"] = old_home
+
+
+def _time(day: int) -> datetime:
+    return datetime(2026, 8, day, 12, tzinfo=timezone.utc)
+
+
+def _source(s12, source_id: str, day: int, *, source_type: str = "transcript"):
+    return s12.MemorySource(
+        source_id=source_id,
+        source_type=source_type,
+        title=f"source {source_id}",
+        captured_at=s12._iso(_time(day)),
+    )
+
+
+def test_stored_memory_keeps_source_and_survives_restart(s12, tmp_path: Path) -> None:
+    path = tmp_path / "records.jsonl"
+    writer = s12.RemoteMemoryStore(path, user_id="alice")
+    created = writer.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-1",
+        content="The project selected SQLite WAL for local persistence.",
+        summary="Selected SQLite WAL.",
+        source=_source(s12, "transcript-42", 1),
+        stored_at=_time(2),
+    )
+
+    reader = s12.RemoteMemoryStore(path, user_id="alice")
+    recovered = reader.read_all()[0]
+
+    assert recovered == created
+    assert recovered.source.source_id == "transcript-42"
+    assert recovered.source.captured_at == "2026-08-01T12:00:00Z"
+
+
+def test_store_rejects_anonymous_or_invalid_source(s12, tmp_path: Path) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+
+    with pytest.raises(s12.RemoteMemoryValidationError, match="source_id"):
+        store.append(
+            kind=s12.MemoryKind.CONVERSATION,
+            content="Source is required.",
+            summary="Missing source.",
+            source=s12.MemorySource("", "transcript", "Missing", s12._iso(_time(1))),
+        )
+    with pytest.raises(s12.RemoteMemoryCorruptionError, match="invalid timestamp"):
+        store.append(
+            kind=s12.MemoryKind.CONVERSATION,
+            content="Source time must parse.",
+            summary="Bad source time.",
+            source=s12.MemorySource("source-1", "transcript", "Bad time", "yesterday"),
+        )
+
+    assert store.read_all() == []
+
+
+def test_recall_returns_query_hit_source_score_contract(s12, tmp_path: Path) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-new",
+        content="We designed layered memory boundaries for the agent harness.",
+        summary="Layered memory boundary design.",
+        source=_source(s12, "transcript-new", 9),
+        stored_at=_time(9),
+    )
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-old",
+        content="We compared unrelated frontend typography options.",
+        summary="Frontend typography comparison.",
+        source=_source(s12, "transcript-old", 1),
+        stored_at=_time(1),
+    )
+
+    result = s12.RecallEngine(store).recall(
+        "continue the layered memory design",
+        query_id="query-1",
+        as_of=_time(10),
+    )
+
+    assert result.query.query_id == "query-1"
+    assert result.query.user_scope == store.user_scope
+    assert result.searched_records == 2
+    assert len(result.hits) == 1
+    hit = result.hits[0]
+    assert hit.query_id == "query-1"
+    assert hit.memory_id == "memory-new"
+    assert hit.source.source_id == "transcript-new"
+    assert hit.rank == 1
+    assert 0 < hit.score <= 1
+    assert "memory" in hit.matched_terms
+
+
+def test_recall_is_a_derived_view_and_never_appends_to_store(s12, tmp_path: Path) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-1",
+        content="Agent loop tools use explicit dispatch contracts.",
+        summary="Explicit agent loop dispatch.",
+        source=_source(s12, "transcript-1", 8),
+        stored_at=_time(8),
+    )
+    before = store.path.read_bytes()
+
+    first = s12.RecallEngine(store).recall(
+        "agent loop dispatch", query_id="query-a", as_of=_time(10)
+    )
+    second = s12.RecallEngine(store).recall(
+        "missing database topic", query_id="query-b", as_of=_time(10)
+    )
+
+    assert first.hits[0].query_id == "query-a"
+    assert second.query.query_id == "query-b"
+    assert second.hits == ()
+    assert store.path.read_bytes() == before
+    assert len(store.read_all()) == 1
+
+
+def test_profile_snapshot_is_injected_but_not_returned_as_history_hit(
+    s12, tmp_path: Path
+) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+    store.append(
+        kind=s12.MemoryKind.PROFILE,
+        memory_id="profile-old",
+        content="Response preference: verbose.",
+        summary="Old remote profile",
+        source=_source(s12, "profile-1", 1, source_type="profile_snapshot"),
+        stored_at=_time(1),
+    )
+    store.append(
+        kind=s12.MemoryKind.PROFILE,
+        memory_id="profile-new",
+        content="Response preference: concise.",
+        summary="New remote profile",
+        source=_source(s12, "profile-2", 9, source_type="profile_snapshot"),
+        stored_at=_time(9),
+    )
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="conversation-1",
+        content="Discussed concise API error contracts.",
+        summary="Concise API errors.",
+        source=_source(s12, "transcript-1", 8),
+        stored_at=_time(8),
+    )
+
+    prompt = s12.build_system_prompt(store)
+    result = s12.RecallEngine(store).recall(
+        "concise response", query_id="query-profile", as_of=_time(10)
+    )
+
+    assert store.latest_profile().memory_id == "profile-new"
+    assert "profile-new" in prompt
+    assert "profile-2" in prompt
+    assert "concise" in prompt
+    assert all(hit.memory_id != "profile-new" for hit in result.hits)
+    assert result.searched_records == 1
+
+
+def test_remote_store_rejects_records_from_another_user_scope(
+    s12, tmp_path: Path
+) -> None:
+    alice = s12.RemoteMemoryStore(tmp_path / "alice.jsonl", user_id="alice")
+    bob = s12.RemoteMemoryStore(tmp_path / "bob.jsonl", user_id="bob")
+    alice.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="private-memory",
+        content="Alice private project history.",
+        summary="Alice history.",
+        source=_source(s12, "transcript-alice", 8),
+        stored_at=_time(8),
+    )
+    bob.path.write_bytes(alice.path.read_bytes())
+
+    with pytest.raises(s12.RemoteMemoryScopeError, match="another user scope"):
+        bob.read_all()
+
+
+def test_rendered_context_preserves_query_source_and_score(s12, tmp_path: Path) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-1",
+        content="The harness uses append-only transcript evidence.",
+        summary="Append-only transcript evidence.",
+        source=_source(s12, "transcript-1", 9),
+        stored_at=_time(9),
+    )
+    result = s12.RecallEngine(store).recall(
+        "transcript evidence", query_id="query-xml", as_of=_time(10)
+    )
+
+    context = s12.render_recall_context(result)
+
+    assert 'query_id="query-xml"' in context
+    assert 'memory_id="memory-1"' in context
+    assert 'source_id="transcript-1"' in context
+    assert 'score="' in context
+
+
+def test_tool_payload_is_structured_json_not_preformatted_history(s12, monkeypatch) -> None:
+    monkeypatch.setattr(s12, "DEFAULT_RECALL", s12.RecallEngine(s12.DEFAULT_STORE))
+
+    payload = json.loads(s12.recall_history("layered memory design", limit=2))
+
+    assert set(payload) == {"query", "hits", "searched_records"}
+    assert payload["query"]["text"] == "layered memory design"
+    assert all("source" in hit and "score" in hit for hit in payload["hits"])

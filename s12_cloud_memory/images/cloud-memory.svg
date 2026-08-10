@@ -1,75 +1,83 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#202124"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
     </marker>
     <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#1a73e8"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
     </marker>
     <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#34a853"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#059669"/>
     </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
   </defs>
-  <rect width="800" height="500" fill="#f8f9fa"/>
 
-  <text x="400" y="35" text-anchor="middle" font-size="22" font-weight="bold" fill="#202124">云端记忆</text>
+  <rect width="900" height="560" fill="#f8fafc"/>
+  <text x="450" y="36" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">Remote Memory：存储记录 ≠ 本轮召回上下文</text>
+  <text x="450" y="59" text-anchor="middle" font-size="12" fill="#64748b">持久对象保留 source；召回对象绑定 query、score 与 rank</text>
 
-  <!-- Left side: Server-side Profile -->
-  <rect x="30" y="60" width="340" height="180" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
-  <rect x="30" y="60" width="340" height="35" rx="8" fill="#1a73e8"/>
-  <rect x="30" y="77" width="340" height="18" fill="#1a73e8"/>
-  <text x="200" y="82" text-anchor="middle" font-size="14" fill="white" font-weight="bold">Server-side Profile</text>
+  <!-- Durable source and storage path. -->
+  <rect x="34" y="98" width="190" height="76" rx="10" fill="#ffffff" stroke="#94a3b8" filter="url(#shadow)"/>
+  <text x="129" y="126" text-anchor="middle" font-size="14" font-weight="700" fill="#0f172a">Original Source</text>
+  <text x="129" y="149" text-anchor="middle" font-size="12" fill="#475569">transcript / profile snapshot</text>
+  <line x1="224" y1="136" x2="278" y2="136" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <text x="50" y="120" font-size="12" fill="#202124">自动生成的用户摘要</text>
-  <text x="50" y="140" font-size="11" fill="#202124">· 从历史对话中提取关键信息</text>
-  <text x="50" y="158" font-size="11" fill="#202124">· 偏好、项目、常用模式</text>
-  <text x="50" y="176" font-size="11" fill="#202124">· 服务端维护, 定期更新</text>
-  <text x="50" y="194" font-size="11" fill="#202124">· 非实时, 是聚合摘要</text>
+  <rect x="287" y="88" width="236" height="96" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2" filter="url(#shadow)"/>
+  <text x="405" y="116" text-anchor="middle" font-size="15" font-weight="700" fill="#1e3a8a">StoredMemory</text>
+  <text x="405" y="139" text-anchor="middle" font-size="12" fill="#1e40af">memory_id · user_scope · kind</text>
+  <text x="405" y="159" text-anchor="middle" font-size="12" fill="#1e40af">content · summary · source</text>
+  <text x="405" y="176" text-anchor="middle" font-size="11" fill="#64748b">durable · immutable evidence</text>
+  <line x1="523" y1="136" x2="579" y2="136" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
 
-  <rect x="50" y="205" width="300" height="25" rx="4" fill="#34a853" opacity="0.2"/>
-  <text x="200" y="222" text-anchor="middle" font-size="11" fill="#34a853" font-weight="bold">会话开始时自动注入</text>
+  <rect x="588" y="98" width="278" height="76" rx="10" fill="#1e40af" filter="url(#shadow)"/>
+  <text x="727" y="126" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">RemoteMemoryStore</text>
+  <text x="727" y="149" text-anchor="middle" font-size="12" fill="#dbeafe">user-scoped append-only JSONL</text>
 
-  <line x1="200" y1="240" x2="200" y2="260" stroke="#34a853" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <!-- Profile uses a selection policy separate from conversation recall. -->
+  <line x1="680" y1="174" x2="617" y2="222" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <rect x="485" y="230" width="272" height="64" rx="9" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="621" y="256" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">Latest PROFILE record</text>
+  <text x="621" y="278" text-anchor="middle" font-size="11" fill="#047857">session-start injection with provenance</text>
 
-  <!-- Session start -->
-  <rect x="80" y="265" width="240" height="35" rx="8" fill="#34a853"/>
-  <text x="200" y="288" text-anchor="middle" font-size="13" fill="white" font-weight="bold">Session Start ← 注入 Profile</text>
+  <!-- Query-scoped recall path. -->
+  <rect x="34" y="246" width="222" height="82" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="2" filter="url(#shadow)"/>
+  <text x="145" y="274" text-anchor="middle" font-size="15" font-weight="700" fill="#9a3412">RecallQuery</text>
+  <text x="145" y="297" text-anchor="middle" font-size="12" fill="#c2410c">query_id · text · scope · limit</text>
+  <text x="145" y="316" text-anchor="middle" font-size="11" fill="#64748b">self-contained for this turn</text>
 
-  <!-- Right side: on-demand recall -->
-  <rect x="430" y="60" width="340" height="180" rx="8" fill="#fbbc04" opacity="0.15" stroke="#fbbc04" stroke-width="2"/>
-  <rect x="430" y="60" width="340" height="35" rx="8" fill="#fbbc04"/>
-  <rect x="430" y="77" width="340" height="18" fill="#fbbc04"/>
-  <text x="600" y="82" text-anchor="middle" font-size="14" fill="#202124" font-weight="bold">On-demand Recall</text>
+  <line x1="256" y1="287" x2="312" y2="287" stroke="#f97316" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="727" y1="174" x2="454" y2="249" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <rect x="321" y="238" width="234" height="98" rx="10" fill="#ffffff" stroke="#7c3aed" stroke-width="2" filter="url(#shadow)"/>
+  <text x="438" y="267" text-anchor="middle" font-size="15" font-weight="700" fill="#5b21b6">RecallEngine</text>
+  <text x="438" y="290" text-anchor="middle" font-size="12" fill="#6d28d9">lexical coverage + recency</text>
+  <text x="438" y="310" text-anchor="middle" font-size="12" fill="#6d28d9">no hidden reranker</text>
+  <text x="438" y="328" text-anchor="middle" font-size="11" fill="#64748b">read-only over conversation records</text>
 
-  <text x="450" y="120" font-size="12" fill="#202124">搜索所有历史对话</text>
-  <text x="450" y="140" font-size="11" fill="#202124">· 跨项目, 跨时间检索</text>
-  <text x="450" y="158" font-size="11" fill="#202124">· 全文搜索 + 语义排序</text>
-  <text x="450" y="176" font-size="11" fill="#202124">· 返回排名靠前的结果</text>
-  <text x="450" y="194" font-size="11" fill="#202124">· 按相关度排序</text>
+  <line x1="555" y1="287" x2="611" y2="287" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="620" y="238" width="246" height="98" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2" filter="url(#shadow)"/>
+  <text x="743" y="267" text-anchor="middle" font-size="15" font-weight="700" fill="#5b21b6">RecallHit</text>
+  <text x="743" y="290" text-anchor="middle" font-size="12" fill="#6d28d9">query_id · memory_id · source</text>
+  <text x="743" y="310" text-anchor="middle" font-size="12" fill="#6d28d9">score · rank · matched_terms</text>
+  <text x="743" y="328" text-anchor="middle" font-size="11" fill="#64748b">temporary candidate view</text>
 
-  <rect x="450" y="205" width="300" height="25" rx="4" fill="#1a73e8" opacity="0.15"/>
-  <text x="600" y="222" text-anchor="middle" font-size="11" fill="#1a73e8" font-weight="bold">按需调用, 结果注入上下文</text>
+  <!-- Results preserve retrieval metadata into prompt context. -->
+  <line x1="743" y1="336" x2="743" y2="384" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="599" y="392" width="288" height="62" rx="9" fill="#ffffff" stroke="#7c3aed"/>
+  <text x="743" y="418" text-anchor="middle" font-size="14" font-weight="700" fill="#5b21b6">RecallResult</text>
+  <text x="743" y="439" text-anchor="middle" font-size="11" fill="#64748b">query + selected hits + searched count</text>
 
-  <line x1="600" y1="240" x2="600" y2="260" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <line x1="743" y1="454" x2="661" y2="497" stroke="#334155" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="621" y1="294" x2="561" y2="497" stroke="#059669" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  <rect x="452" y="501" width="300" height="44" rx="9" fill="#0f172a"/>
+  <text x="602" y="528" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">Prompt assembly with provenance</text>
 
-  <!-- Search results -->
-  <rect x="460" y="265" width="280" height="35" rx="8" fill="#1a73e8"/>
-  <text x="600" y="288" text-anchor="middle" font-size="13" fill="white" font-weight="bold">Ranked Results → 注入上下文</text>
+  <!-- Retrieval is explicitly non-mutating. -->
+  <path d="M 621 369 C 500 405, 357 403, 265 357" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 5"/>
+  <line x1="255" y1="348" x2="275" y2="368" stroke="#dc2626" stroke-width="2"/>
+  <line x1="275" y1="348" x2="255" y2="368" stroke="#dc2626" stroke-width="2"/>
+  <text x="407" y="390" text-anchor="middle" font-size="11" font-weight="700" fill="#b91c1c">Recall does not write hits back to storage</text>
 
-  <!-- Flow: User asks -->
-  <rect x="200" y="320" width="400" height="40" rx="8" fill="#202124"/>
-  <text x="400" y="345" text-anchor="middle" font-size="13" fill="white">用户: "我们之前讨论过什么?"</text>
-
-  <!-- Flow arrows -->
-  <line x1="300" y1="360" x2="200" y2="380" stroke="#1a73e8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
-  <line x1="500" y1="360" x2="600" y2="380" stroke="#1a73e8" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
-
-  <text x="200" y="395" text-anchor="middle" font-size="11" fill="#1a73e8">Profile 已在上下文中</text>
-  <text x="600" y="395" text-anchor="middle" font-size="11" fill="#1a73e8">触发历史召回</text>
-
-  <!-- Combined result -->
-  <rect x="150" y="410" width="500" height="65" rx="8" fill="#34a853" opacity="0.15" stroke="#34a853" stroke-width="2"/>
-  <text x="400" y="435" text-anchor="middle" font-size="14" fill="#34a853" font-weight="bold">融合记忆 → 生成回答</text>
-  <text x="400" y="455" text-anchor="middle" font-size="11" fill="#202124">云端 Profile (全局摘要) + 历史召回 (相关片段) → 完整上下文</text>
-  <text x="400" y="470" text-anchor="middle" font-size="11" fill="#202124">模型基于融合记忆回答: "我们在项目A中讨论过..."</text>
+  <text x="34" y="532" font-size="11" fill="#64748b">稳定契约优先：未来可替换 embedding 或 reranker，但 Query / Hit / Source / Score 仍保持可观察。</text>
 </svg>

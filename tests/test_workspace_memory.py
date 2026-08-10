@@ -130,6 +130,18 @@ def test_atomic_replace_preserves_previous_curated_file_on_failure(
     assert list(memory.memory_dir.glob(".*.tmp")) == []
 
 
+def test_directory_fsync_falls_back_without_opening_directory(
+    s10, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_if_opened(*_args, **_kwargs) -> None:
+        raise AssertionError("directory fsync fallback must not call os.open")
+
+    monkeypatch.setattr(s10, "_DIRECTORY_FSYNC_SUPPORTED", False)
+    monkeypatch.setattr(s10.os, "open", fail_if_opened)
+
+    s10._fsync_directory(tmp_path)
+
+
 def test_new_process_view_recovers_facts_and_curated_context(s10, tmp_path: Path) -> None:
     root = tmp_path / "project"
     writer = s10.WorkspaceMemory(root)

@@ -112,8 +112,10 @@ daily fact log ──select──> curated.json ──render──> MEMORY.md
 
 1. 写入完整内容；
 2. `flush + fsync`；
-3. `os.replace` 原子替换目标并 `fsync` 所在目录；
+3. `os.replace` 原子替换目标；支持目录句柄的平台继续 `fsync` 所在目录，Windows 则安全跳过不受 `os.open` 支持的目录同步；
 4. 失败时清理临时文件，旧版本保持不变。
+
+Windows 的回退仍会在替换前完整写入、刷新并同步临时文件，再执行同目录 `os.replace`，因此不会把半个新文件暴露为 canonical state。POSIX 平台额外同步目录项，以加强断电后的 rename 持久性。
 
 `curated.json` 是 canonical state，`MEMORY.md` 是可重建投影。如果进程在两次替换之间退出，下一次读取会以 canonical state 修复陈旧投影。新建一个 `WorkspaceMemory(project_dir)` 实例即可从磁盘恢复事实、策展条目和 prompt context；不会反序列化任何进程内对象。
 

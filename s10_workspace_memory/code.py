@@ -81,6 +81,25 @@ DEFAULT_RETENTION_DAYS = 30
 MAX_FACT_CHARS = 2_000
 MAX_CONTEXT_FACTS = 6
 WORKDIR = Path.cwd()
+_DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a renamed directory entry where directory handles are supported.
+
+    POSIX platforms allow opening a directory and passing its descriptor to
+    ``fsync``.  Windows does not expose that operation through ``os.open``;
+    the temporary file has still been flushed and synced before ``os.replace``
+    makes the complete new version visible.
+    """
+
+    if not _DIRECTORY_FSYNC_SUPPORTED:
+        return
+    directory = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 class MemoryErrorBase(RuntimeError):
@@ -376,12 +395,10 @@ class WorkspaceMemory:
             os.replace(temporary, path)
             # fsync the directory entry as well as the file contents.  Without
             # this step, a power loss may preserve the temporary file data but
-            # lose the rename that made it canonical.
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            # lose the rename that made it canonical.  Windows cannot open a
+            # directory through os.open, so its safe fallback stops after the
+            # synced temporary file and same-directory atomic replace.
+            _fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
 

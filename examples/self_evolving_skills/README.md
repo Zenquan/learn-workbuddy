@@ -98,7 +98,7 @@ python3 examples/self_evolving_skills/code.py \
 ## 设计取舍
 
 - **确定性蒸馏**：教学版要求多条轨迹具有相同的高层步骤，再提取共同流程。以后可以替换为 LLM distiller，但输出契约和门禁不变。
-- **失败是教训，不是指令**：失败轨迹会被 triage 拒绝。后续可把它们写入独立的 pitfall/reflection memory，但不能直接发布成可执行 Skill。
+- **失败是教训，不是指令**：失败轨迹会被 triage 拒绝，不能直接发布成可执行 Skill。配套的 [`reflection_memory`](../reflection_memory/) 示例要求重复失败与成功恢复共同支持，再经评测和人工批准后写入独立的非执行 Reflection Memory。
 - **评测与训练分离**：held-out trace 不属于 `source_trace_ids`，避免拿训练证据证明自己。
 - **候选与发布分离**：通过评测只代表“可以提交审批”，不代表 Agent 有权安装。
 - **原始证据不进 Skill**：减少密钥、用户数据、绝对路径和一次性命令被永久固化的风险。

@@ -82,6 +82,19 @@ s16 的 `audit_skill()` 目前只扫 `rm -rf /`、`sudo`、`pip install` 这类
 轨迹蒸馏成候选 `SKILL.md`，通过 held-out 回放、安全检查和显式人工审批后才进入
 版本化 Skill 库。
 
+失败轨迹走另一条边界更严格的通道。可运行的
+[`examples/reflection_memory/`](../examples/reflection_memory/) 要求相同失败签名至少由
+两条独立轨迹支持，并提供一条显式关联的 held-out 成功恢复轨迹；形成的 Reflection
+不包含原始命令或工具输出，也不拥有工具权限。它通过评测和人工批准后才能按任务族
+注入 prompt，后续成功证据可将其标记为 `resolved`，同时保留版本与 provenance。
+
+因此两个示例组成一条双通道学习边界：
+
+```text
+成功轨迹 + held-out 回放 -> 可执行 Skill 候选
+重复失败 + 成功恢复       -> 非执行 Reflection 候选
+```
+
 ## 来源
 
 - *Agent Skill Evaluation and Evolution: Frameworks and Benchmarks*（综述）：

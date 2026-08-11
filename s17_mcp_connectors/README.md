@@ -1,6 +1,6 @@
 # s17: MCP Connectors — 外接工具, 标准协议, 信任模型
 
-> *"外接工具, 标准协议, 信任模型"* — MCP 让 agent 的工具池可以无限扩展，但每个外接工具都需要用户手动信任。
+> *"外接工具, 标准协议, 信任模型"* — MCP 让 agent 的工具池可以扩展；Connector 要受信任，具体工具还要被当前 Skill 显式声明。
 >
 > **Harness 层**: 扩展生态 — agent 的外接工具系统。
 
@@ -14,7 +14,11 @@
 flowchart LR
     A["MCP Config"] --> B["Client Handshake"]
     B --> C["Tool Schema Import"]
-    C --> D["Tool Dispatch"]
+    T["Connector Trust"] --> G{"Trust ∩ Skill Grant"}
+    P["Skill Permission Grant"] --> G
+    C --> G
+    G -->|Allow| D["Tool Dispatch"]
+    G -->|Deny| X["Permission Error"]
     D --> E["Remote Tool Result"]
     C -. "state" .-> S["runtime state"]
     S -. "recover" .-> C
@@ -37,6 +41,7 @@ flowchart LR
 - 连接器越多越好是错觉, 工具膨胀会降低选择质量。
 - 未信任连接器直接暴露给模型, 风险很高。
 - MCP 工具不走统一审计, 会出现治理盲区。
+- 信任一个 Connector 不等于允许每个 Skill 调用它的全部工具。
 ## 问题
 
 s16 的 Skills 系统让 agent 可以按需加载单个技能。但技能本质上是 prompt 模板——它们告诉 agent "怎么做"，而不是提供新的"能做什么"。
@@ -47,7 +52,7 @@ s16 的 Skills 系统让 agent 可以按需加载单个技能。但技能本质�
 
 MCP（Model Context Protocol）解决了这个问题。它定义了一个标准协议：任何工具只要实现 `tools/list`（列出你能做什么）和 `tools/call`（执行某个工具），就可以被任何 MCP 客户端发现和使用。工具开发者和 agent 开发者彻底解耦。
 
-但"外接工具"带来了一个安全问题：一个恶意连接器可以执行任意命令、窃取数据。WorkBuddy 的答案是信任模型——每个连接器必须由用户手动 "Trust" 后才会激活。
+但"外接工具"带来了一个安全问题：一个恶意连接器可以执行任意命令、窃取数据。第一道门是信任模型——每个连接器必须由用户手动 "Trust" 后才会激活；第二道门是 Skill 权限——已连接工具只有同时出现在审核后的工具白名单中、且允许网络访问时，才会进入延迟工具池。
 
 ---
 
@@ -60,7 +65,7 @@ MCP（Model Context Protocol）解决了这个问题。它定义了一个标准�
        │              │               │            │
        │              │               │            │
   mcp.json 写入   进程未启动      用户点击 Trust   tools/list 发现
-  配置已保存      工具池不可见     信任持久化       tools/call 可用
+  配置已保存      工具池不可见     信任持久化       再与 Skill Grant 求交集
 
 
            ┌──────────────────────────────────────┐
@@ -83,7 +88,7 @@ MCP（Model Context Protocol）解决了这个问题。它定义了一个标准�
 | configured | 配置写入 `mcp.json` | 不可见 |
 | disconnected | 进程未启动 | 不可见 |
 | trusted | 用户已信任，进程待启动 | 不可见 |
-| connected | 进程启动，`tools/list` 完成 | 可见（延迟加载） |
+| connected | 进程启动，`tools/list` 完成 | 仅已声明工具可见（延迟加载） |
 
 MCP 协议核心方法：
 
@@ -140,6 +145,18 @@ def trust_connector(connector_name: str):
 
 信任状态持久化在 `~/.workbuddy/connector_trust.json`。未信任的连接器不会启动进程，其工具不会出现在工具池中。
 
+信任只决定 Connector 进程能否启动，不决定某个 Skill 能调用哪些工具。教学实现使用独立的 `MCPPermissionGrant`：
+
+```python
+grant = MCPPermissionGrant(
+    tools={"mcp__github__list_issues"},
+    network=True,
+)
+manager = ConnectorManager(MCP_CONFIG, grant)
+```
+
+省略 grant 时默认 `NO_MCP_PERMISSIONS`，即使 Connector 已受信任也不暴露任何工具。更新或撤销 grant 会清空已加载 schema；执行阶段还会重新检查，避免“先加载、后撤权、仍可执行”的 TOCTOU 缺口。
+
 ### 工具发现
 
 连接器被信任并启动后，agent 发送 `tools/list` 请求：
@@ -154,6 +171,8 @@ def discover_tools(connector_name: str) -> list[dict]:
     for tool in response.get("tools", []):
         # 命名空间化: mcp__connectorname__toolname
         namespaced_name = f"mcp__{connector_name}__{tool['name']}"
+        if not active_skill_grant.allows(namespaced_name):
+            continue
         discovered.append({
             "name": namespaced_name,
             "description": tool["description"],
@@ -180,9 +199,9 @@ DEFERRED_TOOLS = [
 
 # 当 agent 决定使用某个延迟工具时:
 # 1. ToolSearch 加载 schema
-schema = tool_search("mcp__github__create_pr")
+schema = tool_search("mcp__github__create_pr")  # 再检查 Skill grant
 # 2. DeferExecuteTool 执行
-result = defer_execute_tool("mcp__github__create_pr", {"title": "...", "body": "..."})
+result = defer_execute_tool("mcp__github__create_pr", {"title": "...", "body": "..."})  # 再检查
 ```
 
 这个设计解决了"工具爆炸"问题——40 个连接器 × 每个 10 个工具 = 400 个工具。如果把 400 个工具的完整 schema 全塞进系统提示，会浪费大量 token。延迟加载让 agent 只在需要时付出代价。
@@ -198,6 +217,8 @@ def build_connector_context() -> str:
     for name, conn in connectors.items():
         if conn.status == "connected":
             for tool in conn.tools:
+                if not active_skill_grant.allows(tool["name"]):
+                    continue
                 lines.append(f"- {tool['name']}: {tool['description']}")
     lines.append("</available_deferred_tools>")
     return "\n".join(lines)
@@ -237,9 +258,10 @@ def build_connector_context() -> str:
 1. 将信任状态写入持久化存储
 2. 启动连接器子进程
 3. 执行 `tools/list` 发现工具
-4. 将工具注册到延迟工具池
+4. 与当前 Skill 的工具/网络 grant 求交集
+5. 只把交集注册到延迟工具池
 
-未信任的连接器显示为 "Not Trusted" 状态，其工具完全不可见。
+未信任的连接器显示为 "Not Trusted" 状态，其工具完全不可见。已信任但未被当前 Skill 声明的工具同样不可见，也不能通过直接构造 `DeferExecuteTool` 调用绕过。
 
 ### 延迟工具加载
 
@@ -276,7 +298,9 @@ WorkBuddy 内置 连接器生态：
 3. **工具发现** — 模拟 `tools/list` 协议方法
 4. **延迟工具加载** — 模拟 `ToolSearch` + `DeferExecuteTool` 模式
 5. **命名空间化** — 工具名格式为 `mcp__connectorname__toolname`
-6. **状态注入** — 将连接器状态注入系统提示
+6. **权限交集** — Connector trust、网络许可和 Skill 工具白名单缺一不可
+7. **双重检查** — `ToolSearch` 与 `DeferExecuteTool` 都 fail closed
+8. **状态注入** — 只将允许的连接器工具注入系统提示
 
 内置模拟连接器：
 - `github` — 模拟 GitHub PR 创建
@@ -289,6 +313,7 @@ WorkBuddy 内置 连接器生态：
 
 ```bash
 python s17_mcp_connectors/code.py
+python -m pytest -q tests/test_skill_permissions.py
 ```
 
 试试这些 prompt：
@@ -298,7 +323,7 @@ python s17_mcp_connectors/code.py
 3. `Create a PR on GitHub to add dark mode`（使用 MCP 工具）
 4. `Send a message on Feishu saying hello`（使用另一个连接器）
 
-观察重点：未信任的连接器工具不可见。信任后工具出现在延迟工具池中。使用时先 ToolSearch 加载 schema，再 DeferExecuteTool 执行。
+观察重点：未信任的连接器工具不可见；信任后还要通过显式 Skill grant。交集中的工具先经 ToolSearch 加载 schema，再经 DeferExecuteTool 二次校验并执行。
 
 ---
 

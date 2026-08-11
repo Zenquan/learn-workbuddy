@@ -1,6 +1,6 @@
 # s16: Skills System — 技能先列目录, 用到时再展开
 
-> *"技能先列目录, 用到时再展开"* — SKILL.md frontmatter, 按需加载。
+> *"技能先列目录, 用到时再展开"* — SKILL.md frontmatter, 按需加载，权限显式声明。
 >
 > **Harness 层**: 扩展生态 — agent 的知识按需加载。
 
@@ -14,8 +14,13 @@
 flowchart LR
     A["Skill Directory"] --> B["Skill Search"]
     B --> C["Skill Loader"]
-    C --> D["Prompt/Tools Merge"]
-    D --> E["Agent Capability"]
+    C --> P["Permission Manifest"]
+    C --> D["Prompt Merge"]
+    P --> G{"Policy Gate"}
+    H["Harness Permission Ceiling"] --> G
+    D --> E["Agent Tool Call"] --> G
+    G -->|Allow| X["Tool Dispatch"]
+    G -->|Deny| Y["Permission Error"]
     C -. "state" .-> S["runtime state"]
     S -. "recover" .-> C
 ```
@@ -37,13 +42,14 @@ flowchart LR
 - 把所有 skill 全文注入 prompt, 会浪费上下文。
 - Skill 写成泛泛建议, 模型不知道什么时候触发。
 - 脚本和参考资料没有边界, 会让 skill 难以复用。
+- 把 Connector 信任或 Skill 声明误当成授权；它们都不能突破 Harness 的基础权限。
 ## 问题
 
 agent 有基础工具（bash、read、write），有记忆系统，有身份。但不同任务需要不同的**操作指南**——提交代码有 commit 规范，做 code review 有 review 流程，部署有部署检查清单。如果把这些全部塞进系统提示，提示会膨胀到不可接受。
 
 你需要一种机制：**平时只列技能目录（名字 + 什么时候用），用到时才加载完整内容。** 就像人的知识——你知道图书馆里有哪些书（目录），但只有需要时才去翻开具体那本。
 
-WorkBuddy 的 Skills 系统解决这个问题。每个技能是一个目录，包含一个 `SKILL.md` 文件。`SKILL.md` 的头部有 YAML frontmatter——标题、摘要、触发条件。系统启动时只扫描 frontmatter 建索引，不加载全文。当用户的输入匹配触发条件时，才把对应技能的完整内容加载进上下文。
+WorkBuddy 的 Skills 系统解决这个问题。每个技能是一个目录，包含一个 `SKILL.md` 文件。`SKILL.md` 的头部有 YAML frontmatter——标题、摘要、触发条件和权限声明。系统启动时只扫描 frontmatter 建索引，不加载全文。当用户的输入匹配触发条件时，才把对应技能的完整内容加载进上下文；其工具调用还必须同时通过 Skill manifest 与 Harness 基础权限。
 
 ---
 
@@ -114,6 +120,12 @@ read_when:
   - git push
   - 保存修改
 agent_created: false
+permissions:
+  tools: [bash]
+  network: false
+  paths:
+    read: ["**"]
+    write: []
 ---
 
 # Git Commit 技能
@@ -131,6 +143,14 @@ agent_created: false
 - 不要提交敏感信息
 - commit message 用中文
 ```
+
+`permissions` 是请求能力，不是授权能力。有效权限始终是：
+
+```text
+Harness 基础权限 ∩ 当前已审核 Skill manifest
+```
+
+字段采用严格白名单：未知字段、绝对路径、`..` 越界路径和错误类型全部拒绝。`paths` 只约束能理解结构化 `path` 参数的工具；`bash` 这类多用途工具仍需要 s04/s23 的沙盒、审批和出口控制，不能靠字符串扫描获得真正隔离。
 
 ### Frontmatter 解析
 
@@ -503,7 +523,12 @@ read_when:                  # 触发条件 (关键词列表)
   - 提交代码
   - commit
 agent_created: false         # 是否由模型创建
-risk_level: P2               # 安全等级
+permissions:                 # Skill 请求的最小能力
+  tools: [read_file]
+  network: false
+  paths:
+    read: ["docs/**"]
+    write: []
 ---
 ```
 
@@ -560,6 +585,8 @@ const SkillTool = {
 | P1 | 包含网络/安装操作 (curl, npm install) | 需用户确认 |
 | P2 | 安全内容 | 直接安装 |
 
+此外，`permission_diff()` 会把新版相对旧版新增的工具、网络、读路径和写路径单独列出。任何权限扩大都进入 P1 人工审批；运行时 `authorize_skill_tool()` 再检查实际工具调用，防止只审安装、不审执行。
+
 ### 自动保存技能
 
 WorkBuddy 的一个设计原则：**完成多步骤任务后，模型必须保存流程为技能**。这让 agent 随着使用越来越强——下次遇到类似任务直接加载技能，不用重新探索。
@@ -576,8 +603,10 @@ WorkBuddy 的一个设计原则：**完成多步骤任务后，模型必须保�
 4. **`load_skill()`** — 按需加载技能完整内容
 5. **`create_skill()`** — 创建新技能（agent_created 标记）
 6. **`audit_skill()`** — 安装前的 P0/P1/P2 安全审计
-7. **`Skill` 工具** — 模型可主动调用的技能加载工具
-8. **agent 循环** — 输入时自动匹配技能，加载后重新组装系统提示
+7. **`parse_skill_permissions()` / `permission_diff()`** — 严格解析权限并显示升级
+8. **`authorize_skill_tool()`** — 执行前校验工具、网络和结构化路径
+9. **`Skill` 工具** — 模型可主动调用的技能加载工具
+10. **agent 循环** — 输入时自动匹配技能，加载后重新组装系统提示
 
 预设了 3 个示例技能（git-commit、code-review、deploy-check）在内存中模拟。运行后试试说"帮我提交代码"——观察技能匹配和加载过程。
 
@@ -587,6 +616,7 @@ WorkBuddy 的一个设计原则：**完成多步骤任务后，模型必须保�
 
 ```bash
 python s16_skills_system/code.py
+python -m pytest -q tests/test_skill_permissions.py
 ```
 
 ---

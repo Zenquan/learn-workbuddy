@@ -45,9 +45,9 @@ P0/P1/P2 检查，但那套字符串匹配还远不够，见下一节。
 
 ## 三、SKILL-INJECT：三类技能注入攻击
 
-s16 的 `audit_skill()` 目前只扫 `rm -rf /`、`sudo`、`pip install` 这类
-**直白模式**。综述里的 SKILL-INJECT 基准指出恶意技能有三类更隐蔽的攻击
-面，纯字符串黑名单一个都拦不住：
+s16 的 `audit_skill()` 保留 `rm -rf /`、`sudo`、`pip install` 这类直白模式
+扫描，同时新增严格的声明式权限解析、权限升级 diff 与运行时门禁。但模式扫描本身
+仍拦不住综述中 SKILL-INJECT 的三类隐蔽攻击：
 
 1. **隐藏覆盖 (hidden override)**：技能表面人畜无害，实际悄悄覆盖或重定义
    了 harness 的默认行为/安全规则。对应"压缩整合"范式删掉安全规则的风险。
@@ -68,12 +68,13 @@ s16 的 `audit_skill()` 目前只扫 `rm -rf /`、`sudo`、`pip install` 这类
 
 1. **给 s16 的 `audit_skill` 补三类攻击的说明与检测占位**（已在 s16 README
    补充），让读者知道 P0/P1/P2 只是第一层。
-2. **s16/s17 增加"声明式权限"字段**：技能在 frontmatter 里声明它需要哪些
-   工具/网络/路径，加载时和实际行为做 diff，这是拦"隐藏覆盖"和"伪装转移"
-   最实用的手段。
-3. **未来的自进化章节**：如果加第 25 章，优先做"轨迹蒸馏 → 新技能"，因为它
-   纯 harness 可实现、演示效果好（用户重复任务被自动固化），且是 Hermes 那
-   类"自进化 Agent"卖点的教学版。
+2. **s16/s17 增加"声明式权限"字段**（已落地）：技能在 frontmatter 里声明
+   工具/网络/路径；未知字段和越界路径 fail closed，新旧版本生成权限升级 diff，
+   s17 在 `ToolSearch` 与 `DeferExecuteTool` 两阶段都执行 Connector trust 与
+   Skill grant 的交集校验。
+3. **轨迹蒸馏 → 新技能**（已在 example 落地）：保持 24 章主线不变，用
+   `examples/self_evolving_skills/` 演示重复成功轨迹、held-out 回放、安全检查和
+   人工审批后的版本化发布。
 4. **评测意识**：README 里引用上面 6 类基准，说明本项目技能子系统对标的是
    哪几维（Utility + Retrieval/Routing + Safety），比空泛说"好用"有说服力。
 

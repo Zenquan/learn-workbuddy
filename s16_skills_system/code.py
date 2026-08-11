@@ -8,7 +8,8 @@ Skills are stored in two levels:
   - Project-level: {workspace}/.workbuddy/skills/ (project-specific, shared)
 
 Each skill is a directory with a SKILL.md file.
-SKILL.md has YAML frontmatter: title, summary, read_when (triggers).
+SKILL.md has YAML frontmatter: title, summary, read_when (triggers), and a
+strict permissions manifest for tools, network, and workspace-relative paths.
 
 Loading is on-demand:
   1. Startup: scan frontmatter → build index (no full content loaded)
@@ -35,7 +36,7 @@ Loading is on-demand:
   └───────────────────────────────────────────────────┘
 
 Production harnesses often use: same frontmatter + on-demand model in agent bridge,
-with P0/P1/P2 security audit on install.
+with install audit, permission diff, runtime policy, and sandbox enforcement.
 Teaching version uses: in-memory skills, keyword matching.
 
 Usage:
@@ -48,8 +49,9 @@ Usage:
 # chapter declares what it inherits and what it adds.
 PROGRESSION = {'chapter': 's16_skills_system',
  'builds_on': ['s15_prompt_assembly'],
- 'adds': ['SKILL.md discovery', 'frontmatter parsing', 'on-demand skill loading'],
- 'preserves': ['prompt assembly pipeline']}
+ 'adds': ['SKILL.md discovery', 'frontmatter parsing', 'on-demand skill loading',
+          'declarative skill permissions'],
+ 'preserves': ['prompt assembly pipeline', 'harness permission ceiling']}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
 import sys as _wb_sys
@@ -61,7 +63,7 @@ from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
 from mini_workbuddy.chapter_demo import prepare_chapter_provider as _wb_prepare_chapter_provider
 _wb_prepare_chapter_provider()
-import os, sys, time, json
+import fnmatch, os, re, sys, time, json
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -96,6 +98,172 @@ except ImportError:
 
 
 # ======================================================================
+# Declarative skill permissions
+# ======================================================================
+
+class SkillPermissionError(ValueError):
+    """Raised when a skill permission manifest is malformed."""
+
+
+@dataclass(frozen=True)
+class SkillPermissions:
+    """Capabilities requested by one skill.
+
+    This manifest can only narrow the harness policy. Declaring a capability
+    never grants authority that the underlying permission layer denied.
+    """
+
+    tools: tuple[str, ...] = ()
+    network: bool = False
+    read_paths: tuple[str, ...] = ()
+    write_paths: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict:
+        return {
+            "tools": list(self.tools),
+            "network": self.network,
+            "paths": {
+                "read": list(self.read_paths),
+                "write": list(self.write_paths),
+            },
+        }
+
+
+_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_NETWORK_COMMAND_PATTERNS = (
+    "curl ", "wget ", "git clone", "npm install", "pip install",
+)
+
+
+def _unique_strings(value, *, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise SkillPermissionError(f"permissions.{field_name} must be a list")
+    result = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise SkillPermissionError(
+                f"permissions.{field_name} entries must be non-empty strings"
+            )
+        item = item.strip()
+        if item not in result:
+            result.append(item)
+    return tuple(result)
+
+
+def _validate_path_pattern(pattern: str, *, field_name: str) -> str:
+    normalized = pattern.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", normalized) or normalized.startswith("/"):
+        raise SkillPermissionError(
+            f"permissions.paths.{field_name} must stay relative to the workspace"
+        )
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts:
+        raise SkillPermissionError(
+            f"permissions.paths.{field_name} must not escape the workspace"
+        )
+    return "/".join(parts)
+
+
+def parse_skill_permissions(value) -> SkillPermissions:
+    """Parse a strict, fail-closed permissions block from frontmatter."""
+    if value is None:
+        return SkillPermissions()
+    if not isinstance(value, dict):
+        raise SkillPermissionError("permissions must be a mapping")
+
+    unknown = set(value) - {"tools", "network", "paths"}
+    if unknown:
+        raise SkillPermissionError(
+            f"unknown permissions fields: {', '.join(sorted(unknown))}"
+        )
+
+    tools = _unique_strings(value.get("tools", []), field_name="tools")
+    for tool in tools:
+        if not _TOOL_NAME.fullmatch(tool):
+            raise SkillPermissionError(f"invalid tool name in permissions.tools: {tool}")
+
+    network = value.get("network", False)
+    if not isinstance(network, bool):
+        raise SkillPermissionError("permissions.network must be true or false")
+
+    paths = value.get("paths", {})
+    if not isinstance(paths, dict):
+        raise SkillPermissionError("permissions.paths must be a mapping")
+    unknown_paths = set(paths) - {"read", "write"}
+    if unknown_paths:
+        raise SkillPermissionError(
+            f"unknown permissions.paths fields: {', '.join(sorted(unknown_paths))}"
+        )
+
+    read_paths = tuple(
+        _validate_path_pattern(pattern, field_name="read")
+        for pattern in _unique_strings(paths.get("read", []), field_name="paths.read")
+    )
+    write_paths = tuple(
+        _validate_path_pattern(pattern, field_name="write")
+        for pattern in _unique_strings(paths.get("write", []), field_name="paths.write")
+    )
+    return SkillPermissions(tools, network, read_paths, write_paths)
+
+
+def permission_diff(
+    previous: SkillPermissions, requested: SkillPermissions
+) -> dict[str, object]:
+    """Return only permission additions so updates can surface escalation."""
+    return {
+        "added_tools": sorted(set(requested.tools) - set(previous.tools)),
+        "network_enabled": requested.network and not previous.network,
+        "added_read_paths": sorted(
+            set(requested.read_paths) - set(previous.read_paths)
+        ),
+        "added_write_paths": sorted(
+            set(requested.write_paths) - set(previous.write_paths)
+        ),
+    }
+
+
+def has_permission_escalation(diff: dict[str, object]) -> bool:
+    return any(bool(value) for value in diff.values())
+
+
+def _path_is_allowed(path: str, patterns: tuple[str, ...], workdir: Path) -> bool:
+    try:
+        resolved = (workdir / path).resolve()
+        relative = resolved.relative_to(workdir.resolve()).as_posix()
+    except (OSError, ValueError):
+        return False
+    return any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns)
+
+
+def authorize_skill_tool(
+    skill: "Skill", tool_name: str, tool_input: dict, *, workdir: Path | None = None
+) -> tuple[bool, str]:
+    """Check one skill manifest before the harness executes a tool call."""
+    if tool_name not in skill.permissions.tools:
+        return False, f"skill '{skill.title}' did not declare tool '{tool_name}'"
+
+    command = str(tool_input.get("command", "")).lower()
+    if tool_name == "bash" and any(
+        pattern in command for pattern in _NETWORK_COMMAND_PATTERNS
+    ) and not skill.permissions.network:
+        return False, f"skill '{skill.title}' did not declare network access"
+
+    path = tool_input.get("path")
+    if isinstance(path, str) and tool_name == "read_file":
+        root = workdir or WORKDIR
+        if not _path_is_allowed(path, skill.permissions.read_paths, root):
+            return False, f"skill '{skill.title}' cannot read path '{path}'"
+    if isinstance(path, str) and tool_name == "write_file":
+        root = workdir or WORKDIR
+        if not _path_is_allowed(path, skill.permissions.write_paths, root):
+            return False, f"skill '{skill.title}' cannot write path '{path}'"
+
+    return True, "allowed by skill manifest; harness policy still applies"
+
+
+# ======================================================================
 # SKILL.md parsing
 # ======================================================================
 
@@ -109,6 +277,7 @@ class Skill:
     content: str = ""           # Full content (loaded on demand)
     loaded: bool = False        # Whether full content is in context
     agent_created: bool = False
+    permissions: SkillPermissions = field(default_factory=SkillPermissions)
 
     def index_line(self) -> str:
         """One-line index entry for system prompt (compact)."""
@@ -133,6 +302,8 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
     if yaml:
         fm = yaml.safe_load(parts[1]) or {}
+        if not isinstance(fm, dict):
+            raise SkillPermissionError("frontmatter must be a mapping")
     else:
         # Fallback: simple parsing without yaml
         fm = {}
@@ -162,6 +333,7 @@ def parse_skill_md(filepath: Path) -> Skill | None:
         content=body,
         loaded=False,
         agent_created=fm.get("agent_created", False),
+        permissions=parse_skill_permissions(fm.get("permissions")),
     )
 
 
@@ -183,6 +355,12 @@ read_when:
   - git push
   - 保存修改
 agent_created: false
+permissions:
+  tools: [bash]
+  network: false
+  paths:
+    read: ["**"]
+    write: []
 ---
 
 # Git Commit 技能
@@ -211,6 +389,12 @@ read_when:
   - review
   - 审查代码
 agent_created: false
+permissions:
+  tools: [read_file]
+  network: false
+  paths:
+    read: ["**"]
+    write: []
 ---
 
 # Code Review 技能
@@ -239,6 +423,12 @@ read_when:
   - 上线
   - 发布
 agent_created: false
+permissions:
+  tools: [bash]
+  network: false
+  paths:
+    read: ["**"]
+    write: []
 ---
 
 # Deploy Check 技能
@@ -281,6 +471,7 @@ def build_skill_index() -> list[Skill]:
             content=body,
             loaded=False,
             agent_created=fm.get("agent_created", False),
+            permissions=parse_skill_permissions(fm.get("permissions")),
         )
         skills.append(skill)
     return skills
@@ -329,7 +520,7 @@ def load_skill(title: str) -> str:
 
 
 def create_skill(title: str, summary: str, read_when: list[str],
-                 content: str) -> str:
+                 content: str, permissions: dict | None = None) -> str:
     """Create a new skill.
 
     In real WorkBuddy, this writes to ~/.workbuddy/skills/{title}/SKILL.md
@@ -340,14 +531,20 @@ def create_skill(title: str, summary: str, read_when: list[str],
     if existing:
         return f"技能 '{title}' 已存在。"
 
+    requested_permissions = parse_skill_permissions(permissions)
+
     # Build SKILL.md content
     triggers_yaml = "\n".join(f"  - {t}" for t in read_when)
+    permissions_yaml = json.dumps(
+        requested_permissions.as_dict(), ensure_ascii=False
+    )
     skill_md = f"""---
 title: {title}
 summary: {summary}
 read_when:
 {triggers_yaml}
 agent_created: true
+permissions: {permissions_yaml}
 ---
 
 {content}"""
@@ -361,6 +558,7 @@ agent_created: true
         content=body,
         loaded=False,
         agent_created=True,
+        permissions=requested_permissions,
     )
     skill_index.append(new_skill)
     SEED_SKILLS[title] = skill_md  # Keep in sync
@@ -368,7 +566,10 @@ agent_created: true
     return f"技能 '{title}' 已创建。"
 
 
-def audit_skill(skill_content: str) -> tuple[str, str]:
+def audit_skill(
+    skill_content: str,
+    previous_permissions: SkillPermissions | None = None,
+) -> tuple[str, str]:
     """Security audit a skill before installing.
 
     P0: Dangerous patterns — block installation
@@ -378,6 +579,14 @@ def audit_skill(skill_content: str) -> tuple[str, str]:
     Production harness: more sophisticated AST analysis.
     Teaching version: pattern matching.
     """
+    try:
+        frontmatter, _ = parse_frontmatter(skill_content)
+        requested_permissions = parse_skill_permissions(
+            frontmatter.get("permissions")
+        )
+    except SkillPermissionError as exc:
+        return ("P0", f"禁止安装: 权限声明无效 ({exc})")
+
     p0_patterns = [
         ("rm -rf /", "递归删除根目录"),
         ("sudo ", "提权操作"),
@@ -403,6 +612,18 @@ def audit_skill(skill_content: str) -> tuple[str, str]:
     for pattern, desc in p1_patterns:
         if pattern in skill_content:
             return ("P1", f"需审批: 包含 '{pattern}' ({desc})")
+
+    if previous_permissions is not None:
+        diff = permission_diff(previous_permissions, requested_permissions)
+        if has_permission_escalation(diff):
+            return (
+                "P1",
+                "需审批: Skill 更新扩大权限 "
+                + json.dumps(diff, ensure_ascii=False, sort_keys=True),
+            )
+
+    if requested_permissions.network or requested_permissions.write_paths:
+        return ("P1", "需审批: Skill 请求网络访问或写路径权限")
 
     return ("P2", "安全: 未检测到危险模式")
 
@@ -498,6 +719,30 @@ TOOLS = [
 TOOL_HANDLERS = {"Skill": run_skill, "bash": run_bash, "read_file": run_read}
 
 
+def authorize_loaded_skill_tool(
+    tool_name: str, tool_input: dict, *, workdir: Path | None = None
+) -> tuple[bool, str]:
+    """Apply active Skill overlays without replacing the base harness policy.
+
+    With no active skill, s04-style harness permissions remain authoritative.
+    When skills are active, at least one reviewed manifest must declare the
+    capability. A production dispatcher should also bind each call to its
+    originating skill instead of using this teaching union.
+    """
+    if tool_name == "Skill" or not loaded_skills:
+        return True, "base harness policy applies"
+
+    reasons = []
+    for skill in loaded_skills:
+        allowed, reason = authorize_skill_tool(
+            skill, tool_name, tool_input, workdir=workdir
+        )
+        if allowed:
+            return True, reason
+        reasons.append(reason)
+    return False, "; ".join(reasons)
+
+
 # ======================================================================
 # Agent Loop
 # ======================================================================
@@ -522,8 +767,13 @@ def agent_loop(messages: list):
             if block.type != "tool_use":
                 continue
 
+            tool_input = dict(block.input) if block.input else {}
+            allowed, reason = authorize_loaded_skill_tool(block.name, tool_input)
             handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            if not allowed:
+                output = f"Permission denied: {reason}"
+            else:
+                output = handler(**tool_input) if handler else f"Unknown: {block.name}"
 
             # Special display for Skill tool
             if block.name == "Skill":

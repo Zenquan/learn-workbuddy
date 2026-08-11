@@ -35,7 +35,28 @@ def test_append_wraps_copied_event_with_monotonic_evidence_envelope(s09, tmp_pat
     assert [record["sequence"] for record in records] == [1, 2]
     assert all(record["schema_version"] == 1 for record in records)
     assert all(record["recorded_at"].endswith("+00:00") for record in records)
+    assert [record["session_id"] for record in records] == ["session", "session"]
+    assert [record["event_id"] for record in records] == [
+        "transcript:session:1",
+        "transcript:session:2",
+    ]
     assert source == {"type": "message", "role": "user", "content": "hello"}
+
+
+def test_envelope_ids_cannot_be_spoofed_by_event_payload(s09, tmp_path: Path) -> None:
+    transcript = s09.JSONLTranscript(tmp_path / "session.jsonl")
+
+    with pytest.raises(s09.TranscriptValidationError, match="reserved envelope"):
+        transcript.append(
+            {
+                "type": "message",
+                "role": "user",
+                "content": "hello",
+                "event_id": "transcript:other-session:99",
+            }
+        )
+
+    assert transcript.count_lines() == 0
 
 
 def test_replay_state_is_derived_not_persisted_runtime_state(s09, tmp_path: Path) -> None:
@@ -60,6 +81,87 @@ def test_fresh_instance_replays_then_continues_sequence(s09, tmp_path: Path) -> 
     assert replacement.replay_state().next_sequence == 2
     replacement.append({"type": "message", "role": "assistant", "content": "two"})
     assert [event["sequence"] for event in replacement._read_all_events()] == [1, 2]
+
+
+def test_memory_candidate_is_explicit_and_keeps_exact_transcript_source(s09, tmp_path: Path) -> None:
+    path = tmp_path / "session-42.jsonl"
+    transcript = s09.JSONLTranscript(path)
+    transcript.append(
+        {
+            "type": "message",
+            "role": "user",
+            "content": "Use SQLite WAL for local persistence.",
+        }
+    )
+    transcript.append({"type": "reasoning", "content": "This may be durable."})
+
+    candidate = transcript.select_memory_candidate(
+        "transcript:session-42:1",
+        summary="Selected SQLite WAL for local persistence.",
+        reason="Explicit architecture decision confirmed by the user.",
+    )
+
+    assert candidate.source_id == "transcript:session-42:1"
+    assert candidate.session_id == "session-42"
+    assert candidate.sequence == 1
+    assert candidate.event_type == s09.TYPE_MESSAGE
+    assert candidate.source_type == "transcript"
+    assert candidate.source_metadata() == {
+        "source_id": "transcript:session-42:1",
+        "source_type": "transcript",
+        "title": "session-42 event 1",
+        "captured_at": candidate.captured_at,
+    }
+    assert not hasattr(candidate, "content")  # source body stays in the transcript
+
+
+def test_memory_selection_rejects_metadata_tool_output_and_unknown_ids(s09, tmp_path: Path) -> None:
+    transcript = s09.JSONLTranscript(tmp_path / "session.jsonl")
+    transcript.append({"type": "reasoning", "content": "private chain of thought"})
+    transcript.append(
+        {
+            "type": "function_call_result",
+            "callId": "call-1",
+            "output": {"content": "x" * 20_000},
+        }
+    )
+
+    for event_id in ("transcript:session:1", "transcript:session:2"):
+        with pytest.raises(s09.MemorySelectionError, match="not eligible"):
+            transcript.select_memory_candidate(
+                event_id,
+                summary="Should not be promoted.",
+                reason="Negative contract test.",
+            )
+
+    with pytest.raises(s09.MemorySelectionError, match="unknown transcript event"):
+        transcript.select_memory_candidate(
+            "transcript:session:99",
+            summary="Missing source.",
+            reason="Negative contract test.",
+        )
+    with pytest.raises(s09.MemorySelectionError, match="summary"):
+        transcript.select_memory_candidate(
+            "transcript:session:1",
+            summary=" ",
+            reason="Negative contract test.",
+        )
+
+
+def test_prompt_replay_bound_does_not_define_memory_retention(s09, tmp_path: Path) -> None:
+    transcript = s09.JSONLTranscript(tmp_path / "session.jsonl")
+    transcript.append({"type": "message", "role": "user", "content": "durable decision"})
+    transcript.append({"type": "message", "role": "assistant", "content": "recent reply"})
+
+    assert transcript.replay(max_items=1) == [
+        {"role": "assistant", "content": "recent reply"}
+    ]
+    candidate = transcript.select_memory_candidate(
+        "transcript:session:1",
+        summary="Durable decision.",
+        reason="Selected independently of the prompt replay window.",
+    )
+    assert candidate.sequence == 1
 
 
 def test_only_unterminated_corrupt_tail_is_ignored(s09, tmp_path: Path) -> None:

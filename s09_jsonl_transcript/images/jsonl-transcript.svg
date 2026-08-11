@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 570" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0,0 L10,5 L0,10 Z" fill="#1a73e8"/>
@@ -12,7 +12,7 @@
   </defs>
 
   <!-- Background -->
-  <rect width="800" height="500" fill="#f8f9fa"/>
+  <rect width="800" height="570" fill="#f8f9fa"/>
 
   <!-- Title -->
   <text x="400" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#202124">JSONL 对话持久化</text>
@@ -106,4 +106,19 @@
   <text x="555" y="445" font-size="11" font-weight="600" fill="#202124">记录类型</text>
   <text x="555" y="462" font-size="10" fill="#5f6368">message | reasoning | function_call</text>
   <text x="555" y="475" font-size="10" fill="#5f6368">function_call_result | snapshot</text>
+
+  <!-- ===== Transcript-to-memory selection boundary ===== -->
+  <rect x="60" y="510" width="230" height="44" rx="9" fill="#e8f0fe" stroke="#1a73e8"/>
+  <text x="175" y="529" text-anchor="middle" font-size="11" font-weight="700" fill="#174ea6">稳定证据 ID</text>
+  <text x="175" y="546" text-anchor="middle" font-size="9" fill="#5f6368" font-family="monospace">transcript:&lt;session&gt;:&lt;sequence&gt;</text>
+
+  <line x1="290" y1="532" x2="318" y2="532" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="326" y="510" width="148" height="44" rx="9" fill="#fff7e0" stroke="#f9ab00"/>
+  <text x="400" y="529" text-anchor="middle" font-size="11" font-weight="700" fill="#a15c00">显式选择</text>
+  <text x="400" y="546" text-anchor="middle" font-size="9" fill="#5f6368">summary + reason</text>
+
+  <line x1="474" y1="532" x2="502" y2="532" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <rect x="510" y="510" width="260" height="44" rx="9" fill="#e6f4ea" stroke="#34a853"/>
+  <text x="640" y="529" text-anchor="middle" font-size="11" font-weight="700" fill="#137333">Memory candidate</text>
+  <text x="640" y="546" text-anchor="middle" font-size="9" fill="#5f6368">只带摘要与来源引用，不复制 transcript 全文</text>
 </svg>

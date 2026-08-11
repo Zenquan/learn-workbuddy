@@ -33,10 +33,18 @@ Usage:
 
 # Machine-readable learning path metadata. Tests enforce that every
 # chapter declares what it inherits and what it adds.
-PROGRESSION = {'chapter': 's09_jsonl_transcript',
- 'builds_on': ['s08_model_routing'],
- 'adds': ['sequenced transcript evidence', 'derived replay state', 'partial-tail recovery'],
- 'preserves': ['model turn event shape']}
+PROGRESSION = {
+    "chapter": "s09_jsonl_transcript",
+    "builds_on": ["s08_model_routing"],
+    "adds": [
+        "sequenced transcript evidence",
+        "stable transcript event ids",
+        "derived replay state",
+        "explicit transcript-to-memory selection",
+        "partial-tail recovery",
+    ],
+    "preserves": ["model turn event shape", "memory as a selective derived view"],
+}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
 import sys as _wb_sys
@@ -70,9 +78,23 @@ TYPE_FUNCTION_CALL_RESULT = "function_call_result"
 TYPE_FILE_SNAPSHOT = "file-history-snapshot"
 TYPE_AI_TITLE = "ai-title"
 
+TRANSCRIPT_SOURCE_TYPE = "transcript"
+MEMORY_ELIGIBLE_EVENT_TYPES = frozenset({TYPE_MESSAGE, TYPE_FILE_SNAPSHOT})
+RESERVED_ENVELOPE_FIELDS = frozenset(
+    {"schema_version", "sequence", "recorded_at", "session_id", "event_id"}
+)
+
 
 class TranscriptCorruptionError(RuntimeError):
     """A complete persisted record is malformed or out of sequence."""
+
+
+class TranscriptValidationError(ValueError):
+    """A caller tried to append an event that violates the evidence envelope."""
+
+
+class MemorySelectionError(ValueError):
+    """A transcript event cannot cross the explicit memory-selection boundary."""
 
 
 @dataclass(frozen=True)
@@ -93,6 +115,42 @@ class ReplayState:
     ignored_partial_tail: bool = False
 
 
+@dataclass(frozen=True)
+class TranscriptMemoryCandidate:
+    """A compact source reference offered to a later memory policy.
+
+    Selecting a candidate does not write memory and deliberately does not copy
+    the source event body.  Workspace, user, or remote memory still decides
+    whether the summary is durable; the transcript remains the evidence owner.
+    """
+
+    source_id: str
+    session_id: str
+    sequence: int
+    event_type: str
+    captured_at: str
+    summary: str
+    selection_reason: str
+    source_type: str = TRANSCRIPT_SOURCE_TYPE
+
+    def source_metadata(self) -> dict[str, str]:
+        """Return the provenance shape accepted by the later memory chapter."""
+
+        return {
+            "source_id": self.source_id,
+            "source_type": self.source_type,
+            "title": f"{self.session_id} event {self.sequence}",
+            "captured_at": self.captured_at,
+        }
+
+
+def _required_selection_text(value: str, *, field_name: str) -> str:
+    normalized = " ".join(str(value).split())
+    if not normalized:
+        raise MemorySelectionError(f"{field_name} is required for memory selection")
+    return normalized
+
+
 class JSONLTranscript:
     """Append-only JSONL transcript for a single session.
 
@@ -105,18 +163,31 @@ class JSONLTranscript:
     def __init__(self, filepath: str | Path):
         self.path = Path(filepath)
         self.filepath = str(self.path)  # compatibility with the original demo
+        self.session_id = self.path.stem
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._ignored_partial_tail = False
 
+    def _event_id(self, sequence: int) -> str:
+        """Build the stable cross-chapter source identifier for one record."""
+
+        return f"{TRANSCRIPT_SOURCE_TYPE}:{self.session_id}:{sequence}"
+
     def append(self, event: dict) -> None:
         """Append one event as a single JSON line. Never overwrite."""
+        reserved = sorted(RESERVED_ENVELOPE_FIELDS.intersection(event))
+        if reserved:
+            raise TranscriptValidationError(
+                "event payload contains reserved envelope fields: " + ", ".join(reserved)
+            )
         existing = self._read_all_events()
         sequence = existing[-1]["sequence"] + 1 if existing else 1
         envelope = {
+            **deepcopy(event),
             "schema_version": 1,
             "sequence": sequence,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
-            **deepcopy(event),
+            "session_id": self.session_id,
+            "event_id": self._event_id(sequence),
         }
         encoded = (json.dumps(envelope, ensure_ascii=False, sort_keys=True) + "\n").encode()
         descriptor = os.open(self.path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
@@ -148,6 +219,10 @@ class JSONLTranscript:
                 raise TranscriptCorruptionError(
                     f"{self.path.name}:{line_number}: invalid complete JSON record"
                 ) from exc
+            if not isinstance(event, dict):
+                raise TranscriptCorruptionError(
+                    f"{self.path.name}:{line_number}: record must be a JSON object"
+                )
             expected = len(events) + 1
             sequence = event.get("sequence", expected)  # read legacy teaching logs
             if sequence != expected:
@@ -155,6 +230,21 @@ class JSONLTranscript:
                     f"{self.path.name}:{line_number}: expected sequence {expected}, got {sequence}"
                 )
             event.setdefault("sequence", sequence)
+            session_id = event.get("session_id", self.session_id)
+            if session_id != self.session_id:
+                raise TranscriptCorruptionError(
+                    f"{self.path.name}:{line_number}: expected session_id "
+                    f"{self.session_id!r}, got {session_id!r}"
+                )
+            event.setdefault("session_id", self.session_id)
+            expected_event_id = self._event_id(expected)
+            event_id = event.get("event_id", expected_event_id)
+            if event_id != expected_event_id:
+                raise TranscriptCorruptionError(
+                    f"{self.path.name}:{line_number}: expected event_id "
+                    f"{expected_event_id!r}, got {event_id!r}"
+                )
+            event.setdefault("event_id", expected_event_id)
             events.append(event)
         return events
 
@@ -206,6 +296,50 @@ class JSONLTranscript:
             reasoning_count=reasoning_count,
             next_sequence=len(events) + 1,
             ignored_partial_tail=self._ignored_partial_tail,
+        )
+
+    def select_memory_candidate(
+        self,
+        event_id: str,
+        *,
+        summary: str,
+        reason: str,
+    ) -> TranscriptMemoryCandidate:
+        """Select one persisted event for evaluation by a memory policy.
+
+        The caller must name one stable event id and explain the selection.
+        Replay limits are unrelated: replay controls prompt context, while this
+        method creates a source-bearing candidate for s10-s12 to evaluate.
+        Reasoning, tool calls/results, and titles are never promoted directly.
+        """
+
+        normalized_summary = _required_selection_text(summary, field_name="summary")
+        normalized_reason = _required_selection_text(reason, field_name="reason")
+        events = self._read_all_events()
+        selected = next(
+            (event for event in events if event.get("event_id") == event_id),
+            None,
+        )
+        if selected is None:
+            raise MemorySelectionError(f"unknown transcript event: {event_id}")
+        event_type = str(selected.get("type", ""))
+        if event_type not in MEMORY_ELIGIBLE_EVENT_TYPES:
+            raise MemorySelectionError(
+                f"event type {event_type!r} is not eligible for memory selection"
+            )
+        captured_at = str(selected.get("recorded_at", "")).strip()
+        if not captured_at:
+            raise MemorySelectionError(
+                f"transcript event {event_id} has no recorded_at provenance"
+            )
+        return TranscriptMemoryCandidate(
+            source_id=str(selected["event_id"]),
+            session_id=str(selected["session_id"]),
+            sequence=int(selected["sequence"]),
+            event_type=event_type,
+            captured_at=captured_at,
+            summary=normalized_summary,
+            selection_reason=normalized_reason,
         )
 
     def recover(self) -> dict:

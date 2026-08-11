@@ -17,6 +17,9 @@ flowchart LR
     C --> D["validated replay fold"]
     D --> E["ReplayState"]
     E --> F["replacement runtime"]
+    C --> G["explicit event_id selection"]
+    G --> H["TranscriptMemoryCandidate"]
+    H -. "target-specific policy" .-> I["s10-s12 Memory"]
     C -. "immutable evidence" .-> D
 ```
 
@@ -25,12 +28,14 @@ flowchart LR
 - JSONL 是一行一个 JSON 事件, 适合追加写入。
 - Transcript 是事实流, SQLite 更适合索引和查询。
 - 崩溃恢复依赖事件顺序、完整行边界和明确的失败策略。
+- `event_id = transcript:<session_id>:<sequence>` 把后续 Memory 关联回一条确切证据。
 - Transcript 是 session 证据，不是跨会话选择性 Memory。
 
 ## 本章抓住的 WorkBuddy-style 机制
 
 - 把用户消息、助手消息、工具调用、工具结果都写成事件。
 - 通过 replay fold 派生可丢弃、可重建的运行时状态。
+- 通过显式选择门槛产生只含摘要与来源引用的 Memory candidate。
 - 为 s21 的数据库分工打基础。
 
 ## 常见误区
@@ -40,7 +45,7 @@ flowchart LR
 - 对任意坏行都静默跳过，会把证据损坏伪装成一次成功恢复。
 ## 问题
 
-s11 解决了"用哪个模型"。现在模型能对话了，但对话内容存哪？
+s08 解决了"用哪个模型"。现在模型能对话了，但对话内容存哪？
 
 最直觉的答案：数据库。开一张 SQLite 表，每条消息一行，`INSERT` 进去。查的时候 `SELECT * FROM messages WHERE session_id = ?`。
 
@@ -124,12 +129,10 @@ WorkBuddy 的做法：**对话内容存 JSONL，元数据存 SQLite**。
 示例 JSONL 内容：
 
 ```jsonl
-{"type":"message","role":"user","content":"fix the bug","timestamp":1709123456}
-{"type":"reasoning","content":"Let me analyze the error...","timestamp":1709123457}
-{"type":"function_call","name":"read_file","arguments":{"path":"main.py"},"callId":"call_001"}
-{"type":"function_call_result","callId":"call_001","output":{"content":"..."}}
-{"type":"file-history-snapshot","path":"main.py","hash":"abc123"}
-{"type":"ai-title","title":"Fix login bug"}
+{"schema_version":1,"sequence":1,"session_id":"abc123","event_id":"transcript:abc123:1","recorded_at":"...","type":"message","role":"user","content":"fix the bug"}
+{"schema_version":1,"sequence":2,"session_id":"abc123","event_id":"transcript:abc123:2","recorded_at":"...","type":"reasoning","content":"Let me analyze the error..."}
+{"schema_version":1,"sequence":3,"session_id":"abc123","event_id":"transcript:abc123:3","recorded_at":"...","type":"function_call","name":"read_file","arguments":{"path":"main.py"},"callId":"call_001"}
+{"schema_version":1,"sequence":4,"session_id":"abc123","event_id":"transcript:abc123:4","recorded_at":"...","type":"function_call_result","callId":"call_001","output":{"content":"..."}}
 ```
 
 前 3 种（message、reasoning、function_call）是 agent 思考链的三个阶段：用户提问 → 模型推理 → 模型行动。第 4 种（function_call_result）是行动的反馈。后 2 种（file-history-snapshot、ai-title）是系统级的元数据。
@@ -253,6 +256,32 @@ def recover(self):
 
 Transcript 按 session 保存发生过的事件，目标是忠实和可回放；s10 Workspace Memory 则跨 session 选择稳定项目事实，目标是相关性与长期保留。关闭 runtime 不删除 transcript，replay 也不会把 transcript 自动晋升成 memory。
 
+### Transcript → Memory 必须经过显式选择
+
+`replay(max_items=N)` 只决定本轮 prompt 能看到多少近期事件，不能充当长期保留策略。即使某条旧事件已经不在 replay window 中，Memory policy 仍可通过稳定 `event_id` 精确引用它；反过来，出现在 replay 中也不代表应该保存为 Memory。
+
+教学版把转换边界写成 `select_memory_candidate(event_id, summary, reason)`：
+
+| 条件 | 原因 |
+|------|------|
+| 必须引用已完整落盘的 `event_id` | Memory 能追溯到唯一 session 与 sequence |
+| 必须提供摘要与选择理由 | 长期保留是可解释决策，不是自动复制历史 |
+| 仅允许 `message` 与 `file-history-snapshot` | reasoning、工具调用、工具正文和标题不能直接晋升 |
+| Candidate 不携带源事件正文 | 大结果仍归 transcript/artifact 所有，Memory 只保存必要摘要和指针 |
+| s10-s12 再执行目标域策略 | Workspace、User、Remote Memory 的作用域与保留规则不同 |
+
+```python
+candidate = transcript.select_memory_candidate(
+    "transcript:session_abc123:17",
+    summary="项目确定使用 SQLite WAL。",
+    reason="用户明确确认的持久化架构决策。",
+)
+
+# candidate.source_metadata() 可交给后续 Memory 层；这里没有写入 Memory。
+```
+
+这条边界防止两种常见错误：把整个 transcript 复制成“长期记忆”，以及恢复 session 时把所有历史重新塞进 prompt。
+
 ---
 
 ## JSONL vs SQLite 分工
@@ -297,11 +326,11 @@ WorkBuddy 同时用 JSONL 和 SQLite，但职责严格分开：
 
 ### 1. 简单
 
-append-only，没有 schema 迁移。加一种新事件类型？直接写进去，旧代码遇到不认识的 `type` 就跳过。不需要 `ALTER TABLE`，不需要迁移脚本。
+append-only 不需要关系表的 `ALTER TABLE`。新增事件类型可以用新的 `schema_version` 和字段继续追加；reader 对未知事件保持证据、只在构建其认识的派生视图时忽略它，而不会改写旧行。
 
 ### 2. 崩溃恢复
 
-不需要事务日志。文件本身就是日志。崩溃后读文件，跳过损坏的最后一行（`json.loads` 失败就 skip），其余数据完好。数据库要管 ACID、WAL、checkpoint，JSONL 只管追加。
+不需要额外事务日志。文件本身就是日志。崩溃后只允许忽略“没有换行且 JSON 不完整”的尾部；完整坏行、文件中间的坏行和 sequence/ID 断裂都必须失败关闭，避免把证据损坏伪装成成功恢复。
 
 ### 3. 可移植
 
@@ -370,6 +399,7 @@ WorkBuddy 在 agent loop 的每个关键节点写入 JSONL：
    - `append(event)` — 追加一行 JSON，永不覆盖
    - `replay(max_items=1000)` — 从末尾取最近 N 个事件，重建 messages[]
    - `recover()` — 读取全部事件，恢复 messages[] + 元数据
+   - `select_memory_candidate(event_id, summary, reason)` — 显式选择一条可追溯证据，不复制正文
    - `_event_to_message(event)` — 将 JSONL 事件转换为 LLM 消息格式
 
 2. **`MockLLM` 类** — 模拟 LLM 的脚本化对话，演示全部 6 种事件类型
@@ -399,7 +429,7 @@ python s09_jsonl_transcript/code.py
 ## 练习
 
 1. **截断回放**：修改 `replay()` 方法，使其在反向读取时遇到最后一个 `message` 类型且 `role=user` 的事件就停止。这意味着只恢复"最后一轮对话"的上下文，而非全部历史。
-2. **损坏容错**：在 JSONL 文件中手动插入一行损坏的 JSON（如 `{"type":"message", broken`），验证 `_read_all_events()` 是否能跳过损坏行并继续恢复其余事件。
+2. **损坏边界**：分别制造未结束的 partial tail 与带换行的完整坏行；验证前者被报告并忽略、后者触发 `TranscriptCorruptionError`。
 3. **会话分片**：当一个 JSONL 文件超过 10000 行时，自动创建新文件（如 `session_abc123_2.jsonl`），并在 SQLite 中记录分片信息。实现这个分片逻辑。
 
 ---

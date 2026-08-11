@@ -15,6 +15,7 @@ Key mechanisms simulated:
   3. tools/list discovery (MCP protocol)
   4. Deferred tool loading (ToolSearch + DeferExecuteTool pattern)
   5. Namespace: mcp__connectorname__toolname
+  6. Connector trust intersected with Skill-scoped MCP permissions
 
 Production harnesses often use:
   - Real MCP server processes (stdio transport) spawned by Sidecar
@@ -39,8 +40,9 @@ Usage:
 # chapter declares what it inherits and what it adds.
 PROGRESSION = {'chapter': 's17_mcp_connectors',
  'builds_on': ['s16_skills_system'],
- 'adds': ['connector config', 'trust workflow', 'MCP tool namespace'],
- 'preserves': ['lazy capability loading']}
+ 'adds': ['connector config', 'trust workflow', 'MCP tool namespace',
+          'skill-scoped MCP permissions'],
+ 'preserves': ['lazy capability loading', 'harness permission ceiling']}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
 import sys as _wb_sys
@@ -175,6 +177,49 @@ SIMULATED_TOOLS = {
 
 
 # ============================================================
+# Skill-scoped MCP permission contract
+# ============================================================
+
+@dataclass(frozen=True)
+class MCPPermissionGrant:
+    """Reviewed Skill capabilities intersected with connector trust.
+
+    Trust answers whether a connector process may run. This grant separately
+    answers which of its remote tools one active Skill may discover and call.
+    """
+
+    tools: frozenset[str] = frozenset()
+    network: bool = False
+
+    def __post_init__(self):
+        if not isinstance(self.network, bool):
+            raise ValueError("MCP permission network must be true or false")
+        if isinstance(self.tools, (str, bytes)):
+            raise ValueError("MCP permission tools must be a collection of names")
+        normalized = frozenset(self.tools)
+        if any(
+            not isinstance(tool, str) or not tool.startswith("mcp__")
+            for tool in normalized
+        ):
+            raise ValueError("MCP permission tools must use namespaced mcp__ names")
+        object.__setattr__(self, "tools", normalized)
+
+    def allows(self, tool_name: str) -> bool:
+        return self.network and tool_name in self.tools
+
+
+NO_MCP_PERMISSIONS = MCPPermissionGrant()
+DEMO_MCP_PERMISSIONS = MCPPermissionGrant(
+    tools=frozenset(
+        f"mcp__{connector_name}__{tool['name']}"
+        for connector_name, tools in SIMULATED_TOOLS.items()
+        for tool in tools
+    ),
+    network=True,
+)
+
+
+# ============================================================
 # Connector Lifecycle Management
 # ============================================================
 
@@ -248,14 +293,36 @@ class MCPConnector:
 class ConnectorManager:
     """Manages all MCP connectors — parse config, trust, connect, discover."""
 
-    def __init__(self, config: dict):
+    def __init__(
+        self,
+        config: dict,
+        permission_grant: MCPPermissionGrant | None = None,
+    ):
         self.connectors: dict[str, MCPConnector] = {}
         self._deferred_schemas: dict[str, dict] = {}  # tool_name -> full schema
+        self.permission_grant = permission_grant or NO_MCP_PERMISSIONS
 
         # Parse config
         for name, cfg in config.get("mcpServers", {}).items():
             self.connectors[name] = MCPConnector(name=name, config=cfg)
         print(f"\033[90m[MCP] Loaded {len(self.connectors)} connector configs from mcp.json\033[0m")
+
+    def set_permission_grant(self, grant: MCPPermissionGrant) -> None:
+        """Replace reviewed permissions and invalidate previously loaded schemas."""
+        self.permission_grant = grant
+        self._deferred_schemas.clear()
+
+    def _permission_denial(self, tool_name: str) -> dict:
+        reason = (
+            "network access is not declared"
+            if not self.permission_grant.network
+            else "tool is not declared by the active skill"
+        )
+        return {
+            "error": f"Permission denied for '{tool_name}': {reason}.",
+            "code": "permission_denied",
+            "tool": tool_name,
+        }
 
     def list_connectors(self) -> str:
         """Display all connectors and their status."""
@@ -297,10 +364,11 @@ class ConnectorManager:
         for conn in self.connectors.values():
             if conn.status == "connected":
                 for tool in conn.tools:
-                    tools.append({
-                        "name": tool["name"],
-                        "description": tool["description"],
-                    })
+                    if self.permission_grant.allows(tool["name"]):
+                        tools.append({
+                            "name": tool["name"],
+                            "description": tool["description"],
+                        })
         return tools
 
     def tool_search(self, tool_name: str) -> dict | None:
@@ -309,6 +377,9 @@ class ConnectorManager:
         Production harness: agent calls ToolSearch with tool_names list,
         system returns full input_schema for each.
         """
+        if not self.permission_grant.allows(tool_name):
+            return self._permission_denial(tool_name)
+
         for conn in self.connectors.values():
             if conn.status != "connected":
                 continue
@@ -328,6 +399,12 @@ class ConnectorManager:
 
         Production harness: agent calls DeferExecuteTool with validated params.
         """
+        # Re-check permissions at execution time so revocation is fail-closed.
+        if not self.permission_grant.allows(tool_name):
+            return json.dumps(
+                self._permission_denial(tool_name), ensure_ascii=False
+            )
+
         # Verify schema was loaded
         if tool_name not in self._deferred_schemas:
             return f"Error: Tool '{tool_name}' schema not loaded. Call ToolSearch first."
@@ -496,7 +573,9 @@ if __name__ == "__main__":
     print("  q         — Quit")
     print()
 
-    manager = ConnectorManager(MCP_CONFIG)
+    # The interactive tour uses an explicit reviewed grant. Library callers
+    # that omit it receive NO_MCP_PERMISSIONS and therefore fail closed.
+    manager = ConnectorManager(MCP_CONFIG, DEMO_MCP_PERMISSIONS)
     agent = MCPAgent(manager)
 
     print(manager.list_connectors())

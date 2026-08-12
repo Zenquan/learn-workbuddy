@@ -13,11 +13,11 @@
 ```mermaid
 flowchart LR
     A["Tool Output"] --> B["Threshold Check"]
-    B --> C["Disk Writer"]
-    C --> D["Pointer Preview"]
+    B --> C["Immutable Artifact"]
+    C --> D["Context Pointer<br/>summary + preview + path"]
     D --> E["Read Page Fault"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    C --> F["ArtifactReference<br/>digest + provenance"]
+    F -. "later policy" .-> G["Memory Reference<br/>summary + pointer, no body"]
 ```
 
 ## 学习前置知识
@@ -29,6 +29,8 @@ flowchart LR
 ## 本章抓住的 WorkBuddy-style 机制
 
 - 把大输出 swap 到 artifact 文件, prompt 里只留摘要和路径。
+- 为 artifact 生成稳定 source ID、摘要、来源工具、时间与 SHA-256，避免它变成不可审计的匿名文件。
+- Memory 只能接收 `ArtifactMemoryReference`，保留必要摘要与可检索指针，不复制大结果正文。
 - 模拟按需读取片段, 类似缺页中断。
 - 为 s14 的压缩减轻压力。
 
@@ -37,6 +39,8 @@ flowchart LR
 - 把全部工具输出塞回 messages, 很快耗尽窗口。
 - 只保留文件路径不保留摘要, 模型不知道何时读取。
 - 外部化文件不纳入审计, 会影响复盘。
+- 用进程内计数器重新从 `001` 写起，会覆盖旧 artifact，让已经保存的 pointer 指向错误证据。
+- 把 pointer 中的 head/tail 预览原样写进 Memory，本质上仍在复制可能巨大或敏感的工具正文。
 ## 问题
 
 一条 `grep -r "TODO" .` 命令能产生多少输出？
@@ -85,6 +89,16 @@ flowchart LR
 
 把工具的完整输出写到磁盘文件，上下文里只保留一个**指针 + 预览**。这和操作系统的虚拟内存换页是同一个思想——物理内存（上下文窗口）不够时，把数据换到磁盘（`tool-results/*.txt`），内存里只留一个页表条目（指针）。
 
+本章进一步把一份大结果拆成三种生命周期不同的表示：
+
+| 表示 | 包含什么 | 服务对象 | 是否拥有完整正文 |
+|------|----------|----------|------------------|
+| Artifact 文件 | 完整工具输出 | 审计、按需读取、完整恢复 | 是，唯一正文所有者 |
+| Context pointer | source ID、摘要、SHA-256、路径、head/tail 预览 | 当前 Agent turn | 否，只是有界表示 |
+| Memory reference | 必要摘要、路径、digest、来源字段 | 后续 Memory policy | 否，刻意没有 `content` 字段 |
+
+这三个对象不能合并成一个字符串：Prompt 需要短期预览，Memory 需要跨会话检索信息，而 artifact 才负责保存不可丢失的原始证据。Memory reference 也只是候选输入，最终是否长期保留仍由 s10–s12 的作用域与保留策略决定。
+
 | 概念 | 操作系统 | WorkBuddy |
 |------|---------|-----------|
 | 内存 | RAM | 上下文窗口 |
@@ -117,7 +131,7 @@ def should_externalize(self, output: str, tool_name: str) -> bool:
 
 ### 磁盘写入
 
-超过阈值的输出写入会话目录下的 `tool-results/` 文件夹，按序编号：
+超过阈值的输出写入会话目录下的 `tool-results/` 文件夹，按序编号。文件名通过独占创建保留；即使进程重启后计数器回到 0，也会跳过已有文件，绝不覆盖旧证据：
 
 ```
 ~/.workbuddy/projects/<workspace>/<session>/
@@ -129,38 +143,52 @@ def should_externalize(self, output: str, tool_name: str) -> bool:
 ```
 
 ```python
-def write_to_disk(self, output: str, session_dir: Path) -> Path:
-    tool_results_dir = session_dir / "tool-results"
-    tool_results_dir.mkdir(parents=True, exist_ok=True)
-
-    # Find next available number
-    existing = list(tool_results_dir.glob("tool_result_*.txt"))
-    next_num = len(existing) + 1
-
-    file_path = tool_results_dir / f"tool_result_{next_num:03d}.txt"
-    file_path.write_text(output, encoding="utf-8")
-    return file_path
+def _next_artifact_path(self) -> Path:
+    while True:
+        self._counter += 1
+        path = self.tool_results_dir / f"tool_result_{self._counter:03d}.txt"
+        try:
+            path.touch(mode=0o600, exist_ok=False)  # 旧证据不能被覆盖
+        except FileExistsError:
+            continue
+        return path
 ```
 
 ### 上下文替换 (pointer + preview)
 
-外部化后，上下文中的 `tool_result` 内容被替换为截断版本 + 文件路径：
+外部化后，上下文中的 `tool_result` 内容被替换为来源头 + 截断预览。来源头让 Agent 和审计逻辑知道“这是谁产生的、正文在哪里、内容是否仍一致”：
 
 ```python
-def make_pointer(self, output: str, file_path: Path) -> str:
+def make_pointer(self, output: str, artifact: ArtifactReference) -> str:
     head = output[:6 * 1024]       # First 6KB
     tail = output[-24 * 1024:]     # Last 24KB
-    size = len(output.encode("utf-8"))
 
     return (
+        f"[Artifact: {artifact.source.source_id}]\n"
+        f"Summary: {artifact.summary}\n"
+        f"Source: {artifact.source_tool}; SHA-256: {artifact.content_sha256}\n"
+        f"Full output: {artifact.path}\n\n"
         f"{head}\n"
-        f"\n... [{size - 30000} characters omitted, "
-        f"full output at: {file_path}] ...\n"
+        f"\n... [full output at: {artifact.path}] ...\n"
         f"\n{tail}"
     )
 ```
 
-Agent 看到的是：开头 6KB 预览 + 省略提示 + 末尾 24KB 预览 + 磁盘路径。它知道完整输出在哪，需要时可以用 Read 工具取回。
+Agent 看到的是：来源字段 + 有界摘要 + 开头 6KB 预览 + 省略提示 + 末尾 24KB 预览 + 磁盘路径。它知道完整输出在哪，需要时可以用 Read 工具取回。摘要默认由首个非空行和输出规模确定性生成，因此离线 demo 不依赖 API key；生产实现可以替换成任务感知摘要，但仍必须限制长度。
+
+### Artifact → Memory 只传瘦引用
+
+`ArtifactReference.for_memory()` 明确切断正文复制路径：
+
+```python
+memory_reference = result.artifact.for_memory()
+
+# 只有 summary、artifact_path、content_sha256、source_tool 和 source。
+# 没有 content，也没有 context pointer 中的 head/tail 预览。
+payload = memory_reference.to_dict()
+```
+
+`source` 与 s09、s12 使用同一组核心字段：`source_id`、`source_type`、`title`、`captured_at`。其中 `source_id` 组合 session、artifact 文件名和内容摘要前缀；`content_sha256` 用于发现文件被替换或损坏。这里没有直接写入 Memory，因为 artifact 是否值得跨会话保留，仍需后续 policy 判断。
 
 ### 按需读取 (Read = 缺页中断)
 
@@ -181,9 +209,13 @@ Agent 上下文                           磁盘
 ```
 
 ```python
-def read_from_disk(self, file_path: Path, offset: int = 0, limit: int = 2000) -> str:
-    """Page fault handler — bring data back from disk on demand."""
-    content = file_path.read_text(encoding="utf-8")
+def read_artifact(self, artifact: ArtifactReference, offset: int = 0, limit: int = 2000) -> str:
+    """Read owned evidence on demand and verify its digest first."""
+    owned_path = self._owned_path(artifact.path)
+    encoded = owned_path.read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != artifact.content_sha256:
+        raise ArtifactIntegrityError("artifact digest mismatch")
+    content = encoded.decode("utf-8")
     lines = content.split("\n")
     selected = lines[offset:offset + limit]
     return "\n".join(selected)
@@ -361,20 +393,26 @@ if (resultSize > CODEBUDDY_TOOL_RESULT_THRESHOLD_KB * 1024) {
 
 1. **`ToolResultExternalizer`** — 核心类
    - `should_externalize(output, tool_name)` — 判断是否需要外部化（Bash: 30000 chars, 其他: 50KB）
-   - `write_to_disk(output, session_dir)` — 写入 `tool-results/tool_result_NNN.txt`
-   - `make_pointer(output, file_path)` — 生成 head 6KB + tail 24KB + 路径指针
-   - `read_from_disk(file_path, offset, limit)` — 缺页中断处理：从磁盘按需读取
+   - `write_to_disk(output)` — 独占创建并 fsync `tool-results/tool_result_NNN.txt`，不覆盖旧证据
+   - `summarize(output, tool_name)` — 无 key 生成有界、确定性的必要摘要
+   - `make_pointer(output, artifact)` — 生成 provenance + head 6KB + tail 24KB + 路径指针
+   - `read_artifact(artifact, offset, limit)` — 校验目录归属与 SHA-256 后，从磁盘按需读取
 
-2. **`MockLLM`** — 模拟 LLM 的行为
+2. **`ArtifactReference` / `ArtifactMemoryReference`** — 引用契约
+   - `ArtifactReference` 记录路径、summary、来源工具、稳定 source、大小和 SHA-256，不持有正文
+   - `for_memory()` 进一步生成瘦引用；没有 `content` 字段，也不复制 pointer 中的预览
+   - 读取路径被限制在当前 session 的 `tool-results/` 下，pointer 不能变成任意文件读取入口
+
+3. **`MockLLM`** — 模拟 LLM 的行为
    - 按预设脚本生成工具调用
    - 看到外部化指针时，决定是否触发"缺页中断"（调 Read 读完整输出）
 
-3. **Agent 循环** — 集成外部化
+4. **Agent 循环** — 集成外部化
    - 工具执行后检查是否需要外部化
-   - 需要则写磁盘 + 替换上下文内容
+   - 需要则写 artifact + 生成结构化 reference + 替换上下文内容
    - 打印 `[externalize]` 日志，显示节省效果
 
-4. **Demo 场景** — 完整演示
+5. **Demo 场景** — 完整演示
    - 模拟一条产生 1.3MB 输出的 grep 命令
    - 展示外部化前后的上下文大小对比
    - 模拟 agent 需要完整输出时的缺页中断
@@ -404,7 +442,7 @@ python s13_output_externalization/code.py
 ## 练习
 
 1. 当前 `make_pointer` 保留 head 6KB + tail 24KB。如果 agent 最常需要的是输出的中间部分（比如第 40000 行的错误），怎么改进预览策略？提示：考虑基于正则匹配的关键行提取，或分块索引。
-2. 给 `ToolResultExternalizer` 加一个清理机制：会话结束时删除 `tool-results/` 目录。但如果 agent 在新会话中需要引用旧会话的外部化输出呢？思考：跨会话的外部化文件应该怎么管理？
+2. 给 `ToolResultExternalizer` 加一个清理机制：会话结束时删除未被引用的 `tool-results/` 文件。但如果 Memory 仍持有某个 `ArtifactMemoryReference`，清理器应如何用 source ID、TTL 和引用计数避免产生悬空指针？
 3. 当前的 `should_externalize` 只看输出大小。如果一条命令的输出是 30KB 的随机字符串（对 agent 无用）vs 30KB 的结构化 JSON（每行都有用），应该用不同策略吗？思考：能否让外部化策略感知输出的信息密度？
 
 ---

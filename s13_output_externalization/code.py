@@ -28,14 +28,26 @@ Usage:
     python s13_output_externalization/code.py
 """
 
-
+import argparse
+import hashlib
+import os
+import tempfile
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 # Machine-readable learning path metadata. Tests enforce that every
 # chapter declares what it inherits and what it adds.
-PROGRESSION = {'chapter': 's13_output_externalization',
- 'builds_on': ['s12_cloud_memory'],
- 'adds': ['large output threshold', 'tool-results swap files', 'page-fault reads'],
- 'preserves': ['context budget mindset']}
+PROGRESSION = {
+    "chapter": "s13_output_externalization",
+    "builds_on": ["s12_cloud_memory"],
+    "adds": [
+        "large output threshold",
+        "source-bearing artifact references",
+        "page-fault reads",
+    ],
+    "preserves": ["context budget mindset", "memory as a selective derived view"],
+}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
 import sys as _wb_sys
@@ -45,9 +57,6 @@ if str(_WB_ROOT) not in _wb_sys.path:
     _wb_sys.path.insert(0, str(_WB_ROOT))
 from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_chapter_demo
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
-import tempfile
-import argparse
-from pathlib import Path
 
 
 # ======================================================================
@@ -58,6 +67,82 @@ BASH_MAX_OUTPUT_LENGTH = 30_000          # chars — Bash output threshold
 TOOL_RESULT_THRESHOLD_KB = 50            # KB — non-Bash tool threshold
 HEAD_BYTES = 6 * 1024                    # 6KB head in pointer
 TAIL_BYTES = 24 * 1024                   # 24KB tail in pointer
+SUMMARY_MAX_CHARS = 240                  # bounded text suitable for later retrieval
+ARTIFACT_SOURCE_TYPE = "artifact"
+
+
+class ArtifactAccessError(ValueError):
+    """An artifact read escaped the externalizer-owned tool-results directory."""
+
+
+class ArtifactIntegrityError(RuntimeError):
+    """Persisted artifact bytes no longer match the reference digest."""
+
+
+@dataclass(frozen=True)
+class ArtifactSource:
+    """Stable provenance shared with the source contract in s09 and s12."""
+
+    source_id: str
+    source_type: str
+    title: str
+    captured_at: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ArtifactMemoryReference:
+    """The only artifact-shaped value that may cross into a Memory policy.
+
+    This value intentionally has no ``content`` field. The large body remains
+    owned by the artifact file; Memory receives a bounded summary, a resolvable
+    pointer, integrity metadata, and provenance for later retrieval.
+    """
+
+    summary: str
+    artifact_path: str
+    content_sha256: str
+    source_tool: str
+    source: ArtifactSource
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["source"] = self.source.to_dict()
+        return payload
+
+
+@dataclass(frozen=True)
+class ArtifactReference:
+    """Metadata for one immutable tool-result artifact, never its raw body."""
+
+    path: Path
+    summary: str
+    source_tool: str
+    source: ArtifactSource
+    byte_size: int
+    character_count: int
+    content_sha256: str
+
+    def for_memory(self) -> ArtifactMemoryReference:
+        """Return a compact reference; do not duplicate the artifact content."""
+
+        return ArtifactMemoryReference(
+            summary=self.summary,
+            artifact_path=str(self.path),
+            content_sha256=self.content_sha256,
+            source_tool=self.source_tool,
+            source=self.source,
+        )
+
+
+@dataclass(frozen=True)
+class ExternalizedToolResult:
+    """Context-safe pointer text plus the artifact metadata that produced it."""
+
+    context_text: str
+    artifact: ArtifactReference
 
 
 # ======================================================================
@@ -95,9 +180,13 @@ class ToolResultExternalizer:
 
     This is the virtual memory swap manager:
     - should_externalize() = check if data exceeds RAM limit
-    - write_to_disk()      = swap data to disk
-    - make_pointer()       = create page table entry (pointer + preview)
+    - write_to_disk()      = persist immutable artifact evidence
+    - make_pointer()       = create a page table entry with provenance
     - read_from_disk()     = page fault handler (bring data back on demand)
+
+    The artifact body, context pointer, and Memory reference are deliberately
+    separate representations. Keeping one raw string for all three would either
+    flood the prompt or silently copy large/sensitive tool output into Memory.
     """
 
     def __init__(self, session_dir: Path):
@@ -105,7 +194,7 @@ class ToolResultExternalizer:
         self.tool_results_dir = session_dir / "tool-results"
         self.tool_results_dir.mkdir(parents=True, exist_ok=True)
         self._counter = 0
-        self.externalized: list[dict] = []  # Track all externalized outputs
+        self.externalized: list[ExternalizedToolResult] = []
 
     def should_externalize(self, output: str, tool_name: str) -> bool:
         """Check if output exceeds the externalization threshold.
@@ -115,21 +204,101 @@ class ToolResultExternalizer:
         """
         if tool_name == "bash":
             return len(output) > BASH_MAX_OUTPUT_LENGTH
-        else:
-            return len(output.encode("utf-8")) > TOOL_RESULT_THRESHOLD_KB * 1024
+        return len(output.encode("utf-8")) > TOOL_RESULT_THRESHOLD_KB * 1024
+
+    def _next_artifact_path(self) -> Path:
+        """Reserve a new name without overwriting evidence from an earlier run.
+
+        A process-local counter alone is unsafe: recreating the externalizer for
+        the same session would start again at 001 and invalidate old pointers.
+        Exclusive creation turns the filename choice into the persistence gate.
+        """
+
+        while True:
+            self._counter += 1
+            candidate = self.tool_results_dir / f"tool_result_{self._counter:03d}.txt"
+            try:
+                candidate.touch(mode=0o600, exist_ok=False)
+            except FileExistsError:
+                continue
+            return candidate
 
     def write_to_disk(self, output: str) -> Path:
-        """Write full output to disk, return the file path.
+        """Durably write full output once and return the reserved file path.
 
         Files are named: tool_result_001.txt, tool_result_002.txt, ...
         """
-        self._counter += 1
-        file_path = self.tool_results_dir / f"tool_result_{self._counter:03d}.txt"
-        file_path.write_text(output, encoding="utf-8")
+        file_path = self._next_artifact_path()
+        with file_path.open("w", encoding="utf-8") as handle:
+            handle.write(output)
+            handle.flush()
+            os.fsync(handle.fileno())
         return file_path
 
-    def make_pointer(self, output: str, file_path: Path, tool_name: str = "bash") -> str:
-        """Create a truncated pointer: head 6KB + tail 24KB + file path.
+    @staticmethod
+    def summarize(output: str, tool_name: str) -> str:
+        """Build a deterministic offline summary without retaining the body.
+
+        Production systems may replace this with a task-aware summarizer. The
+        teaching version keeps the first meaningful line and basic shape so the
+        demo stays keyless, bounded, and honest about what was actually observed.
+        """
+
+        first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+        first_line = " ".join(first_line.split())
+        if len(first_line) > SUMMARY_MAX_CHARS:
+            first_line = first_line[: SUMMARY_MAX_CHARS - 1] + "…"
+        line_count = output.count("\n") + (1 if output else 0)
+        prefix = f"{tool_name} output: {line_count} line(s), {len(output)} characters"
+        return f"{prefix}; starts with: {first_line}" if first_line else prefix
+
+    @staticmethod
+    def _normalize_summary(summary: str) -> str:
+        normalized = " ".join(summary.split())
+        if not normalized:
+            raise ValueError("artifact summary must not be empty")
+        if len(normalized) > SUMMARY_MAX_CHARS:
+            raise ValueError(f"artifact summary exceeds {SUMMARY_MAX_CHARS} characters")
+        return normalized
+
+    def _artifact_reference(
+        self,
+        *,
+        output: str,
+        file_path: Path,
+        tool_name: str,
+        summary: str | None,
+    ) -> ArtifactReference:
+        """Describe persisted evidence with a stable ID and integrity digest."""
+
+        normalized_summary = self._normalize_summary(
+            summary if summary is not None else self.summarize(output, tool_name)
+        )
+
+        encoded = output.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        captured_at = datetime.now(timezone.utc).isoformat()
+        artifact_id = (
+            f"artifact:{self.session_dir.name}:{file_path.name}:{digest[:12]}"
+        )
+        source = ArtifactSource(
+            source_id=artifact_id,
+            source_type=ARTIFACT_SOURCE_TYPE,
+            title=f"{tool_name} output {file_path.name}",
+            captured_at=captured_at,
+        )
+        return ArtifactReference(
+            path=file_path,
+            summary=normalized_summary,
+            source_tool=tool_name,
+            source=source,
+            byte_size=len(encoded),
+            character_count=len(output),
+            content_sha256=digest,
+        )
+
+    def make_pointer(self, output: str, artifact: ArtifactReference) -> str:
+        """Create a bounded context pointer without changing evidence ownership.
 
         Bash tools:    head 6KB + tail 24KB (key info at both ends)
         Other tools:   2KB preview + file path (placeholder strategy)
@@ -140,24 +309,56 @@ class ToolResultExternalizer:
         - middle: usually repetitive data (logs), safe to omit
         """
         size = len(output)
+        header = (
+            f"[Artifact: {artifact.source.source_id}]\n"
+            f"Summary: {artifact.summary}\n"
+            f"Source: {artifact.source_tool}; SHA-256: {artifact.content_sha256}\n"
+            f"Full output: {artifact.path}\n"
+        )
 
-        if tool_name == "bash":
+        if artifact.source_tool == "bash":
             head = output[:HEAD_BYTES]
             tail = output[-TAIL_BYTES:]
-            omitted = size - HEAD_BYTES - TAIL_BYTES
+            omitted = max(size - HEAD_BYTES - TAIL_BYTES, 0)
             return (
-                f"{head}\n"
+                f"{header}\n{head}\n"
                 f"\n... [{omitted} characters omitted, "
-                f"full output at: {file_path}] ...\n"
+                f"full output at: {artifact.path}] ...\n"
                 f"\n{tail}"
             )
-        else:
-            preview = output[:2048]
-            return (
-                f"[Output externalized to: {file_path}]\n"
-                f"Preview ({len(preview)} chars):\n{preview}\n"
-                f"Use Read tool to access full content."
-            )
+        preview = output[:2048]
+        return (
+            f"{header}\n"
+            f"Preview ({len(preview)} chars):\n{preview}\n"
+            "Use Read tool to access full content."
+        )
+
+    def _owned_path(self, file_path: Path) -> Path:
+        """Resolve only files beneath this session's artifact directory."""
+
+        owned_root = self.tool_results_dir.resolve()
+        candidate = file_path.resolve()
+        if candidate.parent != owned_root:
+            raise ArtifactAccessError(f"artifact is outside {owned_root}")
+        return candidate
+
+    @staticmethod
+    def _render_line_range(
+        content: str,
+        *,
+        file_name: str,
+        offset: int,
+        limit: int,
+    ) -> str:
+        """Render a bounded line window after ownership/integrity checks."""
+
+        if offset < 0 or limit <= 0:
+            raise ValueError("offset must be non-negative and limit must be positive")
+        lines = content.split("\n")
+        end = min(offset + limit, len(lines))
+        selected = lines[offset:end]
+        header = f"[reading {file_name}, lines {offset+1}-{end} of {len(lines)}]\n"
+        return header + "\n".join(selected)
 
     def read_from_disk(self, file_path: Path, offset: int = 0, limit: int = 2000) -> str:
         """Page fault handler — bring data back from disk on demand.
@@ -165,23 +366,67 @@ class ToolResultExternalizer:
         Agent calls this when it needs the full output that was externalized.
         Returns a specific line range to avoid re-flooding the context.
         """
-        content = file_path.read_text(encoding="utf-8")
-        lines = content.split("\n")
-        end = min(offset + limit, len(lines))
-        selected = lines[offset:end]
+        if offset < 0 or limit <= 0:
+            raise ValueError("offset must be non-negative and limit must be positive")
+        owned_path = self._owned_path(file_path)
+        content = owned_path.read_text(encoding="utf-8")
+        return self._render_line_range(
+            content,
+            file_name=owned_path.name,
+            offset=offset,
+            limit=limit,
+        )
 
-        header = f"[reading {file_path.name}, lines {offset+1}-{end} of {len(lines)}]\n"
-        return header + "\n".join(selected)
+    def read_artifact(
+        self,
+        artifact: ArtifactReference,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> str:
+        """Read through a reference and fail closed if evidence was replaced."""
 
-    def externalize(self, output: str, tool_name: str) -> str:
-        """Full externalization pipeline: write + make pointer.
+        if offset < 0 or limit <= 0:
+            raise ValueError("offset must be non-negative and limit must be positive")
+        owned_path = self._owned_path(artifact.path)
+        encoded = owned_path.read_bytes()
+        actual_digest = hashlib.sha256(encoded).hexdigest()
+        if actual_digest != artifact.content_sha256:
+            raise ArtifactIntegrityError(
+                f"artifact digest mismatch for {artifact.source.source_id}"
+            )
+        content = encoded.decode("utf-8")
+        return self._render_line_range(
+            content,
+            file_name=owned_path.name,
+            offset=offset,
+            limit=limit,
+        )
 
-        Returns the pointer string to put in context.
+    def externalize(
+        self,
+        output: str,
+        tool_name: str,
+        *,
+        summary: str | None = None,
+    ) -> ExternalizedToolResult:
+        """Persist evidence and return its context-safe representation.
+
+        The returned metadata is sufficient for a later Memory policy to keep a
+        searchable reference, but never carries the raw output body itself.
         """
+        normalized_summary = self._normalize_summary(
+            summary if summary is not None else self.summarize(output, tool_name)
+        )
         file_path = self.write_to_disk(output)
-        pointer = self.make_pointer(output, file_path, tool_name)
+        artifact = self._artifact_reference(
+            output=output,
+            file_path=file_path,
+            tool_name=tool_name,
+            summary=normalized_summary,
+        )
+        pointer = self.make_pointer(output, artifact)
 
-        original_kb = len(output.encode("utf-8")) / 1024
+        original_kb = artifact.byte_size / 1024
         pointer_kb = len(pointer.encode("utf-8")) / 1024
         saved_pct = (1 - len(pointer) / len(output)) * 100 if output else 0
 
@@ -189,13 +434,9 @@ class ToolResultExternalizer:
               f"{original_kb:.1f}KB → {pointer_kb:.1f}KB in context "
               f"(saved {saved_pct:.1f}%)\033[0m")
 
-        self.externalized.append({
-            "file": file_path,
-            "original_size": len(output),
-            "pointer_size": len(pointer),
-        })
-
-        return pointer
+        result = ExternalizedToolResult(context_text=pointer, artifact=artifact)
+        self.externalized.append(result)
+        return result
 
 
 # ======================================================================
@@ -333,15 +574,17 @@ def agent_loop(
 
             # Page fault: read from externalized disk file
             if tool_name == "read":
-                file_path = externalizer.tool_results_dir / "tool_result_001.txt"
+                if not externalizer.externalized:
+                    raise ArtifactAccessError("no externalized artifact is available to read")
+                artifact = externalizer.externalized[-1].artifact
                 offset = tool_input.get("offset", 0)
                 limit = tool_input.get("limit", 2000)
 
                 print(f"\033[33m[page-fault] agent requested full output, "
-                      f"reading {file_path.name} from disk "
+                      f"reading {artifact.path.name} from disk "
                       f"(lines {offset+1}-{offset+limit})\033[0m")
 
-                output = externalizer.read_from_disk(file_path, offset, limit)
+                output = externalizer.read_artifact(artifact, offset, limit)
 
                 # Tool result goes into context
                 messages.append({"role": "assistant", "content": [
@@ -361,8 +604,8 @@ def agent_loop(
 
             # --- The key step: check if externalization is needed ---
             if externalizer.should_externalize(raw_output, tool_name):
-                pointer = externalizer.externalize(raw_output, tool_name)
-                tool_result_content = pointer
+                externalized = externalizer.externalize(raw_output, tool_name)
+                tool_result_content = externalized.context_text
             else:
                 tool_result_content = raw_output
 
@@ -398,27 +641,35 @@ def interactive():
             return
         if line == "small":
             output = mock_grep_small()
-            print(output if not externalizer.should_externalize(output, "bash") else externalizer.externalize(output, "bash"))
+            if externalizer.should_externalize(output, "bash"):
+                print(externalizer.externalize(output, "bash").context_text)
+            else:
+                print(output)
             continue
         if line == "large":
             output = mock_grep_large()
-            last_pointer = externalizer.externalize(output, "bash")
+            last_pointer = externalizer.externalize(output, "bash").context_text
             print(last_pointer[:600] + "\n...[pointer truncated in console]...")
             continue
         if line.startswith("read "):
             parts = line.split()
             offset = int(parts[1]) if len(parts) > 1 else 0
             limit = int(parts[2]) if len(parts) > 2 else 20
-            path = externalizer.tool_results_dir / "tool_result_001.txt"
-            if not path.exists():
+            if not externalizer.externalized:
                 print("No externalized file yet. Run: large")
                 continue
-            print(externalizer.read_from_disk(path, offset=offset, limit=limit))
+            artifact = externalizer.externalized[-1].artifact
+            print(externalizer.read_artifact(artifact, offset=offset, limit=limit))
             continue
         if line == "summary":
             print(f"Externalized files: {len(externalizer.externalized)}")
-            for entry in externalizer.externalized:
-                print(f"  - {entry['file']} ({entry['original_size']} chars -> {entry['pointer_size']} chars)")
+            for result in externalizer.externalized:
+                artifact = result.artifact
+                print(
+                    f"  - {artifact.path} "
+                    f"({artifact.character_count} chars -> "
+                    f"{len(result.context_text)} pointer chars)"
+                )
             if last_pointer:
                 print(f"Last pointer size: {len(last_pointer)} chars")
             continue
@@ -459,20 +710,26 @@ def main():
     print("Externalization Summary")
     print("=" * 65)
 
-    for entry in externalizer.externalized:
-        original_kb = entry["original_size"] / 1024
-        pointer_kb = entry["pointer_size"] / 1024
-        saved_pct = (1 - entry["pointer_size"] / entry["original_size"]) * 100
-        print(f"  {entry['file'].name}: "
+    for result in externalizer.externalized:
+        artifact = result.artifact
+        original_kb = artifact.byte_size / 1024
+        pointer_kb = len(result.context_text.encode("utf-8")) / 1024
+        saved_pct = (1 - len(result.context_text) / artifact.character_count) * 100
+        print(f"  {artifact.path.name}: "
               f"{original_kb:.1f}KB → {pointer_kb:.1f}KB "
               f"(saved {saved_pct:.1f}%)")
+        print(f"    source: {artifact.source.source_id}")
+        print(f"    summary: {artifact.summary}")
 
     final_tokens = estimate_messages_tokens(messages)
     print(f"\n  Final context size: {final_tokens:,} tokens (~{final_tokens*4:,} chars)")
 
     if externalizer.externalized:
-        worst = max(externalizer.externalized, key=lambda e: e["original_size"])
-        print(f"  Without externalization: ~{worst['original_size']//4:,} tokens "
+        worst = max(
+            externalizer.externalized,
+            key=lambda result: result.artifact.character_count,
+        )
+        print(f"  Without externalization: ~{worst.artifact.character_count//4:,} tokens "
               f"for that one tool call alone")
 
     # Show the pointer that's in the context

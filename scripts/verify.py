@@ -202,6 +202,15 @@ def run_offline_demos() -> None:
             env=env,
             timeout=30,
         )
+        run(
+            [
+                sys.executable,
+                "examples/retrieval_routing_eval/code.py",
+                "--output-dir",
+                str(Path(tmp) / "retrieval-routing-eval"),
+            ],
+            timeout=30,
+        )
         required = [
             "tool directory:",
             "permission denial:",

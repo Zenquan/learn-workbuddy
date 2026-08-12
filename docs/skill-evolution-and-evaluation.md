@@ -77,6 +77,10 @@ s16 的 `audit_skill()` 保留 `rm -rf /`、`sudo`、`pip install` 这类直白�
    人工审批后的版本化发布。
 4. **评测意识**：README 里引用上面 6 类基准，说明本项目技能子系统对标的是
    哪几维（Utility + Retrieval/Routing + Safety），比空泛说"好用"有说服力。
+   保持 24 章不变的离线基线已经落在
+   [`examples/retrieval_routing_eval/`](../examples/retrieval_routing_eval/)：统一评价
+   Skill、Memory、Reflection 的 Recall@K、MRR、拒答、作用域泄漏、权限泄漏与
+   Prompt 预算，并把生命周期、权限和 prompt override 过滤放在相关性算分之前。
 
 保持 24 章主线不变的可运行版本见
 [`examples/self_evolving_skills/`](../examples/self_evolving_skills/)：它把成功 JSONL
@@ -94,6 +98,15 @@ s16 的 `audit_skill()` 保留 `rm -rf /`、`sudo`、`pip install` 这类直白�
 ```text
 成功轨迹 + held-out 回放 -> 可执行 Skill 候选
 重复失败 + 成功恢复       -> 非执行 Reflection 候选
+```
+
+这两个学习通道产生候选后，还要经过独立的检索路由考试：
+
+```text
+active + approved + scope/permission safe
+  -> explainable rank
+  -> top-k / prompt budget
+  -> retrieval and safety metrics
 ```
 
 ## 来源

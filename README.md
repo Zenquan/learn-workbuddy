@@ -266,6 +266,8 @@ MINI_WORKBUDDY_HOME=.tmp/mini python3 examples/mini_workbuddy_demo/code.py --mod
 python3 examples/self_evolving_skills/code.py --approve
 # 重复失败 + 成功恢复 -> 评测 -> 人工批准 -> Reflection Memory（完全离线）：
 python3 examples/reflection_memory/code.py --approve
+# Skill / Memory / Reflection 检索路由评测（完全离线）：
+python3 examples/retrieval_routing_eval/code.py
 # 一次跑遍所有 harness 层（provider/session/记忆/权限/外部化/JSONL/HTTP/审计），产出 artifacts：
 python3 examples/full_tour/code.py
 python3 scripts/verify.py

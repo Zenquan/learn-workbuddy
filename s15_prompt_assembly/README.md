@@ -14,8 +14,10 @@
 flowchart LR
     A["Base Rules"] --> B["Memory Blocks"]
     B --> C["Skills/Tools"]
-    C --> D["Prompt Builder"]
-    D --> E["System Prompt"]
+    C --> D["Budget Planner"]
+    D --> E["Required First"]
+    E --> F["Value Selection"]
+    F --> G["System Prompt + Decisions"]
     C -. "state" .-> S["runtime state"]
     S -. "recover" .-> C
 ```
@@ -51,18 +53,18 @@ WorkBuddy 的系统提示可能有 100KB+。它包含：基础指令、身份文
 
 系统提示不是一个字符串，而是一组**片段（segments）**的有序拼接：
 
-| # | 片段 | 来源 | 条件 |
-|---|------|------|------|
-| 1 | 基础指令 | 硬编码 | 始终包含 |
-| 2 | 身份注入 | persona/core.md / persona/identity.md / persona/user.md | 文件存在时 |
-| 3 | 云端记忆 | `<memory>` 块 (s12) | Profile 非空时 |
-| 4 | 项目上下文 | 文件结构、工作目录 | 始终包含 |
-| 5 | 工具描述 | 从注册工具动态生成 | 有工具时 |
-| 6 | 专家指令 | 激活的专家包 | 专家激活时 |
-| 7 | 技能指令 | 已加载技能的 SKILL.md | 技能加载时 |
-| 8 | 连接器状态 | 可用 MCP 连接器 | 有连接器时 |
-| 9 | 区域约定 | 股市颜色、货币符号 | 按区域 |
-| 10 | 工作模式 | craft / plan / ask | 按模式 |
+| # | 片段 | 来源 | 条件 | 预算策略 |
+|---|------|------|------|----------|
+| 1 | 基础指令 | Harness 基础规则 | 始终包含 | required，不允许删除 |
+| 2 | 身份注入 | 用户 persona | 文件存在时 | 可选，高价值 |
+| 3 | 云端记忆 | `<memory>` 块 (s12) | Profile 非空时 | 可选，中等价值，整块取舍 |
+| 4 | 项目上下文 | 工作区文件结构 | 始终构建 | 可选，高价值 |
+| 5 | 工具描述 | Harness 工具注册表 | 有工具时 | required，防止模型臆造工具 |
+| 6 | 专家指令 | 当前激活专家 | 专家激活时 | 可选，高价值 |
+| 7 | 技能指令 | 已加载 SKILL.md | 技能加载时 | 可选，高价值 |
+| 8 | 连接器状态 | 运行时连接器 | 有连接器时 | 可选，较低价值 |
+| 9 | 区域约定 | 当前区域配置 | 按区域 | 可选，低价值 |
+| 10 | 工作模式 | Harness 当前模式 | 始终包含 | required，不允许删除 |
 
 ```
 运行时组装:
@@ -94,6 +96,31 @@ WorkBuddy 的系统提示可能有 100KB+。它包含：基础指令、身份文
 
 ## 工作原理
 
+### 两种顺序不能混为一谈
+
+`priority` 决定最终 Prompt 中片段的展示顺序，`budget_priority` 决定预算不足时谁先获得空间。两者刻意分开：工作模式可以放在 Prompt 最后，但仍然是不可删除的 required 片段；项目上下文可以排在 Memory 后面，却比区域格式更值得保留。
+
+规划器分两阶段执行：
+
+```text
+构建片段并记录 provenance
+  → 先预留 required 片段
+  → required 已超预算则 fail-closed
+  → 可选片段按 budget_priority 从高到低尝试放入
+  → 已选片段按 priority 排序并拼接
+  → 返回 Prompt + included/dropped/inactive 决策
+```
+
+本章使用字符数作为确定性的离线预算单位。它不是声称所有模型都采用同一种 tokenizer；生产适配器可以把长度函数替换为目标模型的 tokenizer，但 required、价值选择、provenance 和决策报告契约不变。
+
+教学 CLI 默认预算是 12,000 字符，也可以通过环境变量收紧后观察决策：
+
+```bash
+PROMPT_BUDGET_CHARS=2000 python s15_prompt_assembly/code.py
+```
+
+如果 required 片段本身已经超过预算，组装会抛出 `PromptBudgetError`，而不是删除安全规则后继续调用模型。
+
 ### 片段定义
 
 每个片段是一个函数，返回字符串（或 None 表示不包含）：
@@ -101,10 +128,16 @@ WorkBuddy 的系统提示可能有 100KB+。它包含：基础指令、身份文
 ```python
 class PromptSegment:
     """系统提示的一个片段。"""
-    def __init__(self, name: str, builder, condition=None):
+    def __init__(self, name: str, builder, condition=None,
+                 priority=50, required=False,
+                 budget_priority=50, provenance="runtime"):
         self.name = name        # 片段名 (用于调试)
         self.builder = builder  # 构建函数 -> str | None
         self.condition = condition or (lambda: True)
+        self.priority = priority              # Prompt 展示顺序
+        self.required = required              # 预算不能删除
+        self.budget_priority = budget_priority # 预算保留价值
+        self.provenance = provenance          # 来源标签
 
     def build(self) -> str | None:
         if not self.condition():
@@ -174,32 +207,20 @@ def build_skill_instructions() -> str | None:
     return "\n\n".join(parts)
 ```
 
-### 拼接
+### 预算规划与拼接
 
 ```python
-def assemble_system_prompt() -> str:
-    """运行时组装系统提示。"""
-    segments = [
-        PromptSegment("base", build_base_instructions),
-        PromptSegment("identity", build_identity),
-        PromptSegment("memory", build_cloud_memory),
-        PromptSegment("project", build_project_context),
-        PromptSegment("tools", build_tool_descriptions),
-        PromptSegment("expert", build_expert_instructions,
-                      condition=lambda: active_expert is not None),
-        PromptSegment("skills", build_skill_instructions,
-                      condition=lambda: len(loaded_skills) > 0),
-        PromptSegment("mode", build_work_mode),
-    ]
+plan = plan_prompt(segments, budget_chars=12_000)
+system_prompt = plan.prompt
 
-    parts = []
-    for seg in segments:
-        content = seg.build()
-        if content:
-            parts.append(content)
-
-    return "\n\n---\n\n".join(parts)
+print(plan.included_names)
+print(plan.dropped_names)
+for decision in plan.decisions:
+    print(decision.name, decision.status,
+          decision.provenance, decision.reason)
 ```
+
+规划器把片段当成原子的信任与来源边界。预算不足时会完整舍弃一个可选 Memory 或 Skill，而不是把它从中间切断；如果某类内容支持安全压缩，应由它自己的 builder 先生成紧凑投影，再交给规划器选择。
 
 ### 重新组装的时机
 
@@ -311,11 +332,12 @@ eventBus.on('identity:changed', () => reassemble());
 
 `code.py` 演示了系统提示的分段组装：
 
-1. **`PromptSegment` 类** — 每个片段有名字、构建函数、条件函数
+1. **`PromptSegment` 类** — 每个片段有名字、构建条件、展示顺序、预算价值、required 标志和 provenance
 2. **10 个片段构建器** — 模拟 WorkBuddy 的全部片段类型
-3. **`assemble_system_prompt()`** — 遍历片段，条件检查，拼接
-4. **重新组装触发** — 演示加载技能、切换专家、切换模式时重新组装
-5. **agent 循环** — 使用组装好的系统提示，支持运行时重新组装
+3. **`plan_prompt()`** — 先保 required，再按价值选择可选片段，并计算分隔符成本
+4. **`PromptPlan` / `SegmentDecision`** — 输出 Prompt 以及可解释的纳入、舍弃与 inactive 决策
+5. **重新组装触发** — 演示加载技能、切换专家、切换模式时重新规划
+6. **agent 循环** — 使用预算内的系统提示，支持运行时重新组装
 
 运行后可以输入 `prompt` 查看当前系统提示的结构，输入 `skill` 模拟加载技能（触发重新组装），输入 `expert` 模拟切换专家。
 
@@ -332,8 +354,8 @@ python s15_prompt_assembly/code.py
 ## 练习
 
 1. 加一个 `build_codebuddy_md()` 片段——读取工作目录下的 `CODEBUDDY.md` 文件，如果存在就注入项目级指令。思考：这个片段和身份注入有什么区别？
-2. 实现片段优先级——某些片段（如基础指令）必须在最前面，某些（如工作模式）必须在最后面。给 `PromptSegment` 加一个 `priority` 字段。
-3. 系统提示可能很大。实现一个 token 预算机制——如果总长度超过预算，优先截断低优先级片段。思考：哪些片段绝对不能截断？
+2. 为目标模型接入 tokenizer，把字符预算替换为 token 预算，并证明预算决策顺序不随长度实现改变。
+3. 为某个可选片段实现安全的紧凑 builder；比较“先压缩再选择”与“直接舍弃”的上下文质量和来源完整性。
 
 ---
 

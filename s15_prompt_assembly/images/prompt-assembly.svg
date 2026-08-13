@@ -72,8 +72,8 @@
 
   <!-- Funnel -->
   <polygon points="50,230 750,230 600,290 200,290" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
-  <text x="400" y="265" text-anchor="middle" font-size="14" fill="#1a73e8" font-weight="bold">运行时拼装 (Runtime Assembly)</text>
-  <text x="400" y="283" text-anchor="middle" font-size="11" fill="#202124">每次会话动态组合, 非静态模板</text>
+  <text x="400" y="260" text-anchor="middle" font-size="14" fill="#1a73e8" font-weight="bold">Context Budget Planner</text>
+  <text x="400" y="279" text-anchor="middle" font-size="11" fill="#202124">required 先保留 · optional 按价值选择 · 来源可追踪</text>
 
   <!-- Arrow down -->
   <line x1="400" y1="290" x2="400" y2="320" stroke="#1a73e8" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
@@ -81,8 +81,8 @@
   <!-- Final System Prompt -->
   <rect x="150" y="325" width="500" height="70" rx="8" fill="#1a73e8"/>
   <text x="400" y="350" text-anchor="middle" font-size="16" fill="white" font-weight="bold">Final System Prompt</text>
-  <text x="400" y="370" text-anchor="middle" font-size="12" fill="#e8f0fe">= Persona + Memory + Profile + Skills + Expert + Tools + Hooks + ...</text>
-  <text x="400" y="387" text-anchor="middle" font-size="11" fill="#e8f0fe">组合后的完整系统提示词发送给 LLM</text>
+  <text x="400" y="370" text-anchor="middle" font-size="12" fill="#e8f0fe">预算内高价值片段按展示优先级拼接</text>
+  <text x="400" y="387" text-anchor="middle" font-size="11" fill="#e8f0fe">同时输出 included / dropped / inactive 决策</text>
 
   <!-- Arrow to LLM -->
   <line x1="400" y1="395" x2="400" y2="420" stroke="#202124" stroke-width="2" marker-end="url(#arrow)"/>
@@ -92,11 +92,11 @@
   <text x="400" y="453" text-anchor="middle" font-size="14" fill="white" font-weight="bold">→ LLM 推理</text>
 
   <!-- Notes -->
-  <text x="50" y="440" font-size="11" fill="#202124">✓ 按需加载: 只包含</text>
-  <text x="50" y="455" font-size="11" fill="#202124">  相关的段落</text>
-  <text x="50" y="470" font-size="11" fill="#202124">✓ 可缓存重复段落</text>
+  <text x="50" y="440" font-size="11" fill="#202124">✓ 安全规则 fail-closed</text>
+  <text x="50" y="455" font-size="11" fill="#202124">✓ Memory 整块取舍</text>
+  <text x="50" y="470" font-size="11" fill="#202124">✓ 计算分隔符成本</text>
 
-  <text x="580" y="440" font-size="11" fill="#202124">✓ 工具列表随配置变化</text>
-  <text x="580" y="455" font-size="11" fill="#202124">✓ 专家可替换整个段落</text>
-  <text x="580" y="470" font-size="11" fill="#202124">✓ 总长度受 token 限制</text>
+  <text x="580" y="440" font-size="11" fill="#202124">✓ 来源进入决策报告</text>
+  <text x="580" y="455" font-size="11" fill="#202124">✓ 展示顺序与价值分离</text>
+  <text x="580" y="470" font-size="11" fill="#202124">✓ 总长度不超过预算</text>
 </svg>

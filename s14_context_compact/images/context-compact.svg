@@ -1,120 +1,85 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 700" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0,0 L10,5 L0,10 Z" fill="#1a73e8"/>
     </marker>
-    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0,0 L10,5 L0,10 Z" fill="#ea4335"/>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#34a853"/>
     </marker>
   </defs>
 
-  <!-- Background -->
-  <rect width="800" height="500" fill="#f8f9fa"/>
+  <!-- Background and title -->
+  <rect width="900" height="700" fill="#f8f9fa"/>
+  <text x="450" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#202124">上下文压缩：有损 Messages 与无损 Durable State</text>
+  <text x="450" y="64" text-anchor="middle" font-size="13" fill="#5f6368">压缩只处理 Prompt 副本；事实、未决事项、来源与确认时间沿旁路保留</text>
 
-  <!-- Title -->
-  <text x="400" y="34" text-anchor="middle" font-size="23" font-weight="700" fill="#202124">四层上下文压缩管线</text>
-  <text x="400" y="54" text-anchor="middle" font-size="12" fill="#5f6368">上下文 &gt; 80% → 启动压缩，逐级递进缩减 Token</text>
+  <!-- Trigger -->
+  <rect x="280" y="82" width="340" height="34" rx="17" fill="#ea4335"/>
+  <text x="450" y="104" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">estimate_tokens(messages) ≥ 80,000</text>
 
-  <!-- Trigger banner -->
-  <rect x="250" y="65" width="300" height="26" rx="13" fill="#ea4335"/>
-  <text x="400" y="83" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">触发条件：上下文使用量 &gt; 80%</text>
+  <!-- Left: lossy pipeline -->
+  <text x="215" y="146" text-anchor="middle" font-size="15" font-weight="700" fill="#202124">可丢弃 Prompt 视图（deep copy）</text>
 
-  <!-- ===== Left: Pipeline stages (vertical) ===== -->
+  <rect x="50" y="162" width="330" height="58" rx="10" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
+  <circle cx="80" cy="191" r="18" fill="#1a73e8"/>
+  <text x="80" y="197" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">L1</text>
+  <text x="110" y="185" font-size="14" font-weight="700" fill="#174ea6">Tool result truncation</text>
+  <text x="110" y="204" font-size="11" fill="#5f6368">超大结果保留有界前缀与截断说明</text>
 
-  <!-- Stage 1: snip -->
-  <rect x="30" y="108" width="260" height="62" rx="10" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
-  <circle cx="58" cy="139" r="18" fill="#1a73e8"/>
-  <text x="58" y="145" text-anchor="middle" font-size="16" font-weight="700" fill="#ffffff">1</text>
-  <text x="88" y="132" font-size="15" font-weight="700" fill="#1a73e8">snip (裁剪)</text>
-  <text x="88" y="150" font-size="11" fill="#5f6368">删除冗余空白、重复内容</text>
-  <text x="88" y="164" font-size="11" fill="#5f6368">移除不必要的格式化字符</text>
+  <line x1="215" y1="220" x2="215" y2="238" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <rect x="50" y="244" width="330" height="58" rx="10" fill="#fef7e0" stroke="#f9ab00" stroke-width="2"/>
+  <circle cx="80" cy="273" r="18" fill="#f9ab00"/>
+  <text x="80" y="279" text-anchor="middle" font-size="15" font-weight="700" fill="#202124">L2</text>
+  <text x="110" y="267" font-size="14" font-weight="700" fill="#a15c00">File read deduplication</text>
+  <text x="110" y="286" font-size="11" fill="#5f6368">同一路径只保留最近一次读取结果</text>
 
-  <!-- Arrow 1→2 -->
-  <path d="M 160 172 L 160 192" fill="none" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <line x1="215" y1="302" x2="215" y2="320" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <rect x="50" y="326" width="330" height="58" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="2"/>
+  <circle cx="80" cy="355" r="18" fill="#34a853"/>
+  <text x="80" y="361" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">L3</text>
+  <text x="110" y="349" font-size="14" font-weight="700" fill="#137333">Message pruning</text>
+  <text x="110" y="368" font-size="11" fill="#5f6368">保留首个请求与最近消息，避免孤立 tool result</text>
 
-  <!-- Stage 2: micro -->
-  <rect x="30" y="196" width="260" height="62" rx="10" fill="#fef7e0" stroke="#fbbc04" stroke-width="2"/>
-  <circle cx="58" cy="227" r="18" fill="#fbbc04"/>
-  <text x="58" y="233" text-anchor="middle" font-size="16" font-weight="700" fill="#202124">2</text>
-  <text x="88" y="220" font-size="15" font-weight="700" fill="#b06000">micro (微摘要)</text>
-  <text x="88" y="238" font-size="11" fill="#5f6368">对旧消息生成摘要替换</text>
-  <text x="88" y="252" font-size="11" fill="#5f6368">保留语义，丢弃细节</text>
+  <line x1="215" y1="384" x2="215" y2="402" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <rect x="50" y="408" width="330" height="58" rx="10" fill="#fce8e6" stroke="#ea4335" stroke-width="2"/>
+  <circle cx="80" cy="437" r="18" fill="#ea4335"/>
+  <text x="80" y="443" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">L4</text>
+  <text x="110" y="431" font-size="14" font-weight="700" fill="#b3261e">Conversation summary</text>
+  <text x="110" y="450" font-size="11" fill="#5f6368">失败或空摘要时保留原消息，禁止静默丢失</text>
 
-  <!-- Arrow 2→3 -->
-  <path d="M 160 260 L 160 280" fill="none" stroke="#fbbc04" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <!-- Right: lossless durable lane -->
+  <rect x="500" y="140" width="350" height="244" rx="12" fill="#ffffff" stroke="#34a853" stroke-width="2.5"/>
+  <rect x="500" y="140" width="350" height="42" rx="12" fill="#34a853"/>
+  <rect x="500" y="165" width="350" height="17" fill="#34a853"/>
+  <text x="675" y="167" text-anchor="middle" font-size="16" font-weight="700" fill="#ffffff">DurableContextState（无损旁路）</text>
 
-  <!-- Stage 3: budget -->
-  <rect x="30" y="284" width="260" height="62" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="2"/>
-  <circle cx="58" cy="315" r="18" fill="#34a853"/>
-  <text x="58" y="321" text-anchor="middle" font-size="16" font-weight="700" fill="#ffffff">3</text>
-  <text x="88" y="308" font-size="15" font-weight="700" fill="#137333">budget (预算)</text>
-  <text x="88" y="326" font-size="11" fill="#5f6368">按 Token 预算分配空间</text>
-  <text x="88" y="340" font-size="11" fill="#5f6368">优先保留关键信息</text>
+  <text x="525" y="213" font-size="13" font-weight="700" fill="#137333">Confirmed facts</text>
+  <text x="525" y="235" font-size="11" fill="#5f6368">content + source_pointer + last_confirmed_at</text>
+  <line x1="525" y1="250" x2="825" y2="250" stroke="#dadce0"/>
+  <text x="525" y="278" font-size="13" font-weight="700" fill="#137333">Pending work</text>
+  <text x="525" y="300" font-size="11" fill="#5f6368">description + source_pointer + last_confirmed_at</text>
+  <line x1="525" y1="315" x2="825" y2="315" stroke="#dadce0"/>
+  <text x="525" y="342" font-size="11" fill="#5f6368">frozen dataclass · tuple collection · unique IDs</text>
+  <text x="525" y="363" font-size="11" font-weight="700" fill="#137333">不进入 L1–L4，不由摘要模型改写</text>
 
-  <!-- Arrow 3→4 -->
-  <path d="M 160 348 L 160 368" fill="none" stroke="#34a853" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <!-- Separate outputs -->
+  <line x1="215" y1="466" x2="215" y2="500" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <rect x="50" y="508" width="330" height="66" rx="10" fill="#e8f0fe" stroke="#1a73e8" stroke-width="2"/>
+  <text x="215" y="535" text-anchor="middle" font-size="14" font-weight="700" fill="#174ea6">Compacted messages</text>
+  <text x="215" y="556" text-anchor="middle" font-size="11" fill="#5f6368">可丢弃、可从 Transcript 重新派生</text>
 
-  <!-- Stage 4: auto -->
-  <rect x="30" y="372" width="260" height="62" rx="10" fill="#fce8e6" stroke="#ea4335" stroke-width="2"/>
-  <circle cx="58" cy="403" r="18" fill="#ea4335"/>
-  <text x="58" y="409" text-anchor="middle" font-size="16" font-weight="700" fill="#ffffff">4</text>
-  <text x="88" y="396" font-size="15" font-weight="700" fill="#ea4335">auto (自动)</text>
-  <text x="88" y="414" font-size="11" fill="#5f6368">紧急压缩到 92% 以下</text>
-  <text x="88" y="428" font-size="11" fill="#5f6368">激进策略，保命优先</text>
+  <line x1="675" y1="384" x2="675" y2="416" stroke="#34a853" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <rect x="500" y="424" width="350" height="80" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="2"/>
+  <text x="675" y="452" text-anchor="middle" font-size="14" font-weight="700" fill="#137333">render_durable_context()</text>
+  <text x="675" y="474" text-anchor="middle" font-size="11" fill="#5f6368">结构化注入事实、未决事项、来源与确认时间</text>
+  <text x="675" y="491" text-anchor="middle" font-size="10" fill="#5f6368">不与 conversation summary 混合</text>
 
-  <!-- ===== Right: Progress bar (token shrinkage) ===== -->
-  <rect x="340" y="108" width="430" height="326" rx="12" fill="#ffffff" stroke="#dadce0" stroke-width="1.5"/>
-  <text x="555" y="132" text-anchor="middle" font-size="14" font-weight="700" fill="#202124">Token 占用变化</text>
-  <text x="555" y="148" text-anchor="middle" font-size="11" fill="#5f6368">随压缩管线逐步缩减</text>
+  <!-- Merge only at the next model request -->
+  <path d="M 215 574 L 215 625 L 340 625" fill="none" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <path d="M 675 504 L 675 625 L 560 625" fill="none" stroke="#34a853" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <rect x="350" y="592" width="200" height="66" rx="12" fill="#202124"/>
+  <text x="450" y="619" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">Next API Call</text>
+  <text x="450" y="641" text-anchor="middle" font-size="11" fill="#bdc1c6">messages + durable system context</text>
 
-  <!-- Bar 0: 200K (initial) -->
-  <text x="355" y="175" font-size="11" fill="#5f6368">初始</text>
-  <rect x="395" y="162" width="360" height="22" rx="4" fill="#ea4335"/>
-  <text x="765" y="178" text-anchor="end" font-size="12" font-weight="700" fill="#ffffff">200K</text>
-
-  <!-- Arrow -->
-  <path d="M 575 188 L 575 196" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
-
-  <!-- Bar 1: 180K (after snip) -->
-  <text x="355" y="215" font-size="11" fill="#1a73e8">snip</text>
-  <rect x="395" y="202" width="324" height="22" rx="4" fill="#1a73e8"/>
-  <text x="725" y="218" text-anchor="end" font-size="12" font-weight="700" fill="#ffffff">180K</text>
-
-  <!-- Arrow -->
-  <path d="M 557 228 L 557 236" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
-
-  <!-- Bar 2: 120K (after micro) -->
-  <text x="355" y="255" font-size="11" fill="#b06000">micro</text>
-  <rect x="395" y="242" width="216" height="22" rx="4" fill="#fbbc04"/>
-  <text x="617" y="258" text-anchor="end" font-size="12" font-weight="700" fill="#202124">120K</text>
-
-  <!-- Arrow -->
-  <path d="M 503 268 L 503 276" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
-
-  <!-- Bar 3: 80K (after budget) -->
-  <text x="355" y="295" font-size="11" fill="#137333">budget</text>
-  <rect x="395" y="282" width="144" height="22" rx="4" fill="#34a853"/>
-  <text x="545" y="298" text-anchor="end" font-size="12" font-weight="700" fill="#ffffff">80K</text>
-
-  <!-- Arrow -->
-  <path d="M 467 308 L 467 316" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
-
-  <!-- Bar 4: 50K (after auto) -->
-  <text x="355" y="335" font-size="11" fill="#ea4335">auto</text>
-  <rect x="395" y="322" width="90" height="22" rx="4" fill="#ea4335"/>
-  <text x="491" y="338" text-anchor="end" font-size="12" font-weight="700" fill="#ffffff">50K</text>
-
-  <!-- Threshold line at 80% -->
-  <line x1="395" y1="358" x2="755" y2="358" stroke="#ea4335" stroke-width="1.5" stroke-dasharray="4 3"/>
-  <text x="395" y="372" font-size="10" fill="#ea4335" font-weight="600">80% 阈值线</text>
-
-  <!-- Summary -->
-  <rect x="355" y="385" width="400" height="38" rx="8" fill="#e6f4ea"/>
-  <text x="555" y="403" text-anchor="middle" font-size="13" font-weight="700" fill="#137333">200K → 50K</text>
-  <text x="555" y="418" text-anchor="middle" font-size="11" fill="#5f6368">总缩减 75%，关键信息保留</text>
-
-  <!-- Bottom note -->
-  <rect x="30" y="448" width="740" height="38" rx="8" fill="#202124"/>
-  <text x="400" y="467" text-anchor="middle" font-size="12" fill="#ffffff">管线策略：从温和裁剪到激进压缩，逐级递进，在信息保留与空间回收间取得平衡</text>
-  <text x="400" y="481" text-anchor="middle" font-size="10" fill="#9aa0a6">每层仅在上一层不足以释放足够空间时才触发</text>
+  <text x="450" y="682" text-anchor="middle" font-size="11" fill="#5f6368">压缩改变上下文视图，不改变长期事实本身</text>
 </svg>

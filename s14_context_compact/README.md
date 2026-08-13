@@ -12,12 +12,13 @@
 
 ```mermaid
 flowchart LR
-    A["Long Transcript"] --> B["Token Counter"]
-    B --> C["Summarizer"]
-    C --> D["Compacted History"]
-    D --> E["Next API Call"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    A["Transcript-derived messages"] --> B["Deep-copy prompt view"]
+    B --> C["L1 truncate → L2 dedup → L3 prune → L4 summary"]
+    C --> D["Compacted messages"]
+    S["DurableContextState"] --> R["Lossless renderer"]
+    R --> E["Next API call"]
+    D --> E
+    S -. "bypasses lossy layers" .-> C
 ```
 
 ## 学习前置知识
@@ -25,18 +26,22 @@ flowchart LR
 - 压缩不是截断, 而是结构化重建上下文。
 - 不同角色需要不同压缩策略: 主会话、子任务、摘要恢复。
 - 触发阈值应该在溢出前, 不是报错后。
+- Transcript、Memory 和当前 Prompt 是生命周期不同的视图；压缩只允许改变最后一个。
 
 ## 本章抓住的 WorkBuddy-style 机制
 
-- 吸收公开架构研究中的 compact/contextSummary 思路。
-- 保留意图、关键文件、错误修复、当前工作、下一步。
-- 展示 snip/micro/budget/auto 多级策略。
+- 吸收公开 Agent 架构中的分层压缩与结构化摘要思路。
+- 四层策略只处理可丢弃、可重建的 messages 副本，不修改 Transcript 派生输入。
+- 用不可变 `DurableContextState` 单独携带已确认事实和未决事项。
+- 每条 durable item 强制保留 source pointer 与 `last_confirmed_at`，并在下一轮 system context 中结构化渲染。
 
 ## 常见误区
 
 - 简单删除早期消息, 会丢掉用户原始意图。
-- 摘要不保留 pending tasks, 长任务会断线。
+- 让生成式摘要负责保存 durable fact，模型可能改写事实或遗漏 pending task。
 - 压缩后不标注来源, 后续很难验证。
+- 原地修改 messages 会连带污染 Transcript 回放或调用方保存的证据视图。
+- 摘要生成失败后仍用错误字符串替换旧历史，会静默丢失最后一份可用上下文。
 ## 问题
 
 agent 跑得越久，消息历史越长。一次对话可能产生几十条消息——每次工具调用的输入输出都堆在 `messages` 列表里。模型的上下文窗口是有限的（128K、200K，无论多大终归有限），一旦超限，API 直接报错。
@@ -93,7 +98,43 @@ agent 跑得越久，消息历史越长。一次对话可能产生几十条消�
   └─────────────────────────────────────┘
 ```
 
-**关键原则**：系统提示和工具定义**永远不压缩**——它们每轮都要用。
+**关键原则**：系统提示、工具定义与 `DurableContextState` **永远不进入有损压缩层**。压缩器先深拷贝 messages，四层只操作这份可丢弃 Prompt 视图；已确认事实、未决事项、来源指针和最近确认时间沿旁路进入下一次 API 调用。
+
+### 压缩对象边界：Messages 可以有损，Durable state 必须无损
+
+```python
+@dataclass(frozen=True)
+class DurableFact:
+    fact_id: str
+    content: str
+    source_pointer: str
+    last_confirmed_at: str
+
+@dataclass(frozen=True)
+class PendingItem:
+    item_id: str
+    description: str
+    source_pointer: str
+    last_confirmed_at: str
+
+@dataclass(frozen=True)
+class DurableContextState:
+    facts: tuple[DurableFact, ...] = ()
+    pending_items: tuple[PendingItem, ...] = ()
+```
+
+`frozen=True` 防止压缩流程就地改写字段，tuple 防止在 state 内追加或删除条目。构造时还会拒绝空 ID、空 source pointer、重复 ID 和没有时区的确认时间。这里的 `source_pointer` 可以指向 s09 Transcript event，也可以指向 s13 Artifact；压缩后仍能回到原始证据。
+
+```text
+可压缩 messages                     不可有损 durable state
+----------------                    -----------------------
+旧对话细节                          已确认事实
+重复文件读取                        未决事项
+大工具结果的上下文副本              source pointer
+探索过程                            last_confirmed_at
+```
+
+生成式摘要即使遗漏任务，甚至错误地把“SQLite WAL”写成“JSON 文件”，也只能污染一次 conversation summary，不能修改 `DurableContextState`。下一轮 Prompt 由 `render_durable_context()` 重新注入原始结构化事实。
 
 ---
 
@@ -146,7 +187,7 @@ def truncate_tool_results(messages: list) -> list:
                 result = block.get("content", "")
                 tokens = len(str(result)) // 4
                 if tokens > MAX_TOOL_RESULT_TOKENS:
-                    # 截断为摘要
+                    # 这里只做有界截断；真正摘要属于 Layer 4
                     truncated = str(result)[:MAX_TOOL_RESULT_TOKENS * 4]
                     block["content"] = (
                         truncated +
@@ -229,217 +270,93 @@ def prune_old_messages(messages: list) -> list:
 
 ### Layer 4: 全对话摘要
 
-最激进的策略——用模型生成整个对话的摘要，替换掉所有旧消息：
+最激进的策略——用模型生成旧对话摘要，同时保留最近消息。它只总结 conversation messages，不接收 `DurableContextState`。如果模型调用失败或返回空摘要，函数保留原消息并报告节省 0 token，不能用“摘要失败”字符串覆盖历史：
 
 ```python
-def generate_summary(messages: list, client) -> list:
+def generate_summary(messages: list, summarizer) -> tuple[list, int]:
     """Layer 4: 生成对话摘要替换历史。
 
     调用模型总结到目前为止的对话,
     用摘要替换旧消息, 保留最近几轮。
     """
-    summary_prompt = """请总结以下对话的关键信息:
-- 讨论了什么问题
-- 做了哪些操作 (工具调用)
-- 得到了什么结论
-- 当前任务进度
-
-只保留关键信息, 省略细节。"""
-
     old_messages = messages[:-4]  # 保留最近 4 条
     recent = messages[-4:]
 
-    response = client.messages.create(
-        model=MODEL,
-        system=summary_prompt,
-        messages=[{"role": "user", "content": json.dumps(old_messages)}],
-        max_tokens=2000,
-    )
+    try:
+        summary = summarizer(json.dumps(old_messages)).strip()
+    except Exception:
+        return messages, 0
+    if not summary:
+        return messages, 0
 
-    summary = response.content[0].text
-
-    return [
+    summarized = [
         {"role": "user", "content": f"[对话摘要]\n{summary}"},
         {"role": "assistant", "content": "好的, 我已了解之前的对话内容。"},
     ] + recent
+    return summarized, estimate_tokens(messages) - estimate_tokens(summarized)
 ```
 
 ### 在循环中的位置
 
 ```python
-def agent_loop(messages: list):
+def agent_loop(messages: list, durable_state: DurableContextState):
     while True:
-        # 压缩检查 — 每次 API 调用前
-        messages = compact_if_needed(messages)
+        result = compact_context(messages, durable_state)
+        messages = result.messages
+        durable_context = render_durable_context(result.durable_state)
 
-        response = client.messages.create(...)
+        response = client.messages.create(
+            system=SYSTEM + "\n\n" + durable_context,
+            messages=messages,
+            ...,
+        )
         # ... 正常循环 ...
 ```
 
----
-
-## 压缩触发阈值层级
-
-WorkBuddy 不是只有一个阈值——它有一组层级化的阈值，在不同压力下触发不同策略。
-
-```
-压缩触发阈值层级 (tokenUsageThresholds):
-
-  0%  ──────────────────────────────────────── 100%
-       │         │        │        │      │
-       0%       50%      70%      80%    92%
-       │         │        │        │      │
-    安全      preMessage  auto    preMessage emergency
-              Compact    Compact           Compact
-              (eC=0.5)  (eE=0.7)  (0.8)  (0.92)
-```
-
-**教学常量 (clean-room reference):**
-
-| 常量 | 值 | 含义 |
-|------|----|------|
-| `eE` | `0.7` | DEFAULT\_TOKEN\_THRESHOLD — autocompact 自动压缩触发 |
-| `eC` | `0.5` | pre-message compact 阈值 (50%) |
-| `preMessage` | `0.8` | tokenUsageThresholds.inputTokens.preMessage |
-| `emergency` | `0.92` | tokenUsageThresholds.inputTokens.emergency |
-| `subAgentEmergency` | emergency 或 0.92 | 子 Agent 紧急压缩阈值 |
-
-**环境变量覆盖:**
-
-```bash
-CODEBUDDY_AUTOCOMPACT_PCT_OVERRIDE=0.6      # 覆盖 autocompact 阈值
-CODEBUDDY_PRE_MESSAGE_COMPACT_PCT=0.45        # 覆盖 pre-message 阈值
-CODEBUDDY_ENGINEERING_COMPACT_SUFFICIENCY_RATIO=0.3  # 压缩充分率
-# autoCompactEnabled setting — 可关闭自动压缩
-```
+`compact_context()` 返回 `CompactionResult`，同时记录压缩前后 token 和实际触发的层。它会深拷贝输入 messages，因此原始 Transcript 回放视图不随 L1/L2 的就地整理发生变化。兼容入口 `compact_if_needed()` 仍只返回 messages，方便前面章节的调用方式保持简单。
 
 ---
 
-## compact vs contextSummary — 两个不同的 Agent
+## 教学版的触发与停止条件
 
-这是**两个不同的 Agent**，用途不同，保留内容不同：
+本章只有一个公开触发条件：`estimate_tokens(messages) >= TOKEN_THRESHOLD`。触发后按 L1 → L4 依次尝试；每层结束都重新估算，低于阈值就立即停止。本章没有声称某个外部产品采用特定百分比、内部 Agent 名称或环境变量。
 
-| 特性 | compact Agent | contextSummary Agent |
-|------|--------------|---------------------|
-| AgentNames | `COMPACT = "compact"` | `CONTEXT_SUMMARY = "contextSummary"` |
-| 模型 | default | default |
-| 工具数 | 0 | 0 |
-| 触发时机 | 70% 阈值 (autocompact) | 92% 阈值 (emergency) |
-| 保留内容 | 技术骨架 (意图、概念、文件、错误、方案) | 全部用户消息 + 技术骨架 |
-| 用户消息 | 可能不保留所有 | 保留所有用户消息 |
-| 适用场景 | 常规压缩，保留技术上下文 | 紧急压缩，保留完整对话线索 |
-| 通信能力 | 无 (INTERNAL\_GENERATOR\_AGENTS) | 无 (INTERNAL\_GENERATOR\_AGENTS) |
-
-**compact Agent 压缩后的结构:**
-
-```
-压缩后的上下文包含:
-  - Primary Request and Intent — 用户原始意图
-  - Key Technical Concepts — 涉及的技术概念
-  - Files and Code Sections — 关键文件和代码片段
-  - Errors and fixes — 遇到的错误和修复方式
-  - Problem Solving — 已解决和待解决的问题
-  - Pending Tasks — 未完成的任务
-  - Current Work — 当前正在进行的工作
-  - Optional Next Step — 可选的下一步
+```text
+低于 80,000 tokens ──> 不压缩，返回深拷贝
+达到 80,000 tokens ──> L1 → 检查 → L2 → 检查 → L3 → 检查 → L4
+                         └──────── 任一层达标即停止 ────────┘
 ```
 
-**contextSummary Agent 额外保留:**
-
-```
-  - All user messages — 所有用户消息 (仅 contextSummary 模式)
-  (其他结构与 compact 相同)
-```
+`HARD_LIMIT` 是后续练习可使用的紧急上限常量，当前调度器尚未为它实现第二套策略，因此不能把它描述成已经存在的 emergency 模式。
 
 ---
 
-## 压缩不是截断，是结构化重建
+## 压缩不是 Memory 写入
 
-关键认知：压缩 ≠ 截断。压缩是提取骨架、重建结构。
+结构化摘要可以尽量保留意图、关键操作和当前进度，但它仍是模型生成的、有损的 Prompt 视图，不能作为长期事实的唯一副本：
 
-```python
-# 错误理解: 截断 = 砍掉后面的内容
-messages = messages[:100]  # 丢失上下文，agent 失忆
-
-# 正确理解: 压缩 = 提取骨架，重建结构
-compressed = compact_agent.run(messages)
-# compressed 包含: 意图 + 技术概念 + 文件 + 错误 + 进度
-# 丢掉的是: 中间推理过程、冗余的 tool_result、重复的确认消息
+```text
+Transcript events ──派生──> messages ──有损压缩──> compacted messages
+Memory records ───────────> DurableContextState ──无损渲染──> system context
 ```
 
-丢掉的是"过程噪声"，留下的是"技术骨架"——agent 不会因此失忆，只是忘记了"怎么走到这里"，但记得"走到了哪里"。
+两条路径只在下一次模型请求时汇合。摘要说“任务已完成”不会自动关闭 pending item；只有经过 Memory 自己的确认与写入流程，durable state 才能改变。这也是为什么本章保留 source pointer：压缩后仍能回到 Transcript 或 Artifact 核验证据。
 
 ---
 
-## 三层压缩管线 (跨课交叉引用)
+## 生产化时还要补什么
 
-信息从产生到被主 Agent 使用，经过三层压缩：
+本章刻意保持 clean-room 教学实现。生产 harness 通常还要根据自己的模型与协议补齐：
 
-```
-第一层: memorySelector 预筛选记忆 (≤5条, lite模型)
-  └─ 防止无关记忆进入上下文
+| 关注点 | 本章做法 | 生产化方向 |
+|--------|----------|------------|
+| token 计数 | 4 字符约 1 token | 使用目标模型 tokenizer，并计入 system 与 tools |
+| 工具结果 | 保留有界前缀 | 按内容类型保留头尾，或外置为 Artifact |
+| 协议完整性 | 避免以孤立 tool result 开头 | 按 tool-use ID 成对裁剪完整调用组 |
+| 摘要失败 | 原消息原样保留 | 加超时、重试预算和可观测失败原因 |
+| 长期事实 | durable state 旁路 | 接入带版本、冲突处理和来源校验的 Memory store |
 
-第二层: SubAgent 只返回摘要 (SendMessage/Notification)
-  └─ SubAgent 完整推理不进入主 Agent
-
-第三层: compact/contextSummary 全局压缩
-  └─ 对话过长时，结构化重建整个上下文
-```
-
-每一层都是有损压缩，但都保留"骨架"信息。核心哲学：
-
-- **不是等上下文腐烂了再压缩** (reactive 被动式)
-- **而是从一开始就不让无关内容进入** (preventive 预防式)
-
-第一层和第二层是"预防"——在内容进入之前就过滤。第三层是"治疗"——内容已经太多了，做结构化重建。
-
----
-
-## maxConsecutiveTokenLimitSummary — 安全阀
-
-还有一个防护机制：`maxConsecutiveTokenLimitSummary` — 限制连续压缩操作的次数，防止无限压缩循环。
-
-如果压缩后仍然腾不出足够 token，系统不会无限次重试压缩。这避免了"压缩 → 仍然超 → 再压缩 → 仍然超"的死循环。当连续压缩达到上限仍不满足时，系统会选择其他策略（如更激进地修剪消息，或直接报错让用户介入）。
-
----
-
-## WorkBuddy 架构对照
-
-生产级桌面 agent 的上下文管理是 `agent bridge` 中的核心子系统之一。它的压缩策略比教学版更精细：
-
-### 四层压缩对应
-
-| 教学版 | WorkBuddy 实现 | 触发条件 |
-|--------|---------------|---------|
-| Layer 1: 工具结果截断 | `truncateToolResult()` — 大输出按 token 预算截断 | 单条 tool_result > 阈值 |
-| Layer 2: 文件去重 | `deduplicateFileContent()` — 同文件多次读取去重 | 检测到重复 read |
-| Layer 3: 消息修剪 | `pruneMessages()` — 旧消息按优先级删除 | token 超过 80% 阈值 |
-| Layer 4: 对话摘要 | `summarizeConversation()` — 调模型生成摘要 | token 超过 95% 阈值 |
-
-### Token 追踪
-
-生产级 harness 通常会分别追踪各组件的 token 消耗：
-
-```javascript
-// agent bridge 中的 token 追踪 (简化)
-const tokenUsage = {
-  system: estimateTokens(systemPrompt),
-  tools: estimateTokens(JSON.stringify(tools)),
-  messages: estimateTokens(messages),
-  total: 0,  // = system + tools + messages
-};
-```
-
-每次 API 调用前检查 `tokenUsage.total` 是否超过阈值。系统提示和工具定义**永远不压缩**——它们每轮都需要。
-
-### 保留策略
-
-WorkBuddy 的修剪不是简单删除——它有优先级：
-
-1. **永远保留**: 系统提示、工具定义、当前用户请求
-2. **高优先级保留**: 最近的工具调用结果、最近 N 轮对话
-3. **中优先级**: 中间过程的工具调用（可截断或摘要）
-4. **低优先级**: 早期的探索性对话（最先被删）
+这些是可验证的设计方向，不代表任何特定闭源产品的内部实现。
 
 ---
 
@@ -447,13 +364,16 @@ WorkBuddy 的修剪不是简单删除——它有优先级：
 
 `code.py` 实现了完整的四层压缩管线：
 
-1. **`estimate_tokens()`** — 粗略估算 messages 的 token 数（4 字符 ≈ 1 token）
-2. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
-3. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新
-4. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，删除旧消息
-5. **`generate_summary()`** — Layer 4: 用模型生成摘要替换历史
-6. **`compact_if_needed()`** — 总调度：依次尝试四层，直到 token 数达标
-7. **agent 循环** — 每次 API 调用前检查并压缩
+1. **`DurableFact` / `PendingItem`** — 不可变的事实与未决事项，强制携带 source pointer 和带时区的最近确认时间
+2. **`DurableContextState`** — 在有损管线旁路传递的 Memory 输入，并拒绝重复 ID
+3. **`render_durable_context()`** — 把 durable state 独立渲染进 system context，不混入生成式摘要
+4. **`estimate_tokens()`** — 粗略估算 messages 的 token 数（4 字符 ≈ 1 token）
+5. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
+6. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新
+7. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，删除旧消息
+8. **`generate_summary()`** — Layer 4: 用模型生成摘要替换历史；失败或空摘要时保留原历史
+9. **`compact_context()`** — 深拷贝 messages，依次尝试四层，并返回 `CompactionResult`
+10. **Agent 循环** — 每次 API 调用前压缩 disposable messages，再把 durable state 独立注入
 
 运行后会看到压缩日志——每层触发时打印 `[compact]` 消息，可以看到哪些层在什么时候被触发。
 
@@ -471,9 +391,10 @@ python s14_context_compact/code.py
 
 ## 练习
 
-1. 给 Layer 3（消息修剪）加一个"保护列表"——某些关键消息（如包含用户核心需求的）永远不被删除。提示：给消息加一个 `_protected` 标记。
-2. 当前 Layer 4 的摘要是一次性生成。实现增量摘要：每次只摘要新增的消息，与之前的摘要合并。思考：增量摘要有什么风险？
-3. `estimate_tokens` 用 4 字符 ≈ 1 token 估算。安装 `tiktoken`，用精确计数替换。对比两种方法的差异——在什么场景下粗略估算会严重偏差？
+1. 给 pending item 增加状态机（open / blocked / done）。思考：完成状态由谁确认，如何避免摘要中的一句“已完成”越权修改 durable state？
+2. 当前 Layer 4 的摘要是一次性生成。实现增量摘要：每次只摘要新增的 messages，与之前的摘要合并；然后设计测试证明 durable state 不参与摘要合并。
+3. 为 source pointer 增加解析器，分别定位 `transcript:` 与 `artifact:` 来源。思考：来源已被清理或权限不足时，Prompt 应怎样呈现而不是伪造证据？
+4. `estimate_tokens` 用 4 字符 ≈ 1 token 估算。安装 tokenizer 做精确计数，对比中英文和结构化 tool result 的偏差。
 
 ---
 

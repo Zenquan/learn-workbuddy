@@ -33,7 +33,7 @@ Four layers, triggered from lightest to heaviest:
   │    ├─ L3: prune old messages (keep recent N)         │
   │    └─ L4: generate summary (model call)              │
   │                                                      │
-  │  NEVER compact: system prompt, tool definitions      │
+  │  NEVER compact: durable facts, pending work, sources │
   └──────────────────────────────────────────────────────┘
 
 Production harnesses often use: precise tiktoken counting, priority-based pruning,
@@ -43,15 +43,31 @@ Teaching version uses: 4-chars ≈ 1-token estimation, simple thresholds.
 Usage:
     python s14_context_compact/code.py
 """
-
-
+import copy
+import json
+import os
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 # Machine-readable learning path metadata. Tests enforce that every
 # chapter declares what it inherits and what it adds.
-PROGRESSION = {'chapter': 's14_context_compact',
- 'builds_on': ['s13_output_externalization'],
- 'adds': ['token pressure detection', 'structured compaction', 'summary preservation'],
- 'preserves': ['externalized output pointers']}
+PROGRESSION = {
+    "chapter": "s14_context_compact",
+    "builds_on": ["s13_output_externalization"],
+    "adds": [
+        "token pressure detection",
+        "structured compaction",
+        "durable state preservation",
+    ],
+    "preserves": [
+        "externalized output pointers",
+        "memory facts outside lossy summaries",
+    ],
+}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
 import sys as _wb_sys
@@ -63,8 +79,6 @@ from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
 from mini_workbuddy.chapter_demo import prepare_chapter_provider as _wb_prepare_chapter_provider
 _wb_prepare_chapter_provider()
-import os, sys, time, json
-from pathlib import Path
 
 try:
     import readline
@@ -82,16 +96,25 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ.get("MODEL_ID")
-if not MODEL:
-    raise SystemExit(
-        "MODEL_ID is not set. Copy .env.example to .env and fill in "
-        "ANTHROPIC_API_KEY and MODEL_ID (see README quick start)."
-    )
+_client: Anthropic | None = None
 
 SYSTEM = f"""你是一个桌面 AI 助手, 工作目录: {WORKDIR}
 你有文件读写和命令执行工具。回答要简洁。"""
+
+
+def runtime_client() -> Anthropic:
+    """Create the online client lazily so compaction contracts stay keyless."""
+
+    global _client
+    if not MODEL:
+        raise RuntimeError(
+            "MODEL_ID is not set. Copy .env.example to .env and fill in "
+            "the provider key and MODEL_ID (see README quick start)."
+        )
+    if _client is None:
+        _client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+    return _client
 
 
 # ======================================================================
@@ -105,6 +128,126 @@ TOKEN_THRESHOLD = 80_000        # Trigger compaction at 80K tokens
 HARD_LIMIT = 120_000            # Hard limit — must compact before this
 MAX_TOOL_RESULT_TOKENS = 5_000  # Layer 1: truncate tool results above this
 KEEP_RECENT_TURNS = 6           # Layer 3: keep this many recent messages
+
+
+def _required_text(value: str, *, field_name: str) -> str:
+    """Reject anonymous durable state before it reaches prompt assembly."""
+
+    normalized = " ".join(str(value).split())
+    if not normalized:
+        raise ValueError(f"{field_name} must not be empty")
+    return normalized
+
+
+def _confirmed_at(value: str) -> str:
+    """Require an explicit timezone so recency remains comparable after restart."""
+
+    normalized = _required_text(value, field_name="last_confirmed_at")
+    parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("last_confirmed_at must include a timezone")
+    return normalized
+
+
+@dataclass(frozen=True)
+class DurableFact:
+    """A confirmed fact owned by Memory, not by the lossy message summary."""
+
+    fact_id: str
+    content: str
+    source_pointer: str
+    last_confirmed_at: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fact_id", _required_text(self.fact_id, field_name="fact_id"))
+        object.__setattr__(self, "content", _required_text(self.content, field_name="content"))
+        object.__setattr__(
+            self,
+            "source_pointer",
+            _required_text(self.source_pointer, field_name="source_pointer"),
+        )
+        object.__setattr__(self, "last_confirmed_at", _confirmed_at(self.last_confirmed_at))
+
+
+@dataclass(frozen=True)
+class PendingItem:
+    """Unfinished work that must survive even when its original turn is pruned."""
+
+    item_id: str
+    description: str
+    source_pointer: str
+    last_confirmed_at: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "item_id", _required_text(self.item_id, field_name="item_id"))
+        object.__setattr__(
+            self,
+            "description",
+            _required_text(self.description, field_name="description"),
+        )
+        object.__setattr__(
+            self,
+            "source_pointer",
+            _required_text(self.source_pointer, field_name="source_pointer"),
+        )
+        object.__setattr__(self, "last_confirmed_at", _confirmed_at(self.last_confirmed_at))
+
+
+@dataclass(frozen=True)
+class DurableContextState:
+    """Typed state carried around compaction rather than summarized by it."""
+
+    facts: tuple[DurableFact, ...] = ()
+    pending_items: tuple[PendingItem, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Type hints do not stop callers from passing lists. Normalize them here
+        # so a frozen state cannot still be mutated through a list reference.
+        object.__setattr__(self, "facts", tuple(self.facts))
+        object.__setattr__(self, "pending_items", tuple(self.pending_items))
+        fact_ids = [item.fact_id for item in self.facts]
+        pending_ids = [item.item_id for item in self.pending_items]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("durable fact ids must be unique")
+        if len(pending_ids) != len(set(pending_ids)):
+            raise ValueError("pending item ids must be unique")
+
+
+EMPTY_DURABLE_STATE = DurableContextState()
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    """Lossy messages plus the exact durable state that bypassed the pipeline."""
+
+    messages: list[dict]
+    durable_state: DurableContextState
+    tokens_before: int
+    tokens_after: int
+    applied_layers: tuple[str, ...]
+
+
+def render_durable_context(state: DurableContextState) -> str:
+    """Render source-bearing state separately from a generated conversation summary."""
+
+    if not state.facts and not state.pending_items:
+        return ""
+    lines = ["[Durable context — do not reinterpret as conversation summary]"]
+    if state.facts:
+        lines.append("Confirmed facts:")
+        for fact in state.facts:
+            lines.append(
+                f"- {fact.fact_id}: {fact.content} "
+                f"(source={fact.source_pointer}; confirmed={fact.last_confirmed_at})"
+            )
+    if state.pending_items:
+        lines.append("Pending work:")
+        for item in state.pending_items:
+            lines.append(
+                f"- {item.item_id}: {item.description} "
+                f"(source={item.source_pointer}; confirmed={item.last_confirmed_at})"
+            )
+    return "\n".join(lines)
 
 
 def estimate_tokens(messages: list) -> int:
@@ -270,7 +413,27 @@ def prune_old_messages(messages: list) -> tuple[list, int]:
 # Layer 4: Full conversation summary
 # ======================================================================
 
-def generate_summary(messages: list) -> tuple[list, int]:
+def _model_summary(conversation_text: str) -> str:
+    """Online adapter kept outside the pure compaction state contract."""
+
+    summary_prompt = (
+        "请总结以下对话的关键信息, 用于后续对话的上下文恢复。\n"
+        "包括: 讨论的问题, 执行的操作, 得到的结论, 当前任务进度。\n"
+        "简洁, 只保留关键信息。"
+    )
+    response = runtime_client().messages.create(
+        model=MODEL,
+        system=summary_prompt,
+        messages=[{"role": "user", "content": conversation_text}],
+        max_tokens=2000,
+    )
+    return str(response.content[0].text)
+
+
+def generate_summary(
+    messages: list,
+    summarizer: Callable[[str], str] | None = None,
+) -> tuple[list, int]:
     """Layer 4: Generate a conversation summary replacing old messages.
 
     Calls the model to summarize the conversation, then replaces
@@ -317,22 +480,16 @@ def generate_summary(messages: list) -> tuple[list, int]:
             content = " ".join(parts)
         convo_text.append(f"{role}: {content[:500]}")
 
-    summary_prompt = (
-        "请总结以下对话的关键信息, 用于后续对话的上下文恢复。\n"
-        "包括: 讨论的问题, 执行的操作, 得到的结论, 当前任务进度。\n"
-        "简洁, 只保留关键信息。"
-    )
-
     try:
-        response = client.messages.create(
-            model=MODEL,
-            system=summary_prompt,
-            messages=[{"role": "user", "content": "\n".join(convo_text)}],
-            max_tokens=2000,
-        )
-        summary = response.content[0].text
-    except Exception as e:
-        summary = f"[摘要生成失败: {e}]"
+        summary = (summarizer or _model_summary)("\n".join(convo_text))
+    except Exception:
+        # A failed summary is not evidence. Replacing history with an error
+        # string would silently discard the only remaining conversation copy.
+        return messages, 0
+
+    summary = str(summary).strip()
+    if not summary:
+        return messages, 0
 
     summarized = [
         {"role": "user", "content": f"[之前的对话摘要]\n{summary}"},
@@ -348,51 +505,108 @@ def generate_summary(messages: list) -> tuple[list, int]:
 # Compact dispatcher
 # ======================================================================
 
-def compact_if_needed(messages: list, verbose: bool = True) -> list:
-    """Check token count and compact if needed.
+def compact_context(
+    messages: list,
+    durable_state: DurableContextState = EMPTY_DURABLE_STATE,
+    *,
+    summarizer: Callable[[str], str] | None = None,
+    verbose: bool = True,
+) -> CompactionResult:
+    """Compact an isolated message copy while carrying durable state unchanged.
 
     Tries layers in order: L1 → L2 → L3 → L4.
     Stops as soon as token count drops below threshold.
+
+    ``messages`` are a disposable prompt view, so the pipeline may truncate,
+    deduplicate, prune, or summarize them. ``durable_state`` is a typed Memory
+    input and deliberately bypasses every lossy layer. The deep copy also keeps
+    callers' transcript-derived messages unchanged for replay and audit.
     """
-    tokens = estimate_tokens(messages)
+    working = copy.deepcopy(messages)
+    tokens_before = estimate_tokens(working)
+    tokens = tokens_before
+    applied_layers: list[str] = []
 
     if tokens < TOKEN_THRESHOLD:
-        return messages
+        return CompactionResult(
+            messages=working,
+            durable_state=durable_state,
+            tokens_before=tokens_before,
+            tokens_after=tokens,
+            applied_layers=(),
+        )
 
     if verbose:
         print(f"\n\033[33m[compact] 当前 token 估算: {tokens:,} (阈值: {TOKEN_THRESHOLD:,})\033[0m")
 
     # Layer 1: Truncate large tool results
-    messages, saved = truncate_tool_results(messages)
-    tokens = estimate_tokens(messages)
+    working, saved = truncate_tool_results(working)
+    tokens = estimate_tokens(working)
+    if saved > 0:
+        applied_layers.append("tool_result_truncation")
     if saved > 0 and verbose:
         print(f"\033[33m[compact] L1 截断工具结果: 节省 {saved:,} tokens, 当前 {tokens:,}\033[0m")
     if tokens < TOKEN_THRESHOLD:
-        return messages
+        return CompactionResult(
+            working, durable_state, tokens_before, tokens, tuple(applied_layers)
+        )
 
     # Layer 2: Dedup file reads
-    messages, saved = dedup_file_reads(messages)
-    tokens = estimate_tokens(messages)
+    working, saved = dedup_file_reads(working)
+    tokens = estimate_tokens(working)
+    if saved > 0:
+        applied_layers.append("file_read_deduplication")
     if saved > 0 and verbose:
         print(f"\033[33m[compact] L2 文件去重: 节省 {saved:,} tokens, 当前 {tokens:,}\033[0m")
     if tokens < TOKEN_THRESHOLD:
-        return messages
+        return CompactionResult(
+            working, durable_state, tokens_before, tokens, tuple(applied_layers)
+        )
 
     # Layer 3: Prune old messages
-    messages, saved = prune_old_messages(messages)
-    tokens = estimate_tokens(messages)
+    working, saved = prune_old_messages(working)
+    tokens = estimate_tokens(working)
+    if saved > 0:
+        applied_layers.append("message_pruning")
     if saved > 0 and verbose:
         print(f"\033[33m[compact] L3 修剪旧消息: 节省 {saved:,} tokens, 当前 {tokens:,}\033[0m")
     if tokens < TOKEN_THRESHOLD:
-        return messages
+        return CompactionResult(
+            working, durable_state, tokens_before, tokens, tuple(applied_layers)
+        )
 
     # Layer 4: Generate summary
-    messages, saved = generate_summary(messages)
-    tokens = estimate_tokens(messages)
+    working, saved = generate_summary(working, summarizer=summarizer)
+    tokens = estimate_tokens(working)
+    if saved > 0:
+        applied_layers.append("conversation_summary")
     if saved > 0 and verbose:
         print(f"\033[33m[compact] L4 生成摘要: 节省 {saved:,} tokens, 当前 {tokens:,}\033[0m")
 
-    return messages
+    return CompactionResult(
+        messages=working,
+        durable_state=durable_state,
+        tokens_before=tokens_before,
+        tokens_after=tokens,
+        applied_layers=tuple(applied_layers),
+    )
+
+
+def compact_if_needed(
+    messages: list,
+    verbose: bool = True,
+    *,
+    durable_state: DurableContextState = EMPTY_DURABLE_STATE,
+    summarizer: Callable[[str], str] | None = None,
+) -> list:
+    """Compatibility entrypoint returning only the disposable prompt messages."""
+
+    return compact_context(
+        messages,
+        durable_state,
+        summarizer=summarizer,
+        verbose=verbose,
+    ).messages
 
 
 # ======================================================================
@@ -448,18 +662,25 @@ TOOL_HANDLERS = {"read_file": run_read, "bash": run_bash, "write_file": run_writ
 # Agent Loop with compaction
 # ======================================================================
 
-def agent_loop(messages: list):
-    """Agent loop with context compaction before each API call."""
+def agent_loop(
+    messages: list,
+    durable_state: DurableContextState = EMPTY_DURABLE_STATE,
+):
+    """Agent loop with lossy messages and lossless durable state kept separate."""
     while True:
-        # --- NEW: Compact if needed ---
-        messages = compact_if_needed(messages, verbose=True)
+        result = compact_context(messages, durable_state, verbose=True)
+        messages = result.messages
 
         # Token check display
         tokens = estimate_tokens(messages)
         print(f"\033[90m[tokens: {tokens:,} / {TOKEN_THRESHOLD:,}]\033[0m")
 
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
+        durable_context = render_durable_context(result.durable_state)
+        runtime_system = SYSTEM
+        if durable_context:
+            runtime_system += f"\n\n{durable_context}"
+        response = runtime_client().messages.create(
+            model=MODEL, system=runtime_system, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})

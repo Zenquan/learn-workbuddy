@@ -84,10 +84,24 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from mini_workbuddy.paths import tutorial_workbuddy_home
 
+DEFAULT_PROMPT_BUDGET_CHARS = 12_000
+
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+
+def _prompt_budget_from_env() -> int:
+    raw = os.environ.get("PROMPT_BUDGET_CHARS", str(DEFAULT_PROMPT_BUDGET_CHARS))
+    try:
+        budget = int(raw)
+    except ValueError as exc:
+        raise SystemExit("PROMPT_BUDGET_CHARS must be a non-negative integer") from exc
+    if budget < 0:
+        raise SystemExit("PROMPT_BUDGET_CHARS must be a non-negative integer")
+    return budget
+
 WORKDIR = Path.cwd()
+PROMPT_BUDGET_CHARS = _prompt_budget_from_env()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ.get("MODEL_ID")
 if not MODEL:
@@ -110,6 +124,9 @@ class PromptSegment:
     - builder: function that returns str | None
     - condition: function that returns bool (default: always True)
     - priority: lower = earlier in the prompt (default: 50)
+    - required: a budget may never remove this segment
+    - budget_priority: higher-value optional segments win scarce budget
+    - provenance: source label retained in the assembly decision report
 
     If builder returns None, or condition returns False,
     the segment is not included.
@@ -118,11 +135,179 @@ class PromptSegment:
     builder: Callable[[], str | None]
     condition: Callable[[], bool] = field(default=lambda: True)
     priority: int = 50
+    required: bool = False
+    budget_priority: int = 50
+    provenance: str = "runtime"
 
     def build(self) -> str | None:
         if not self.condition():
             return None
         return self.builder()
+
+
+PROMPT_SEPARATOR = "\n\n---\n\n"
+
+
+class PromptBudgetError(ValueError):
+    """Raised when required prompt segments cannot fit the configured budget."""
+
+
+@dataclass(frozen=True)
+class SegmentDecision:
+    """One explainable include/drop decision made by the budget planner."""
+
+    name: str
+    priority: int
+    required: bool
+    budget_priority: int
+    provenance: str
+    status: str
+    original_chars: int
+    rendered_chars: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class PromptPlan:
+    """Rendered prompt plus the decisions that produced it."""
+
+    prompt: str
+    budget_chars: int | None
+    used_chars: int
+    decisions: tuple[SegmentDecision, ...]
+
+    @property
+    def included_names(self) -> tuple[str, ...]:
+        return tuple(
+            decision.name for decision in self.decisions
+            if decision.status == "included"
+        )
+
+    @property
+    def dropped_names(self) -> tuple[str, ...]:
+        return tuple(
+            decision.name for decision in self.decisions
+            if decision.status == "dropped"
+        )
+
+
+def _rendered_length(contents: list[str]) -> int:
+    if not contents:
+        return 0
+    return sum(len(content) for content in contents) + (
+        len(contents) - 1
+    ) * len(PROMPT_SEPARATOR)
+
+
+def plan_prompt(
+    segments: list[PromptSegment],
+    *,
+    budget_chars: int | None = DEFAULT_PROMPT_BUDGET_CHARS,
+) -> PromptPlan:
+    """Build and select prompt segments under an explicit character budget.
+
+    Required segments are admitted first. Optional segments are considered by
+    descending ``budget_priority`` with stable presentation priority/name tie
+    breaks. Selected content is finally rendered by presentation ``priority``.
+
+    A segment is an atomic trust/provenance block: the planner drops an
+    optional block in full instead of silently slicing memory or instructions.
+    Builders may create their own compact projection before this boundary.
+    """
+    if budget_chars is not None and budget_chars < 0:
+        raise ValueError("budget_chars must be non-negative or None")
+    names = [segment.name for segment in segments]
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise ValueError(
+            "duplicate prompt segment names: " + ", ".join(duplicate_names)
+        )
+
+    built: list[tuple[PromptSegment, str]] = []
+    for segment in segments:
+        content = segment.build()
+        if content:
+            built.append((segment, content))
+
+    required = [(segment, content) for segment, content in built if segment.required]
+    optional = [(segment, content) for segment, content in built if not segment.required]
+    selected: dict[str, tuple[PromptSegment, str]] = {
+        segment.name: (segment, content) for segment, content in required
+    }
+
+    required_contents = [
+        content for _, content in sorted(
+            required, key=lambda item: (item[0].priority, item[0].name)
+        )
+    ]
+    required_chars = _rendered_length(required_contents)
+    if budget_chars is not None and required_chars > budget_chars:
+        required_names = ", ".join(segment.name for segment, _ in required)
+        raise PromptBudgetError(
+            f"required prompt segments need {required_chars} chars, "
+            f"but budget is {budget_chars}: {required_names}"
+        )
+
+    rejected: dict[str, str] = {}
+    for segment, content in sorted(
+        optional,
+        key=lambda item: (-item[0].budget_priority, item[0].priority, item[0].name),
+    ):
+        candidate = list(selected.values()) + [(segment, content)]
+        ordered_contents = [
+            value for _, value in sorted(
+                candidate, key=lambda item: (item[0].priority, item[0].name)
+            )
+        ]
+        candidate_chars = _rendered_length(ordered_contents)
+        if budget_chars is None or candidate_chars <= budget_chars:
+            selected[segment.name] = (segment, content)
+        else:
+            rejected[segment.name] = (
+                f"needs {candidate_chars} chars after higher-value segments; "
+                f"budget is {budget_chars}"
+            )
+
+    ordered_selected = sorted(
+        selected.values(), key=lambda item: (item[0].priority, item[0].name)
+    )
+    prompt = PROMPT_SEPARATOR.join(content for _, content in ordered_selected)
+
+    decisions: list[SegmentDecision] = []
+    built_by_identity = {id(segment): content for segment, content in built}
+    for segment in sorted(segments, key=lambda item: (item.priority, item.name)):
+        built_content = built_by_identity.get(id(segment))
+        if built_content is None:
+            decisions.append(SegmentDecision(
+                name=segment.name, priority=segment.priority,
+                required=segment.required, budget_priority=segment.budget_priority,
+                provenance=segment.provenance, status="inactive",
+                original_chars=0, rendered_chars=0,
+                reason="condition false or builder returned empty content",
+            ))
+        elif segment.name in selected:
+            decisions.append(SegmentDecision(
+                name=segment.name, priority=segment.priority,
+                required=segment.required, budget_priority=segment.budget_priority,
+                provenance=segment.provenance, status="included",
+                original_chars=len(built_content), rendered_chars=len(built_content),
+                reason="required segment" if segment.required else "fits budget by value order",
+            ))
+        else:
+            decisions.append(SegmentDecision(
+                name=segment.name, priority=segment.priority,
+                required=segment.required, budget_priority=segment.budget_priority,
+                provenance=segment.provenance, status="dropped",
+                original_chars=len(built_content), rendered_chars=0,
+                reason=rejected[segment.name],
+            ))
+
+    return PromptPlan(
+        prompt=prompt,
+        budget_chars=budget_chars,
+        used_chars=len(prompt),
+        decisions=tuple(decisions),
+    )
 
 
 # ======================================================================
@@ -284,52 +469,85 @@ def build_work_mode() -> str:
 # ======================================================================
 
 SEGMENTS: list[PromptSegment] = [
-    PromptSegment("base", build_base_instructions, priority=10),
-    PromptSegment("identity", build_identity, priority=20),
-    PromptSegment("memory", build_cloud_memory, priority=25),
-    PromptSegment("project", build_project_context, priority=30),
-    PromptSegment("tools", build_tool_descriptions, priority=40),
+    PromptSegment(
+        "base", build_base_instructions, priority=10, required=True,
+        provenance="harness:base-rules",
+    ),
+    PromptSegment(
+        "identity", build_identity, priority=20, budget_priority=90,
+        provenance="user:persona",
+    ),
+    PromptSegment(
+        "memory", build_cloud_memory, priority=25, budget_priority=60,
+        provenance="remote:profile-recall",
+    ),
+    PromptSegment(
+        "project", build_project_context, priority=30, budget_priority=80,
+        provenance="workspace:project-context",
+    ),
+    PromptSegment(
+        "tools", build_tool_descriptions, priority=40, required=True,
+        provenance="harness:tool-registry",
+    ),
     PromptSegment("expert", build_expert_instructions,
-                  condition=lambda: active_expert is not None, priority=50),
+                  condition=lambda: active_expert is not None, priority=50,
+                  budget_priority=85, provenance="runtime:active-expert"),
     PromptSegment("skills", build_skill_instructions,
-                  condition=lambda: len(loaded_skills) > 0, priority=55),
+                  condition=lambda: len(loaded_skills) > 0, priority=55,
+                  budget_priority=75, provenance="runtime:loaded-skills"),
     PromptSegment("connectors", build_connector_status,
-                  condition=lambda: len(connectors) > 0, priority=60),
-    PromptSegment("region", build_regional_conventions, priority=70),
-    PromptSegment("mode", build_work_mode, priority=80),
+                  condition=lambda: len(connectors) > 0, priority=60,
+                  budget_priority=40, provenance="runtime:connectors"),
+    PromptSegment(
+        "region", build_regional_conventions, priority=70,
+        budget_priority=20, provenance="runtime:region",
+    ),
+    PromptSegment(
+        "mode", build_work_mode, priority=80, required=True,
+        provenance="harness:work-mode",
+    ),
 ]
 
 
-def assemble_system_prompt(verbose: bool = False) -> str:
+LAST_PROMPT_PLAN: PromptPlan | None = None
+
+
+def assemble_system_prompt(
+    verbose: bool = False,
+    *,
+    budget_chars: int | None = None,
+) -> str:
     """Assemble system prompt from segments.
 
-    1. Sort segments by priority
-    2. Build each segment (check condition)
-    3. Filter out None results
-    4. Join with separator
+    1. Build each segment and keep its provenance
+    2. Reserve required segments
+    3. Select optional segments by budget value
+    4. Render selected segments in presentation order
     """
-    sorted_segments = sorted(SEGMENTS, key=lambda s: s.priority)
-
-    parts = []
-    segment_info = []
-    for seg in sorted_segments:
-        content = seg.build()
-        included = content is not None
-        segment_info.append((seg.name, seg.priority, included,
-                            len(content) if content else 0))
-        if content:
-            parts.append(content)
+    global LAST_PROMPT_PLAN
+    if budget_chars is None:
+        budget_chars = PROMPT_BUDGET_CHARS
+    LAST_PROMPT_PLAN = plan_prompt(SEGMENTS, budget_chars=budget_chars)
 
     if verbose:
-        print(f"\n\033[90m{'片段':<15} {'优先级':>6} {'包含':>6} {'长度':>8}\033[0m")
-        print(f"\033[90m{'─'*15} {'─'*6} {'─'*6} {'─'*8}\033[0m")
-        for name, pri, inc, length in segment_info:
-            mark = "✓" if inc else "✗"
-            print(f"\033[90m{name:<15} {pri:>6} {mark:>6} {length:>8}\033[0m")
-        total = sum(l for _, _, i, l in segment_info if i)
-        print(f"\033[90m{'总计':<15} {'':>6} {'':>6} {total:>8}\033[0m\n")
+        print(
+            f"\n\033[90m{'segment':<12} {'order':>5} {'value':>5} "
+            f"{'status':>9} {'chars':>7} source / reason\033[0m"
+        )
+        for decision in LAST_PROMPT_PLAN.decisions:
+            print(
+                f"\033[90m{decision.name:<12} {decision.priority:>5} "
+                f"{decision.budget_priority:>5} {decision.status:>9} "
+                f"{decision.rendered_chars:>7} {decision.provenance} / "
+                f"{decision.reason}\033[0m"
+            )
+        budget = "unbounded" if budget_chars is None else f"{budget_chars:,}"
+        print(
+            f"\033[90mused {LAST_PROMPT_PLAN.used_chars:,} / {budget} chars; "
+            f"dropped={list(LAST_PROMPT_PLAN.dropped_names)}\033[0m\n"
+        )
 
-    return "\n\n---\n\n".join(parts)
+    return LAST_PROMPT_PLAN.prompt
 
 
 # ======================================================================

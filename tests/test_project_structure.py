@@ -174,7 +174,7 @@ def test_all_images_are_referenced_from_markdown(root: Path) -> None:
         if not is_skipped(path)
     )
     missing = [path.relative_to(root).as_posix() for path in images if path.name not in markdown]
-    assert len(images) == 28
+    assert len(images) == 29
     assert missing == []
 
 

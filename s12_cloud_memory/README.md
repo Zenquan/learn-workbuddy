@@ -257,6 +257,17 @@ s09 transcript 可以成为 s12 StoredMemory 的 source，但“有 transcript�
 - Recall 多次执行：不会改变 durable store；
 - Profile snapshot：只用于 profile selection，不混入 conversation hits。
 
+## 无 key 组合边界
+
+`RemoteMemoryStore`、`RecallEngine` 和 context renderer 都是纯本地机制。导入这些类型时不应要求模型配置，也不应因为 import 就向默认目录写 seed records。因此在线副作用分成两个延迟入口：
+
+```text
+default_runtime()  -> 首次运行交互 CLI 或 recall_history 时创建教学 store
+runtime_client()   -> online agent_loop 真正请求模型时才校验 MODEL_ID
+```
+
+这让其他章节和 [Layered Memory Walkthrough](../examples/layered_memory_walkthrough/) 可以直接复用 S12 的存储与召回契约，而不需要伪造 API key。章节 CLI 的行为不变：真正进入 online loop 时，缺少模型配置仍会明确失败。
+
 ## 离线验证
 
 新增测试覆盖：
@@ -268,6 +279,7 @@ s09 transcript 可以成为 s12 StoredMemory 的 source，但“有 transcript�
 - 跨用户 scope 文件拒绝；
 - Prompt context 保留 query/source/score；
 - 工具输出是结构化 JSON，而非预格式化历史文本。
+- 导入 S12 时不构造 provider client，也不创建默认 store。
 
 运行：
 

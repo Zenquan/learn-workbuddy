@@ -64,6 +64,24 @@ def _source(s12, source_id: str, day: int, *, source_type: str = "transcript"):
     )
 
 
+def test_import_keeps_provider_and_default_store_lazy(s12) -> None:
+    assert s12.client is None
+    assert s12.DEFAULT_STORE is None
+    assert s12.DEFAULT_RECALL is None
+    assert s12.SYSTEM is None
+
+
+def test_provider_config_is_checked_only_at_online_boundary(
+    s12, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MODEL_ID", raising=False)
+    monkeypatch.setattr(s12, "MODEL", None)
+    monkeypatch.setattr(s12, "client", None)
+
+    with pytest.raises(RuntimeError, match="MODEL_ID is not set"):
+        s12.runtime_client()
+
+
 def test_stored_memory_keeps_source_and_survives_restart(s12, tmp_path: Path) -> None:
     path = tmp_path / "records.jsonl"
     writer = s12.RemoteMemoryStore(path, user_id="alice")
@@ -252,8 +270,21 @@ def test_rendered_context_preserves_query_source_and_score(s12, tmp_path: Path) 
     assert 'score="' in context
 
 
-def test_tool_payload_is_structured_json_not_preformatted_history(s12, monkeypatch) -> None:
-    monkeypatch.setattr(s12, "DEFAULT_RECALL", s12.RecallEngine(s12.DEFAULT_STORE))
+def test_tool_payload_is_structured_json_not_preformatted_history(
+    s12, monkeypatch, tmp_path: Path
+) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "tool-records.jsonl", user_id="alice")
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-tool-1",
+        content="Layered memory keeps query and source contracts explicit.",
+        summary="Layered memory source contracts.",
+        source=_source(s12, "transcript-tool-1", 9),
+        stored_at=_time(9),
+    )
+    monkeypatch.setattr(s12, "DEFAULT_STORE", store)
+    monkeypatch.setattr(s12, "DEFAULT_RECALL", s12.RecallEngine(store))
+    monkeypatch.setattr(s12, "SYSTEM", None)
 
     payload = json.loads(s12.recall_history("layered memory design", limit=2))
 

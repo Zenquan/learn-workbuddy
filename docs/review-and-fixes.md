@@ -4,7 +4,7 @@
 
 ## 总体评价
 
-项目底子很好：24 章渐进链路 + `PROGRESSION` 元数据契约、`mini_workbuddy` 可运行 runtime、clean-room 扫描、CI、27 张 SVG 配图和每章 Mermaid 架构图，工程完整度已经达到甚至超过多数同类"从零构建"教程。对标 learn-claude-code，缺的不是规模而是几个**正确性与诚实性**的细节。本文件记录已经落地的修复，以及仍需单独推进的缺口。
+项目底子很好：24 章渐进链路 + `PROGRESSION` 元数据契约、`mini_workbuddy` 可运行 runtime、clean-room 扫描、CI、28 张 SVG 配图和每章 Mermaid 架构图，工程完整度已经达到甚至超过多数同类"从零构建"教程。对标 learn-claude-code，缺的不是规模而是几个**正确性与诚实性**的细节。本文件记录已经落地的修复，以及仍需单独推进的缺口。
 
 ## 修复的 Bug（按严重度）
 
@@ -45,7 +45,7 @@ demo 在模块顶层 `from anthropic import Anthropic`，导致声称"无需 API
 
 ### 6. [低] 文档数字不一致
 
-`docs/code-quality-review.md` 写"37 个架构图"，实际是 27 张 SVG + 每章 mermaid。已更正为准确表述。
+`docs/code-quality-review.md` 曾写"37 个架构图"；当时实际是 27 张 SVG + 每章 Mermaid，现已增加为 28 张 SVG。已更正为准确表述。
 
 ## 新增测试（自动化）
 

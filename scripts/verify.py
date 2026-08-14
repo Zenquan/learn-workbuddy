@@ -211,6 +211,30 @@ def run_offline_demos() -> None:
             ],
             timeout=30,
         )
+        layered_output = run_capture(
+            [
+                sys.executable,
+                "examples/layered_memory_walkthrough/code.py",
+                "--home",
+                str(Path(tmp) / "layered-memory"),
+            ],
+            env=env,
+            timeout=30,
+        )
+        layered_required = [
+            "Transcript evidence",
+            "User preference dedup and isolation",
+            "Compaction boundary",
+            "RESULT: OK",
+        ]
+        layered_missing = [
+            item for item in layered_required if item not in layered_output
+        ]
+        if layered_missing:
+            raise SystemExit(
+                "Layered memory walkthrough missing markers: "
+                + ", ".join(layered_missing)
+            )
         required = [
             "tool directory:",
             "permission denial:",
@@ -325,7 +349,7 @@ def check_project_shape() -> None:
         text = readme.read_text(encoding="utf-8")
         if "## 代码架构图" not in text or "```mermaid" not in text:
             readme_diagram_missing.append(readme.relative_to(ROOT).as_posix())
-    if missing or missing_images or bad_readmes or readme_diagram_missing or len(images) != 27:
+    if missing or missing_images or bad_readmes or readme_diagram_missing or len(images) != 28:
         raise SystemExit(
             "Project shape failed:\n"
             + "\n".join(missing)

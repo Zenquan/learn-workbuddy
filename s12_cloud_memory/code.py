@@ -83,12 +83,27 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 
 WORKDIR = Path.cwd()
 MODEL = os.environ.get("MODEL_ID")
-if not MODEL:
-    raise SystemExit(
-        "MODEL_ID is not set. Copy .env.example to .env and fill in "
-        "ANTHROPIC_API_KEY and MODEL_ID (see README quick start)."
-    )
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client: Anthropic | None = None
+
+
+def runtime_client() -> tuple[Anthropic, str]:
+    """Create the provider client only when the online loop actually needs it.
+
+    Storage, recall, rendering, and cross-chapter walkthroughs are pure local
+    contracts.  Requiring a provider key while importing those types would
+    make an otherwise keyless lesson impossible to compose or test.
+    """
+
+    global client
+    model = os.environ.get("MODEL_ID") or MODEL
+    if not model:
+        raise RuntimeError(
+            "MODEL_ID is not set. Copy .env.example to .env and fill in "
+            "the provider key and MODEL_ID (see README quick start)."
+        )
+    if client is None:
+        client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+    return client, model
 
 
 SCHEMA_VERSION = 1
@@ -605,15 +620,35 @@ def create_default_store() -> RemoteMemoryStore:
     return store
 
 
-DEFAULT_STORE = create_default_store()
-DEFAULT_RECALL = RecallEngine(DEFAULT_STORE)
-SYSTEM = build_system_prompt(DEFAULT_STORE)
+DEFAULT_STORE: RemoteMemoryStore | None = None
+DEFAULT_RECALL: RecallEngine | None = None
+SYSTEM: str | None = None
+
+
+def default_runtime() -> tuple[RemoteMemoryStore, RecallEngine, str]:
+    """Initialize seeded interactive state on first use, never on import.
+
+    The chapter CLI still receives the same deterministic seed data.  Library
+    users can import the storage and recall types without writing to a default
+    home directory merely as a side effect of inspection.
+    """
+
+    global DEFAULT_STORE, DEFAULT_RECALL, SYSTEM
+    if DEFAULT_STORE is None:
+        DEFAULT_STORE = create_default_store()
+    if DEFAULT_RECALL is None or DEFAULT_RECALL.store is not DEFAULT_STORE:
+        DEFAULT_RECALL = RecallEngine(DEFAULT_STORE)
+    # Prompt assembly is a view, not durable state. Rebuild it so a profile
+    # written since the previous turn cannot leave the online loop stale.
+    SYSTEM = build_system_prompt(DEFAULT_STORE)
+    return DEFAULT_STORE, DEFAULT_RECALL, SYSTEM
 
 
 def recall_history(query: str, limit: int = 5) -> str:
     """Tool adapter returning structured query, hit, source, and score fields."""
 
-    result = DEFAULT_RECALL.recall(query, limit=int(limit))
+    _store, recall, _system = default_runtime()
+    result = recall.recall(query, limit=int(limit))
     return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
 
 
@@ -707,10 +742,12 @@ TOOL_HANDLERS = {
 def agent_loop(messages: list[dict]) -> None:
     """Run the standard tool loop with structured recall as one tool."""
 
+    active_client, model = runtime_client()
+    _store, _recall, system = default_runtime()
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
+        response = active_client.messages.create(
+            model=model,
+            system=system,
             messages=messages,
             tools=TOOLS,
             max_tokens=8_000,
@@ -738,10 +775,11 @@ def agent_loop(messages: list[dict]) -> None:
 
 
 def main() -> None:
+    store, _recall, _system = default_runtime()
     print("s12: Remote Memory — stored records vs recalled context")
-    print(f"user scope: {DEFAULT_STORE.user_scope}")
-    print(f"durable store: {DEFAULT_STORE.path}")
-    profile = DEFAULT_STORE.latest_profile()
+    print(f"user scope: {store.user_scope}")
+    print(f"durable store: {store.path}")
+    profile = store.latest_profile()
     if profile:
         print(
             "profile snapshot: "

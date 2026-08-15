@@ -13,11 +13,15 @@ flowchart LR
     A["Tool / Agent outcome"] --> B["validate MemoryFact"]
     B --> C["daily/*.jsonl append"]
     C --> D["DistillPolicy gate"]
-    D -->|"important or repeated"| E["curated.json"]
+    D -->|"important or repeated"| E["group by memory_key"]
     D -->|"not stable"| C
-    E --> F["MEMORY.md projection"]
+    E --> H{"one strongest newer value?"}
+    H -->|"yes"| I["new active revision"]
+    H -->|"tie / stale"| C
+    I --> J["curated.json history"]
+    J --> F["active-only MEMORY.md"]
     F --> G["bounded prompt context"]
-    C -. "evidence retained" .-> E
+    C -. "evidence retained" .-> J
 ```
 
 ## 本章设计目标
@@ -27,6 +31,8 @@ s09 的 JSONL transcript 属于某个 session，是完整执行证据；本章�
 - 同一项目的不同会话可以恢复同一份记忆；不同项目绝不串线。
 - 原始事实只追加，蒸馏不会删除证据。
 - 只有稳定、足够旧且重要或重复出现的事实进入长期视图。
+- 可替换的项目决策使用显式 `memory_key` 形成冲突域，新值只会在重复确认且时间更新时替代旧值。
+- 被替代的修订和原始证据继续保留，prompt 只注入每个冲突域的 active 修订。
 - 策展状态通过原子替换更新，失败时仍保留上一份完整文件。
 - 不依赖 API key 就能验证记忆策略。
 
@@ -64,6 +70,7 @@ memory.append_daily_log(
     "SQLite must run in WAL mode.",
     kind=FactKind.DECISION,
     importance=5,
+    memory_key="storage.sqlite.journal-mode",
     source="agent",
     evidence={"file": "storage.py"},
 )
@@ -80,6 +87,8 @@ memory.append_daily_log(
 
 内容、重要度和类型在持久化之前验证。每个 JSON 对象编码为一行，再以一次 `os.write` 追加；成功返回前执行 `fsync`。
 
+`memory_key` 是可选的、由 harness 或工具调用者显式提供的稳定冲突域，只允许小写单词以及 `.`、`_`、`-` 分隔符，例如 `runtime.python-version`。它描述“这条记忆回答哪个问题”，而不是答案本身：`Use Python 3.11` 和 `Use Python 3.12` 可以共享同一个 key。未设置该字段的旧调用继续使用内容派生 key，不会被升级过程猜测或合并。
+
 ### 2. 通过显式策略蒸馏
 
 默认策略的逻辑是：
@@ -92,7 +101,15 @@ AND (importance >= 4 OR 规范化后重复出现 >= 2 次)
 
 这套规则刻意不让 LLM 直接决定“什么值得永远记住”。生产系统可以在候选提取阶段使用模型，但保留条件、作用域和证据关系仍应由 harness 控制。
 
-每条策展记忆的 key 由 `kind + 规范化内容` 稳定生成，`evidence_ids` 指向原始事实。因此重复运行 distill 是幂等的，新证据只会更新同一个条目。
+无 `memory_key` 的策展记忆仍由 `kind + 规范化内容` 生成稳定 key。显式 keyed 记忆则先按 `memory_key` 建立冲突域，再按以下规则处理：
+
+1. 与 active 内容相同的新事实只合并 `evidence_ids`，不会产生新修订。
+2. 不同内容必须同时通过普通晋升门槛，并至少有 `supersession_repeat_threshold` 条独立事实确认；默认值为 2，即单条高重要度事实也不能直接覆盖现有决策。
+3. 候选的最新时间必须晚于 active 修订的 `last_seen`，过期证据不能回滚当前值。
+4. 多个候选按重要度、独立证据数和最新时间排序；最优分数相同时 fail closed，保留当前修订并在报告中增加 `conflicts`。
+5. 唯一胜出者成为下一版 active 修订；旧版标记为 `superseded`，双方通过 `supersedes` / `superseded_by` 互相指向。
+
+每条修订都保留 `revision` 和 `evidence_ids`，因此重复运行 `distill` 是幂等的，完整决策历史也可审计。`DistillReport` 额外报告 `superseded`、`conflicts` 与 `stale`，让拒绝覆盖的原因可观察。
 
 ### 3. 保留原始证据
 
@@ -119,6 +136,8 @@ Windows 的回退仍会在替换前完整写入、刷新并同步临时文件，
 
 `curated.json` 是 canonical state，`MEMORY.md` 是可重建投影。如果进程在两次替换之间退出，下一次读取会以 canonical state 修复陈旧投影。新建一个 `WorkspaceMemory(project_dir)` 实例即可从磁盘恢复事实、策展条目和 prompt context；不会反序列化任何进程内对象。
 
+当前 schema 为 v2；读取器仍接受 v1 daily fact 和 curated state。旧条目按无 key 的 legacy 语义恢复，在下一次成功蒸馏写入时统一保存为 v2，而不会自动推断冲突域。读取 keyed 状态时还会校验每个域恰好一个 active 修订、修订号连续、前后链接互相匹配；损坏状态会显式报错，不会静默选择一个答案。
+
 ## Prompt 注入边界
 
 `get_context_for_agent()` 只注入两部分：
@@ -126,7 +145,7 @@ Windows 的回退仍会在替换前完整写入、刷新并同步临时文件，
 - 紧凑的 `MEMORY.md`；
 - 最近最多 6 条 workspace facts。
 
-它不会把所有 daily log 或 session transcript 整体塞回上下文。Memory 的价值不在“存得越多”，而在召回时有明确预算和优先级。
+它不会把所有 daily log 或 session transcript 整体塞回上下文。Keyed 原始事实在完成蒸馏前也不会作为 recent facts 绕过冲突策略；prompt 只能看到每个冲突域当前的 active 修订。Memory 的价值不在“存得越多”，而在召回时有明确预算和优先级。
 
 `MemoryAwareAgent` 在每个模型回合前读取这个 bounded view，并提供结构化 `write_memory` 工具。是否继续工具循环由响应中的 `tool_use` block 决定，不依赖 provider 的某个 stop-reason 字符串。
 
@@ -134,16 +153,17 @@ Windows 的回退仍会在替换前完整写入、刷新并同步临时文件，
 
 ```text
 append_daily_log
-  -> validate kind / importance / content
+  -> validate kind / importance / content / optional memory_key
   -> attach workspace_id + fact_id + UTC timestamp
   -> append one JSONL record + fsync
 
 distill
   -> load facts older than cutoff
   -> reject unstable kinds
-  -> group normalized repeated facts
+  -> preserve legacy content groups; group keyed facts by conflict domain
   -> apply importance/repetition gate
-  -> merge by deterministic key and evidence id
+  -> reject stale or tied challengers
+  -> merge evidence or append a linked revision
   -> atomically replace curated.json and MEMORY.md
 
 restart
@@ -167,7 +187,7 @@ python3 s10_workspace_memory/code.py --demo
 python3 -m pytest -q tests/test_workspace_memory.py
 ```
 
-测试覆盖：项目隔离、追加顺序、蒸馏门槛、幂等、证据保留、原子替换失败和跨实例恢复。
+测试覆盖：项目隔离、追加顺序、蒸馏门槛、幂等、证据保留、原子替换失败、key 校验、新值确认、冲突 fail closed、过期证据防回滚、修订链校验、v1 迁移和跨实例恢复。
 
 配置模型后可运行交互路径：
 
@@ -189,11 +209,14 @@ python3 s10_workspace_memory/code.py
 - **直接覆盖策展文件**：崩溃可能损坏长期状态。
 - **只按字符串路径隔离**：相对路径、软链接可能让同一项目得到多个 scope。
 - **把一次测试通过写成长期规则**：outcome 应留在近期日志，不自动晋升。
+- **用答案文本充当 `memory_key`**：值改变时会变成另一个冲突域，失去替代关系；key 应描述稳定问题，例如 `runtime.python-version`。
+- **让单条新事实覆盖已有决策**：高重要度不等于已确认，替代必须满足独立重复证据门槛。
+- **把所有候选都注入 prompt 再让模型选择**：这会绕过 harness 的冲突策略；未决候选应留在证据日志中。
 
 ## 练习
 
 1. 为 `DistillPolicy` 增加来源置信度，让用户确认的事实比工具推断更容易晋升。
-2. 为 curated entry 增加 supersedes 关系，处理“旧决策被新决策替代”。
+2. 为冲突报告增加待人工裁决队列，并设计显式选择某个候选的审计记录。
 3. 在不加载全部日志的前提下实现按日期倒序读取最近事实。
 
 ## 下一课

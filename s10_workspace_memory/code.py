@@ -40,6 +40,7 @@ PROGRESSION = {
     "adds": [
         "workspace-scoped fact log",
         "policy-driven memory distillation",
+        "keyed memory supersession",
         "atomic curated memory view",
     ],
     "preserves": ["append-only evidence and restart recovery"],
@@ -76,10 +77,14 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_FACT_SCHEMAS = frozenset({1, SCHEMA_VERSION})
+SUPPORTED_CURATED_SCHEMAS = frozenset({1, SCHEMA_VERSION})
 DEFAULT_RETENTION_DAYS = 30
 MAX_FACT_CHARS = 2_000
 MAX_CONTEXT_FACTS = 6
+MAX_MEMORY_KEY_CHARS = 120
+MEMORY_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 WORKDIR = Path.cwd()
 _DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 
@@ -128,6 +133,13 @@ class FactKind(str, Enum):
     OUTCOME = "outcome"
 
 
+class CuratedStatus(str, Enum):
+    """Lifecycle state for one immutable curated revision."""
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+
+
 @dataclass(frozen=True)
 class MemoryFact:
     """One immutable fact in a workspace's append-only daily log."""
@@ -141,6 +153,7 @@ class MemoryFact:
     importance: int = 3
     evidence: Mapping[str, str] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
+    memory_key: str | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "MemoryFact":
@@ -151,6 +164,11 @@ class MemoryFact:
                 recorded_at=str(payload["recorded_at"]),
                 kind=str(payload["kind"]),
                 content=str(payload["content"]),
+                memory_key=(
+                    None
+                    if payload.get("memory_key") in (None, "")
+                    else _clean_memory_key(str(payload["memory_key"]))
+                ),
                 source=str(payload.get("source", "agent")),
                 importance=int(payload.get("importance", 3)),
                 evidence=dict(payload.get("evidence") or {}),
@@ -167,6 +185,7 @@ class DistillPolicy:
     minimum_age_days: int = DEFAULT_RETENTION_DAYS
     minimum_importance: int = 4
     repeat_threshold: int = 2
+    supersession_repeat_threshold: int = 2
     stable_kinds: frozenset[str] = frozenset(
         {FactKind.DECISION.value, FactKind.CONVENTION.value, FactKind.PITFALL.value}
     )
@@ -178,6 +197,8 @@ class DistillPolicy:
             raise ValueError("minimum_importance must be between 1 and 5")
         if self.repeat_threshold < 1:
             raise ValueError("repeat_threshold must be >= 1")
+        if self.supersession_repeat_threshold < 2:
+            raise ValueError("supersession_repeat_threshold must be >= 2")
 
 
 @dataclass
@@ -191,11 +212,27 @@ class CuratedMemoryEntry:
     last_seen: str
     evidence_ids: list[str]
     occurrences: int
+    memory_key: str | None = None
+    revision: int = 1
+    status: str = CuratedStatus.ACTIVE.value
+    supersedes: str | None = None
+    superseded_by: str | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "CuratedMemoryEntry":
         try:
             evidence_ids = [str(item) for item in payload.get("evidence_ids", [])]
+            memory_key = payload.get("memory_key")
+            if memory_key not in (None, ""):
+                memory_key = _clean_memory_key(str(memory_key))
+            else:
+                memory_key = None
+            revision = int(payload.get("revision", 1))
+            status = str(payload.get("status", CuratedStatus.ACTIVE.value))
+            if revision < 1:
+                raise ValueError("revision must be >= 1")
+            if status not in {item.value for item in CuratedStatus}:
+                raise ValueError(f"unsupported curated status: {status}")
             return cls(
                 key=str(payload["key"]),
                 kind=str(payload["kind"]),
@@ -204,6 +241,19 @@ class CuratedMemoryEntry:
                 last_seen=str(payload["last_seen"]),
                 evidence_ids=evidence_ids,
                 occurrences=int(payload.get("occurrences", len(evidence_ids))),
+                memory_key=memory_key,
+                revision=revision,
+                status=status,
+                supersedes=(
+                    None
+                    if payload.get("supersedes") in (None, "")
+                    else str(payload["supersedes"])
+                ),
+                superseded_by=(
+                    None
+                    if payload.get("superseded_by") in (None, "")
+                    else str(payload["superseded_by"])
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise MemoryCorruptionError(f"invalid curated entry: {exc}") from exc
@@ -218,6 +268,9 @@ class DistillReport:
     created: int
     updated: int
     skipped: int
+    superseded: int = 0
+    conflicts: int = 0
+    stale: int = 0
 
 
 def _as_utc(value: datetime | None) -> datetime:
@@ -241,9 +294,49 @@ def _normal_form(content: str) -> str:
     return re.sub(r"\s+", " ", content).strip().casefold()
 
 
-def _entry_key(kind: str, content: str) -> str:
-    material = f"{kind}\0{_normal_form(content)}".encode("utf-8")
-    return hashlib.sha256(material).hexdigest()[:16]
+def _clean_memory_key(value: str) -> str:
+    """Normalize one explicit conflict domain before it reaches durable state."""
+
+    key = value.strip().casefold()
+    if not key:
+        raise ValueError("memory_key must not be empty")
+    if len(key) > MAX_MEMORY_KEY_CHARS:
+        raise ValueError(f"memory_key exceeds {MAX_MEMORY_KEY_CHARS} characters")
+    if not MEMORY_KEY_PATTERN.fullmatch(key):
+        raise ValueError(
+            "memory_key must use lowercase words separated by '.', '_' or '-'"
+        )
+    return key
+
+
+def _entry_key(
+    kind: str,
+    content: str,
+    *,
+    memory_key: str | None = None,
+    revision: int = 1,
+) -> str:
+    if memory_key is None:
+        material = f"{kind}\0{_normal_form(content)}"
+    else:
+        material = (
+            f"{memory_key}\0revision:{revision}\0{kind}\0{_normal_form(content)}"
+        )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _proposal_signature(fact: MemoryFact) -> tuple[str, str]:
+    return fact.kind, _normal_form(fact.content)
+
+
+def _proposal_score(facts: list[MemoryFact]) -> tuple[int, int, datetime]:
+    """Prefer stronger evidence; use recency only after importance and count."""
+
+    return (
+        max(fact.importance for fact in facts),
+        len({fact.fact_id for fact in facts}),
+        max(_parse_timestamp(fact.recorded_at) for fact in facts),
+    )
 
 
 class WorkspaceMemory:
@@ -289,6 +382,7 @@ class WorkspaceMemory:
         importance: int = 3,
         source: str = "agent",
         evidence: Mapping[str, str] | None = None,
+        memory_key: str | None = None,
         recorded_at: datetime | None = None,
         fact_id: str | None = None,
     ) -> MemoryFact:
@@ -314,12 +408,16 @@ class WorkspaceMemory:
             raise ValueError(f"unknown fact kind: {kind_value}")
 
         timestamp = _as_utc(recorded_at)
+        normalized_memory_key = (
+            None if memory_key is None else _clean_memory_key(memory_key)
+        )
         fact = MemoryFact(
             fact_id=fact_id or uuid.uuid4().hex,
             workspace_id=self.workspace_id,
             recorded_at=timestamp.isoformat().replace("+00:00", "Z"),
             kind=kind_value,
             content=text,
+            memory_key=normalized_memory_key,
             source=source,
             importance=importance,
             evidence=dict(evidence or {}),
@@ -358,7 +456,7 @@ class WorkspaceMemory:
                     break
                 raise MemoryCorruptionError(f"{path.name}:{index}: invalid JSON") from exc
             fact = MemoryFact.from_dict(payload)
-            if fact.schema_version != SCHEMA_VERSION:
+            if fact.schema_version not in SUPPORTED_FACT_SCHEMAS:
                 raise MemoryCorruptionError(
                     f"{path.name}:{index}: unsupported schema {fact.schema_version}"
                 )
@@ -411,15 +509,100 @@ class WorkspaceMemory:
             raise MemoryCorruptionError("curated.json is not valid JSON") from exc
         if payload.get("workspace_id") != self.workspace_id:
             raise MemoryScopeError("curated memory belongs to another workspace")
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        if payload.get("schema_version") not in SUPPORTED_CURATED_SCHEMAS:
             raise MemoryCorruptionError("unsupported curated memory schema")
-        return [CuratedMemoryEntry.from_dict(item) for item in payload.get("entries", [])]
+        entries = [
+            CuratedMemoryEntry.from_dict(item)
+            for item in payload.get("entries", [])
+        ]
+        self._validate_curated(entries)
+        return entries
+
+    @staticmethod
+    def _validate_curated(entries: list[CuratedMemoryEntry]) -> None:
+        """Reject ambiguous or broken lifecycle graphs before prompt projection."""
+
+        by_key = {entry.key: entry for entry in entries}
+        if len(by_key) != len(entries):
+            raise MemoryCorruptionError("curated entry keys must be unique")
+        active_by_memory_key: dict[str, CuratedMemoryEntry] = {}
+        for entry in entries:
+            if entry.occurrences != len(set(entry.evidence_ids)):
+                raise MemoryCorruptionError(
+                    f"curated entry {entry.key} has inconsistent evidence count"
+                )
+            if entry.memory_key is None:
+                if (
+                    entry.revision != 1
+                    or entry.status != CuratedStatus.ACTIVE.value
+                    or entry.supersedes
+                    or entry.superseded_by
+                ):
+                    raise MemoryCorruptionError(
+                        f"legacy entry {entry.key} cannot have revision lifecycle"
+                    )
+                continue
+            if entry.memory_key is not None and entry.status == CuratedStatus.ACTIVE.value:
+                previous = active_by_memory_key.get(entry.memory_key)
+                if previous is not None:
+                    raise MemoryCorruptionError(
+                        f"multiple active revisions for memory_key {entry.memory_key}"
+                    )
+                active_by_memory_key[entry.memory_key] = entry
+            if entry.status == CuratedStatus.ACTIVE.value and entry.superseded_by:
+                raise MemoryCorruptionError(
+                    f"active entry {entry.key} cannot have superseded_by"
+                )
+            if entry.status == CuratedStatus.SUPERSEDED.value and not entry.superseded_by:
+                raise MemoryCorruptionError(
+                    f"superseded entry {entry.key} needs superseded_by"
+                )
+            if entry.revision == 1 and entry.supersedes:
+                raise MemoryCorruptionError(
+                    f"first revision {entry.key} cannot supersede another entry"
+                )
+            if entry.revision > 1 and not entry.supersedes:
+                raise MemoryCorruptionError(
+                    f"revision {entry.key} needs a supersedes link"
+                )
+        keyed_domains = {
+            entry.memory_key for entry in entries if entry.memory_key is not None
+        }
+        missing_active = sorted(keyed_domains - set(active_by_memory_key))
+        if missing_active:
+            raise MemoryCorruptionError(
+                "curated lifecycle has no active revision for: "
+                + ", ".join(missing_active)
+            )
+        for entry in entries:
+            if entry.superseded_by:
+                successor = by_key.get(entry.superseded_by)
+                if successor is None or successor.supersedes != entry.key:
+                    raise MemoryCorruptionError(
+                        f"entry {entry.key} has a broken superseded_by link"
+                    )
+            if entry.supersedes:
+                previous = by_key.get(entry.supersedes)
+                if previous is None or previous.superseded_by != entry.key:
+                    raise MemoryCorruptionError(
+                        f"entry {entry.key} has a broken supersedes link"
+                    )
+                if previous.memory_key != entry.memory_key:
+                    raise MemoryCorruptionError(
+                        f"entry {entry.key} supersedes another conflict domain"
+                    )
+                if entry.revision != previous.revision + 1:
+                    raise MemoryCorruptionError(
+                        f"entry {entry.key} has a non-contiguous revision"
+                    )
 
     def _render_memory(self, entries: Iterable[CuratedMemoryEntry]) -> str:
         groups: dict[str, list[CuratedMemoryEntry]] = {
             kind.value: [] for kind in FactKind if kind is not FactKind.OUTCOME
         }
         for entry in entries:
+            if entry.status != CuratedStatus.ACTIVE.value:
+                continue
             groups.setdefault(entry.kind, []).append(entry)
 
         labels = {
@@ -450,7 +633,16 @@ class WorkspaceMemory:
         return "\n".join(lines)
 
     def _save_curated(self, entries: list[CuratedMemoryEntry]) -> None:
-        ordered = sorted(entries, key=lambda item: (item.kind, item.key))
+        self._validate_curated(entries)
+        ordered = sorted(
+            entries,
+            key=lambda item: (
+                item.kind,
+                item.memory_key or "",
+                item.revision,
+                item.key,
+            ),
+        )
         payload = {
             "schema_version": SCHEMA_VERSION,
             "workspace_id": self.workspace_id,
@@ -486,10 +678,11 @@ class WorkspaceMemory:
     ) -> DistillReport:
         """Promote eligible facts without deleting their source evidence.
 
-        A stable fact becomes long-term memory when it is old enough and is
-        either explicitly important or independently repeated.  Existing
-        evidence ids make reruns idempotent.  Repeated observations update the
-        same deterministic entry instead of producing near-duplicate bullets.
+        Unkeyed facts preserve the original content-based behavior.  Facts
+        with ``memory_key`` share one conflict domain: repeated, newer evidence
+        may create a new active revision while the old revision and all source
+        facts remain available for audit.  Equal-strength proposals fail
+        closed instead of depending on filesystem or dictionary order.
         """
 
         active_policy = policy or DistillPolicy()
@@ -510,23 +703,48 @@ class WorkspaceMemory:
             for fact in aged
             if fact.kind in active_policy.stable_kinds and fact.fact_id not in processed_ids
         ]
-        groups: dict[str, list[MemoryFact]] = {}
-        for fact in candidates:
-            groups.setdefault(_entry_key(fact.kind, fact.content), []).append(fact)
 
         created = 0
         updated = 0
         eligible = 0
         skipped = len(aged) - len(candidates)
+        superseded = 0
+        conflicts = 0
+        stale = 0
         changed = False
-        for key, facts in groups.items():
-            current = by_key.get(key)
-            qualifies = (
-                current is not None
-                or max(fact.importance for fact in facts) >= active_policy.minimum_importance
+
+        def distinct(facts: list[MemoryFact]) -> list[MemoryFact]:
+            return list({fact.fact_id: fact for fact in facts}.values())
+
+        def qualifies(facts: list[MemoryFact]) -> bool:
+            return (
+                max(fact.importance for fact in facts)
+                >= active_policy.minimum_importance
                 or len(facts) >= active_policy.repeat_threshold
             )
-            if not qualifies:
+
+        def representative(facts: list[MemoryFact]) -> MemoryFact:
+            return max(
+                facts,
+                key=lambda fact: (
+                    fact.importance,
+                    _parse_timestamp(fact.recorded_at),
+                    fact.fact_id,
+                ),
+            )
+
+        # Legacy facts intentionally keep their original content-derived key.
+        # An upgrade must not infer conflict domains for existing workspaces.
+        legacy_groups: dict[str, list[MemoryFact]] = {}
+        for fact in candidates:
+            if fact.memory_key is None:
+                legacy_groups.setdefault(
+                    _entry_key(fact.kind, fact.content), []
+                ).append(fact)
+        for key in sorted(legacy_groups):
+            facts = distinct(legacy_groups[key])
+            current = by_key.get(key)
+            if current is None and not qualifies(facts):
                 skipped += len(facts)
                 continue
 
@@ -534,14 +752,20 @@ class WorkspaceMemory:
             timestamps = sorted(fact.recorded_at for fact in facts)
             new_ids = {fact.fact_id for fact in facts}
             if current is None:
-                representative = sorted(
+                # Preserve the original legacy projection: importance first,
+                # then the earliest stable wording for deterministic display.
+                chosen = min(
                     facts,
-                    key=lambda fact: (-fact.importance, fact.recorded_at, fact.fact_id),
-                )[0]
+                    key=lambda fact: (
+                        -fact.importance,
+                        _parse_timestamp(fact.recorded_at),
+                        fact.fact_id,
+                    ),
+                )
                 by_key[key] = CuratedMemoryEntry(
                     key=key,
-                    kind=representative.kind,
-                    content=representative.content,
+                    kind=chosen.kind,
+                    content=chosen.content,
                     first_seen=timestamps[0],
                     last_seen=timestamps[-1],
                     evidence_ids=sorted(new_ids),
@@ -557,6 +781,122 @@ class WorkspaceMemory:
                 updated += 1
             changed = True
 
+        active_by_memory_key = {
+            entry.memory_key: entry
+            for entry in existing
+            if entry.memory_key is not None
+            and entry.status == CuratedStatus.ACTIVE.value
+        }
+        keyed_groups: dict[
+            str, dict[tuple[str, str], list[MemoryFact]]
+        ] = {}
+        for fact in candidates:
+            if fact.memory_key is None:
+                continue
+            proposals = keyed_groups.setdefault(fact.memory_key, {})
+            proposals.setdefault(_proposal_signature(fact), []).append(fact)
+
+        for memory_key in sorted(keyed_groups):
+            proposals = {
+                signature: distinct(facts)
+                for signature, facts in keyed_groups[memory_key].items()
+            }
+            current = active_by_memory_key.get(memory_key)
+
+            # More evidence for the current value is an idempotent update, not
+            # a new revision.  It also advances last_seen before challengers
+            # are checked, preventing older evidence from rolling it back.
+            if current is not None:
+                current_signature = (current.kind, _normal_form(current.content))
+                reinforcing = proposals.pop(current_signature, None)
+                if reinforcing:
+                    timestamps = sorted(fact.recorded_at for fact in reinforcing)
+                    new_ids = {fact.fact_id for fact in reinforcing}
+                    current.first_seen = min(current.first_seen, timestamps[0])
+                    current.last_seen = max(current.last_seen, timestamps[-1])
+                    current.evidence_ids = sorted(
+                        set(current.evidence_ids) | new_ids
+                    )
+                    current.occurrences = len(current.evidence_ids)
+                    eligible += len(reinforcing)
+                    updated += 1
+                    changed = True
+
+            qualified: list[tuple[tuple[str, str], list[MemoryFact]]] = []
+            for signature, facts in proposals.items():
+                if not qualifies(facts):
+                    skipped += len(facts)
+                    continue
+                if current is not None:
+                    if len(facts) < active_policy.supersession_repeat_threshold:
+                        skipped += len(facts)
+                        continue
+                    latest = max(
+                        _parse_timestamp(fact.recorded_at) for fact in facts
+                    )
+                    if latest <= _parse_timestamp(current.last_seen):
+                        skipped += len(facts)
+                        stale += len(facts)
+                        continue
+                qualified.append((signature, facts))
+
+            if not qualified:
+                continue
+
+            best_score = max(_proposal_score(facts) for _signature, facts in qualified)
+            winners = [
+                (signature, facts)
+                for signature, facts in qualified
+                if _proposal_score(facts) == best_score
+            ]
+            if len(winners) != 1:
+                conflicts += 1
+                skipped += sum(len(facts) for _signature, facts in qualified)
+                continue
+
+            winning_signature, winning_facts = winners[0]
+            skipped += sum(
+                len(facts)
+                for signature, facts in qualified
+                if signature != winning_signature
+            )
+            chosen = representative(winning_facts)
+            timestamps = sorted(fact.recorded_at for fact in winning_facts)
+            new_ids = sorted({fact.fact_id for fact in winning_facts})
+            revision = 1 if current is None else current.revision + 1
+            key = _entry_key(
+                chosen.kind,
+                chosen.content,
+                memory_key=memory_key,
+                revision=revision,
+            )
+            if key in by_key:
+                raise MemoryCorruptionError(
+                    f"curated revision key collision for {memory_key}"
+                )
+            entry = CuratedMemoryEntry(
+                key=key,
+                kind=chosen.kind,
+                content=chosen.content,
+                first_seen=timestamps[0],
+                last_seen=timestamps[-1],
+                evidence_ids=new_ids,
+                occurrences=len(new_ids),
+                memory_key=memory_key,
+                revision=revision,
+                status=CuratedStatus.ACTIVE.value,
+                supersedes=None if current is None else current.key,
+            )
+            if current is not None:
+                current.status = CuratedStatus.SUPERSEDED.value
+                current.superseded_by = entry.key
+                superseded += 1
+            by_key[entry.key] = entry
+            active_by_memory_key[memory_key] = entry
+            eligible += len(winning_facts)
+            created += 1
+            changed = True
+
         if changed:
             self._save_curated(list(by_key.values()))
 
@@ -566,6 +906,9 @@ class WorkspaceMemory:
             created=created,
             updated=updated,
             skipped=skipped,
+            superseded=superseded,
+            conflicts=conflicts,
+            stale=stale,
         )
 
     def get_context_for_agent(self, *, recent_limit: int = MAX_CONTEXT_FACTS) -> str:
@@ -576,7 +919,13 @@ class WorkspaceMemory:
         if curated:
             parts.append(curated)
 
-        recent = self.read_all_facts()[-recent_limit:] if recent_limit > 0 else []
+        # Explicitly keyed facts belong to the curated lifecycle.  Projecting
+        # raw challengers here would bypass the evidence threshold and expose
+        # conflicting values before distillation resolves them.
+        recent_candidates = [
+            fact for fact in self.read_all_facts() if fact.memory_key is None
+        ]
+        recent = recent_candidates[-recent_limit:] if recent_limit > 0 else []
         if recent:
             lines = ["# Recent Workspace Facts", ""]
             lines.extend(
@@ -616,7 +965,9 @@ class MemoryAwareAgent:
 
 Use write_memory only for durable project decisions, conventions, pitfalls,
 or completed outcomes. Do not store greetings, guesses, secrets, or raw tool
-output. Memory supplements the user-facing reply; it never replaces it."""
+output. Set memory_key for a replaceable project decision so later evidence
+can supersede it safely. Memory supplements the user-facing reply; it never
+replaces it."""
 
     @staticmethod
     def _build_tools() -> list[dict]:
@@ -645,6 +996,15 @@ output. Memory supplements the user-facing reply; it never replaces it."""
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 5,
+                        },
+                        "memory_key": {
+                            "type": "string",
+                            "description": (
+                                "Optional stable conflict domain such as "
+                                "runtime.python-version"
+                            ),
+                            "pattern": MEMORY_KEY_PATTERN.pattern,
+                            "maxLength": MAX_MEMORY_KEY_CHARS,
                         },
                     },
                     "required": ["content", "kind", "importance"],
@@ -686,6 +1046,11 @@ output. Memory supplements the user-facing reply; it never replaces it."""
                         kind=str(block.input.get("kind", FactKind.OUTCOME.value)),
                         importance=int(block.input.get("importance", 3)),
                         source="model_tool",
+                        memory_key=(
+                            None
+                            if block.input.get("memory_key") in (None, "")
+                            else str(block.input["memory_key"])
+                        ),
                     )
                     output = f"memory fact appended: {fact.fact_id}"
                 elif block.name == "bash":
@@ -726,7 +1091,8 @@ def _print_report(report: DistillReport) -> None:
     print(
         "distill: "
         f"scanned={report.scanned}, eligible={report.eligible}, "
-        f"created={report.created}, updated={report.updated}, skipped={report.skipped}"
+        f"created={report.created}, updated={report.updated}, skipped={report.skipped}, "
+        f"superseded={report.superseded}, conflicts={report.conflicts}, stale={report.stale}"
     )
 
 

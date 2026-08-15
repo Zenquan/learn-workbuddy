@@ -80,8 +80,13 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    # PromptSegment / plan_prompt 是纯标准库契约。只有在线 agent loop 才
+    # 需要 provider 依赖，离线组合方不应为了 import 规划器而安装 dotenv。
+    def load_dotenv(*_args, **_kwargs):
+        return False
 from mini_workbuddy.paths import tutorial_workbuddy_home
 
 DEFAULT_PROMPT_BUDGET_CHARS = 12_000
@@ -102,13 +107,24 @@ def _prompt_budget_from_env() -> int:
 
 WORKDIR = Path.cwd()
 PROMPT_BUDGET_CHARS = _prompt_budget_from_env()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ.get("MODEL_ID")
-if not MODEL:
-    raise SystemExit(
-        "MODEL_ID is not set. Copy .env.example to .env and fill in "
-        "ANTHROPIC_API_KEY and MODEL_ID (see README quick start)."
-    )
+
+
+def runtime_client():
+    """只在在线 agent loop 真正启动时构造 provider client。"""
+    model = os.environ.get("MODEL_ID")
+    if not model:
+        raise SystemExit(
+            "MODEL_ID is not set. Copy .env.example to .env and fill in "
+            "ANTHROPIC_API_KEY and MODEL_ID (see README quick start)."
+        )
+    try:
+        from anthropic import Anthropic
+    except ImportError as exc:
+        raise SystemExit(
+            "anthropic is required for the online agent loop; "
+            "install requirements.txt first"
+        ) from exc
+    return Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL")), model
 
 
 # ======================================================================
@@ -650,9 +666,10 @@ TOOL_HANDLERS = {"bash": run_bash, "read_file": run_read, "glob": run_glob}
 
 def agent_loop(messages: list):
     """Agent loop using the assembled system prompt."""
+    client, model = runtime_client()
     while True:
         response = client.messages.create(
-            model=MODEL, system=SYSTEM_PROMPT, messages=messages,
+            model=model, system=SYSTEM_PROMPT, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})

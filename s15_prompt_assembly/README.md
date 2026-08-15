@@ -121,6 +121,12 @@ PROMPT_BUDGET_CHARS=2000 python s15_prompt_assembly/code.py
 
 如果 required 片段本身已经超过预算，组装会抛出 `PromptBudgetError`，而不是删除安全规则后继续调用模型。
 
+### 离线组合与在线 provider 的边界
+
+`PromptSegment`、`PromptPlan` 和 `plan_prompt()` 是纯离线契约。导入本章并调用预算规划器不需要 provider SDK、`MODEL_ID`、API key 或网络；只有真正进入 `agent_loop()` 时，`runtime_client()` 才检查在线配置并构造 Anthropic client。
+
+这个延迟初始化边界让其他教学示例可以直接组合 S15，而不需要伪造模型配置。缺少 `MODEL_ID` 或 SDK 时，在线入口仍会在调用点明确失败。
+
 ### 片段定义
 
 每个片段是一个函数，返回字符串（或 None 表示不包含）：

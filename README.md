@@ -270,6 +270,8 @@ python3 examples/reflection_memory/code.py --approve
 python3 examples/retrieval_routing_eval/code.py
 # Markdown 摄取、增量索引、BM25、安全门禁和可验证引用（完全离线）：
 python3 examples/source_grounded_rag/code.py
+# RAG + Skill/Memory/Reflection routing + S15 总预算的端到端组合（完全离线）：
+python3 examples/context_pipeline_walkthrough/code.py
 # 分层 Memory 写入、去重、隔离、召回、压缩和跨重启恢复（完全离线）：
 python3 examples/layered_memory_walkthrough/code.py
 # 一次跑遍所有 harness 层（provider/session/记忆/权限/外部化/JSONL/HTTP/审计），产出 artifacts：

@@ -35,7 +35,7 @@ Usage:
 # chapter declares what it inherits and what it adds.
 PROGRESSION = {'chapter': 's08_model_routing',
  'builds_on': ['s07_session_management'],
- 'adds': ['lite/default/craft routing', 'cost tracking', 'agent-to-model mapping'],
+ 'adds': ['lite/default/craft routing', 'cost tracking', 'memory selector zero-tool routing'],
  'preserves': ['session runtime context']}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
@@ -48,8 +48,9 @@ from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
 import argparse
 import os
-import random
+import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -147,6 +148,73 @@ AGENT_MODEL_MAP: dict[str, ModelTier] = {
     "insightsAnalyzer":       ModelTier.LITE,
 }
 
+MEMORY_SELECTOR_AGENT = "memorySelector"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Memory Selector contract — bounded candidates, zero tools
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class MemoryCandidate:
+    """One already-retrieved candidate offered to the selector.
+
+    The selector does not own retrieval. It receives a bounded candidate set
+    from a memory store or recall stage, then returns IDs from that set only.
+    """
+
+    memory_id: str
+    content: str
+
+    def __post_init__(self) -> None:
+        if not self.memory_id.strip():
+            raise ValueError("memory candidate ID must not be empty")
+        if not self.content.strip():
+            raise ValueError("memory candidate content must not be empty")
+
+
+@dataclass(frozen=True)
+class MemorySelectionRequest:
+    """Provider-neutral input for one bounded memory selection decision."""
+
+    query: str
+    candidates: tuple[MemoryCandidate, ...]
+    limit: int = 3
+
+    def __post_init__(self) -> None:
+        if not self.query.strip():
+            raise ValueError("memory selection query must not be empty")
+        if self.limit < 1:
+            raise ValueError("memory selection limit must be positive")
+        candidate_ids = [candidate.memory_id for candidate in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("memory candidate IDs must be unique")
+
+
+@dataclass(frozen=True)
+class MemorySelectorRoute:
+    """Observable invocation policy for the internal selector model."""
+
+    model: ModelInfo
+    tools: tuple[dict[str, object], ...] = ()
+    max_output_tokens: int = 256
+    temperature: float = 0.0
+    reason: str = "bounded relevance selection over supplied memory candidates"
+
+    def __post_init__(self) -> None:
+        if self.tools:
+            raise ValueError("memory selector route must not contain tools")
+
+
+@dataclass(frozen=True)
+class MemorySelectionResult:
+    """Allowlisted selector output plus the route that produced it."""
+
+    selected_ids: tuple[str, ...]
+    considered_ids: tuple[str, ...]
+    route: MemorySelectorRoute
+    raw_response: str
+
 
 # ═══════════════════════════════════════════════════════════════
 # Mock LLM — simulates model responses without API calls
@@ -164,10 +232,13 @@ def mock_llm(model: ModelInfo, prompt: str, task: str = "") -> str:
     time.sleep(model.latency_ms / 1000 * DEMO_SLEEP_SCALE)
 
     if task == "memory_selection":
-        # lite model: pick 3 IDs from the prompt
+        # The offline model only demonstrates the invocation contract. S12 owns
+        # real candidate scoring; here we return bounded IDs from the supplied
+        # list so S08 can focus on tier and tool routing.
         lines = [l.strip() for l in prompt.split("\n") if l.strip().startswith("[")]
         picked = lines[:3] if len(lines) >= 3 else lines
-        return "Selected memory IDs:\n" + "\n".join(picked)
+        picked_ids = [line.split("]", 1)[0] + "]" for line in picked]
+        return "Selected memory IDs:\n" + "\n".join(picked_ids)
 
     if task == "hook_eval":
         # lite model: yes/no safety judgment
@@ -297,7 +368,22 @@ class ModelRouter:
 
         Tracks cost automatically. Returns mock LLM response.
         """
+        if agent_name == MEMORY_SELECTOR_AGENT:
+            raise ValueError(
+                "memorySelector must use MemorySelectorRouter.select(); "
+                "the selector has a dedicated zero-tool contract"
+            )
         model = self.route_request(agent_name)
+        return self.call_model(
+            model,
+            prompt,
+            task=task,
+            token_override=token_override,
+        )
+
+    def call_model(self, model: ModelInfo, prompt: str, task: str = "",
+                   token_override: int | None = None) -> str:
+        """Call an already-routed model and account for its token cost."""
 
         # Estimate token count (in real life, tokenizer does this)
         if token_override is not None:
@@ -327,6 +413,89 @@ class ModelRouter:
         print("└─────────────────────────┴──────────┴────────────────────────┘")
 
 
+class MemorySelectorRouter:
+    """Route a memory relevance decision without creating a tool-capable Agent.
+
+    A generic tool Agent may discover tools, execute them, and mutate external
+    state. The memory selector has a narrower job: choose IDs from candidates
+    that another layer already retrieved. Passing tool schemas is therefore a
+    protocol error, not an optional optimization.
+    """
+
+    def __init__(self, router: ModelRouter):
+        self.router = router
+
+    def route(
+        self,
+        *,
+        tool_schemas: Sequence[dict[str, object]] = (),
+    ) -> MemorySelectorRoute:
+        """Resolve the lite model while enforcing the zero-tool boundary."""
+
+        if tool_schemas:
+            raise ValueError("memory selector is zero-tool; tool schemas are not allowed")
+        model = self.router.route_request(MEMORY_SELECTOR_AGENT)
+        if model.tier is not ModelTier.LITE:
+            raise RuntimeError("memory selector must remain on the lite model tier")
+        return MemorySelectorRoute(model=model)
+
+    @staticmethod
+    def _build_prompt(request: MemorySelectionRequest) -> str:
+        lines = [
+            f"User query: {request.query.strip()}",
+            f"Select up to {request.limit} candidate IDs.",
+            "Return IDs only; do not answer the query or request tools.",
+            "Candidates:",
+        ]
+        lines.extend(
+            f"[{candidate.memory_id}] {candidate.content.strip()}"
+            for candidate in request.candidates
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _allowlisted_ids(
+        raw_response: str,
+        request: MemorySelectionRequest,
+    ) -> tuple[str, ...]:
+        """Keep stable, unique IDs that were present in the input candidate set."""
+
+        allowed = {candidate.memory_id for candidate in request.candidates}
+        selected: list[str] = []
+        for memory_id in re.findall(r"\[([^\]\n]+)\]", raw_response):
+            if memory_id not in allowed or memory_id in selected:
+                continue
+            selected.append(memory_id)
+            if len(selected) >= request.limit:
+                break
+        return tuple(selected)
+
+    def select(
+        self,
+        request: MemorySelectionRequest,
+        *,
+        tool_schemas: Sequence[dict[str, object]] = (),
+        token_override: int | None = None,
+    ) -> MemorySelectionResult:
+        """Run one selector call and return an ID-only, allowlisted result."""
+
+        route = self.route(tool_schemas=tool_schemas)
+        raw_response = self.router.call_model(
+            route.model,
+            self._build_prompt(request),
+            task="memory_selection",
+            token_override=token_override,
+        )
+        return MemorySelectionResult(
+            selected_ids=self._allowlisted_ids(raw_response, request),
+            considered_ids=tuple(
+                candidate.memory_id for candidate in request.candidates
+            ),
+            route=route,
+            raw_response=raw_response,
+        )
+
+
 # ═══════════════════════════════════════════════════════════════
 # Demo 1: "Use AI to Manage AI" pattern
 # ═══════════════════════════════════════════════════════════════
@@ -344,19 +513,21 @@ def demo_use_ai_to_manage_ai(router: ModelRouter):
     print("Demo: 用 AI 管理 AI — lite 粗筛, craft 推理")
     print("=" * 60)
 
-    # 10 mock memories — in real WorkBuddy, loaded from memory store
-    memories = [
-        "[mem_01] Fixed login token expiration bug in auth.py",
-        "[mem_02] Updated README to reflect new API endpoints",
-        "[mem_03] Refactored database connection pool logic",
-        "[mem_04] User prefers concise responses with code examples",
-        "[mem_05] Fixed login race condition in session handling",
-        "[mem_06] Added unit tests for payment processing module",
-        "[mem_07] Configured CI/CD pipeline with GitHub Actions",
-        "[mem_08] Debugged memory leak in WebSocket handler",
-        "[mem_09] Migrated authentication from JWT to session-based",
-        "[mem_10] Optimized image loading with lazy loading strategy",
-    ]
+    # S12/retrieval would supply this bounded candidate set. The offline mock
+    # places the three relevant records first because S08 demonstrates routing,
+    # not relevance scoring; the S12 recall chapter owns that algorithm.
+    memories = (
+        MemoryCandidate("mem_01", "Fixed login token expiration bug in auth.py"),
+        MemoryCandidate("mem_05", "Fixed login race condition in session handling"),
+        MemoryCandidate("mem_09", "Migrated authentication from JWT to session-based"),
+        MemoryCandidate("mem_02", "Updated README to reflect new API endpoints"),
+        MemoryCandidate("mem_03", "Refactored database connection pool logic"),
+        MemoryCandidate("mem_04", "User prefers concise responses with code examples"),
+        MemoryCandidate("mem_06", "Added unit tests for payment processing module"),
+        MemoryCandidate("mem_07", "Configured CI/CD pipeline with GitHub Actions"),
+        MemoryCandidate("mem_08", "Debugged memory leak in WebSocket handler"),
+        MemoryCandidate("mem_10", "Optimized image loading with lazy loading strategy"),
+    )
 
     user_query = "上次修那个登录 bug 的方案是什么？"
 
@@ -366,21 +537,24 @@ def demo_use_ai_to_manage_ai(router: ModelRouter):
     print(f"│ 模型: {router.models[ModelTier.LITE].name}")
     print(f"│ 成本: ${router.models[ModelTier.LITE].cost_per_million}/M tokens")
 
-    filter_prompt = f"User query: {user_query}\n\nMemories:\n"
-    filter_prompt += "\n".join(memories)
-    filter_prompt += "\n\nSelect the 3 most relevant memory IDs."
+    selector = MemorySelectorRouter(router)
+    selection = selector.select(
+        MemorySelectionRequest(user_query, memories, limit=3),
+        token_override=5000,
+    )
 
-    selected = router.call("memorySelector", filter_prompt,
-                           task="memory_selection", token_override=5000)
-
-    print(f"│ 输出: {selected.split(chr(10))[1:]}")
+    print(f"│ 工具: {len(selection.route.tools)}（zero-tool）")
+    print(f"│ 输出: {list(selection.selected_ids)}")
     print(f"│ tokens: 5000, cost: ${router.models[ModelTier.LITE].cost(5000):.6f}")
     print("└──────────────────────────────────────────────────────────┘")
 
-    # Extract selected memories (simulate parsing lite model output)
-    selected_ids = ["mem_01", "mem_05", "mem_09"]
-    selected_memories = [m for m in memories
-                         if any(mid in m for mid in selected_ids)]
+    # The main Agent receives the selected records, never the selector's free
+    # text or any hallucinated ID outside the supplied candidate set.
+    selected_memories = [
+        f"[{candidate.memory_id}] {candidate.content}"
+        for candidate in memories
+        if candidate.memory_id in selection.selected_ids
+    ]
 
     # ── Step 2: craft model processes filtered results ──
     print("\n┌─ Step 2: CLI (craft) 推理 ────────────────────────────────┐")
@@ -438,13 +612,12 @@ def demo_cost_comparison(router: ModelRouter):
     # ── Scenario A: all craft (no routing) ──
     router.tracker.reset()
     print("\n─ Scenario A: 全部使用 craft 模型 ─")
-    for agent, task, tokens in steps:
+    for agent, _task, tokens in steps:
         # Force all to craft
         router.tracker.track(ModelTier.CRAFT, tokens)
         # Simulate response
         model = router.models[ModelTier.CRAFT]
         time.sleep(model.latency_ms / 1000 * DEMO_SLEEP_SCALE)
-        resp = mock_llm(model, "", task)
         print(f"  {agent:<25} → craft  {tokens:>6} tokens  "
               f"${model.cost(tokens):.6f}")
 
@@ -455,11 +628,10 @@ def demo_cost_comparison(router: ModelRouter):
     # ── Scenario B: tiered routing ──
     router.tracker.reset()
     print("\n─ Scenario B: 分级路由 ─")
-    for agent, task, tokens in steps:
+    for agent, _task, tokens in steps:
         model = router.route_request(agent)
         router.tracker.track(model.tier, tokens)
         time.sleep(model.latency_ms / 1000 * DEMO_SLEEP_SCALE)
-        resp = mock_llm(model, "", task)
         print(f"  {agent:<25} → {model.tier.value:<8} {tokens:>6} tokens  "
               f"${model.cost(tokens):.6f}")
 
@@ -507,6 +679,7 @@ def demo_agent_loop(router: ModelRouter):
     ]
 
     router.tracker.reset()
+    selector = MemorySelectorRouter(router)
 
     for agent, task, desc in pipeline:
         model = router.route_request(agent)
@@ -525,8 +698,32 @@ def demo_agent_loop(router: ModelRouter):
         print(f"  │  模型: {model.name}")
         print(f"  │  延迟: {model.latency_ms}ms")
 
-        response = router.call(agent, user_message, task=task,
-                               token_override=tokens)
+        if agent == MEMORY_SELECTOR_AGENT:
+            selection = selector.select(
+                MemorySelectionRequest(
+                    query=user_message,
+                    candidates=(
+                        MemoryCandidate(
+                            "mem_auth",
+                            "Previous login fix used token expiry checks.",
+                        ),
+                        MemoryCandidate(
+                            "mem_ui",
+                            "The settings screen uses a compact layout.",
+                        ),
+                    ),
+                    limit=1,
+                ),
+                token_override=tokens,
+            )
+            response = f"selected IDs={list(selection.selected_ids)}; tools=0"
+        else:
+            response = router.call(
+                agent,
+                user_message,
+                task=task,
+                token_override=tokens,
+            )
 
         # Show truncated response
         resp_preview = response.replace("\n", "\n  │  ")[:100]
@@ -549,9 +746,11 @@ def interactive():
     """Interactive router shell for trying agent -> model mappings."""
     print("s08: Model Routing Interactive")
     router = ModelRouter()
+    selector = MemorySelectorRouter(router)
     print("Commands:")
     print("  table")
     print("  route <agent>")
+    print("  select <query>")
     print("  call <agent> [task] [prompt]")
     print("  cost")
     print("  reset")
@@ -572,12 +771,34 @@ def interactive():
             model = router.route_request(agent)
             print(f"{agent} -> {model.tier.value} ({model.name})")
             continue
+        if line.startswith("select "):
+            query = line[7:].strip()
+            result = selector.select(
+                MemorySelectionRequest(
+                    query=query,
+                    candidates=(
+                        MemoryCandidate("mem_auth", "Login token expiry decision."),
+                        MemoryCandidate("mem_ui", "Compact settings layout preference."),
+                        MemoryCandidate("mem_ci", "CI runs the offline verification suite."),
+                    ),
+                    limit=2,
+                )
+            )
+            print(
+                f"[{result.route.model.tier.value}; tools=0] "
+                f"selected={list(result.selected_ids)}"
+            )
+            continue
         if line.startswith("call "):
             parts = line.split(" ", 3)
             agent = parts[1] if len(parts) > 1 else "CLI"
             task = parts[2] if len(parts) > 2 else ""
             prompt = parts[3] if len(parts) > 3 else "demo prompt"
-            response = router.call(agent, prompt, task=task)
+            try:
+                response = router.call(agent, prompt, task=task)
+            except ValueError as exc:
+                print(exc)
+                continue
             model = router.route_request(agent)
             print(f"[{model.tier.value}] {response}")
             continue
@@ -588,7 +809,10 @@ def interactive():
             router.tracker.reset()
             print("cost tracker reset")
             continue
-        print("Unknown command. Use: table | route <agent> | call <agent> [task] [prompt] | cost | reset | q")
+        print(
+            "Unknown command. Use: table | route <agent> | select <query> | "
+            "call <agent> [task] [prompt] | cost | reset | q"
+        )
 
 
 def main():
@@ -622,8 +846,9 @@ def main():
     print("核心要点:")
     print("  1. 不是所有任务都用最贵的模型")
     print("  2. lite 模型做粗筛/分类, craft 模型做推理/交互")
-    print("  3. '用 AI 管理 AI' = 便宜的先过滤, 贵的只看结果")
-    print("  4. 成本可降低 50-90%, 上下文质量反而更好")
+    print("  3. memory selector 只选已有候选 ID, 不加载或执行工具")
+    print("  4. '用 AI 管理 AI' = 便宜的先过滤, 贵的只看结果")
+    print("  5. 成本可降低 50-90%, 上下文质量反而更好")
     print("=" * 60)
 
 

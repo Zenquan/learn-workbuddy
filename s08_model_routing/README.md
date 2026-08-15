@@ -12,12 +12,13 @@
 
 ```mermaid
 flowchart LR
-    A["Agent Type"] --> B["Routing Table"]
-    B --> C["ModelRouter"]
-    C --> D["Cost Tracker"]
-    D --> E["Model Response"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    A["Tool-capable Agent"] --> B["ModelRouter"]
+    B --> T["lite / default / craft"]
+    T --> D["CostTracker"]
+    Q["Query + bounded candidates"] --> M["MemorySelectorRouter"]
+    M --> Z["lite invocation · tools=()"]
+    Z --> I["allowlisted memory IDs"]
+    I --> A
 ```
 
 ## 学习前置知识
@@ -25,6 +26,7 @@ flowchart LR
 - 模型路由是成本、延迟、质量的权衡。
 - 分类、筛选、格式化适合轻模型; 深推理、最终决策适合强模型。
 - 路由本身也要可观测, 否则省钱会变成随机降智。
+- Memory Selector 是内部判定器，不是拥有工具循环的通用 Agent。
 
 ## 本章抓住的 WorkBuddy-style 机制
 
@@ -37,6 +39,37 @@ flowchart LR
 - 所有任务都用最强模型, 成本会失控。
 - 所有任务都用便宜模型, 关键步骤质量会不稳。
 - 只按关键词路由, 容易被复杂任务误导。
+
+## Memory Selector 的独立边界
+
+`memorySelector` 和 `general-purpose` Agent 都会调用模型，但两者不是同一种运行时：
+
+| 对比项 | Memory Selector | 通用 Tool Agent |
+|---|---|---|
+| 输入 | query + 已检索的 bounded candidates | 用户目标、上下文、工具目录 |
+| 输出 | candidate 集合内的稳定 ID | 文本或 tool call |
+| 工具 | `tools=()`，传入 schema 立即拒绝 | 可以发现、选择并执行工具 |
+| 副作用 | 无，只产生一次派生选择 | 可能读写文件或调用外部系统 |
+| 失败处理 | 丢弃未知 ID、去重并限制数量 | 由工具协议和权限层处理 |
+
+因此，Memory Selector 不负责查数据库、不负责调用 `read_file`，也不直接回答用户问题。S12 的 Recall 阶段先产出候选；S08 只决定这些候选应路由到哪个模型，并保证选择调用没有工具能力。这样可以防止候选内容诱导内部选择器越过检索边界执行动作。
+
+代码中由 `MemorySelectorRouter` 暴露唯一的 selector 入口：
+
+```python
+request = MemorySelectionRequest(
+    query="previous login decision",
+    candidates=candidates,
+    limit=3,
+)
+result = MemorySelectorRouter(router).select(request)
+
+assert result.route.model.tier is ModelTier.LITE
+assert result.route.tools == ()
+```
+
+离线 mock 只证明 route、zero-tool 和 ID allowlist 契约，不声称模拟真实语义相关性。候选生成、score、stable rank 与无结果语义由后续 Recall 章节负责。
+
 ## 问题
 
 s10 讲了 多类 Agent：CLI 主 Agent、Explore、Plan、compact、memorySelector、promptHookEvaluator……每个 Agent 各司其职。
@@ -396,13 +429,14 @@ function buildModelParams(model, agentConfig) {
 
 1. **ModelTier 枚举** — 定义 LITE / DEFAULT / CRAFT 三级
 2. **ModelInfo 数据类** — 每个模型的成本、延迟、能力参数
-3. **ModelRouter 类** — 核心：根据 Agent 名称路由到对应层级
+3. **ModelRouter 类** — 根据普通 Agent 名称路由到对应层级并记录成本
    - `route_request(agent_name)` → 返回 ModelInfo
-   - `call_model(model, prompt)` → 模拟 LLM 调用，返回 mock 响应
-   - `track_cost(tier, tokens)` → 累计成本
-4. **"用 AI 管理 AI" demo** — lite 模型先从 10 条记忆中选 3 条，craft 模型基于 3 条生成回答
-5. **成本对比** — all-craft 方案 vs 分级路由方案，打印对比表
-6. **Agent 循环** — 模拟一次完整对话，展示不同 Agent 使用不同模型
+   - `call_model(model, prompt)` → 执行已完成路由的 mock 调用
+   - `CostTracker` → 累计各 tier 的 token 与成本
+4. **MemorySelectorRouter** — 接收 bounded candidates，固定 `tools=()`，只返回 allowlisted IDs
+5. **"用 AI 管理 AI" demo** — lite selector 先从 10 条候选中选 3 个 ID，craft 模型只看到三条记录
+6. **成本对比** — all-craft 方案 vs 分级路由方案，打印对比表
+7. **Agent 循环** — 模拟一次完整对话，展示 selector 与通用 Agent 的运行时差别
 
 关键代码：
 
@@ -434,7 +468,7 @@ python s08_model_routing/code.py
 不需要 API key——所有 LLM 响应都是 mock 的。观察重点：
 
 1. **路由表**：不同 Agent 是否被路由到正确的模型层级？
-2. **"用 AI 管理 AI" demo**：lite 模型是否正确筛选了记忆？craft 模型是否只看到筛选后的结果？
+2. **"用 AI 管理 AI" demo**：selector 是否固定走 lite、保持 `tools=()`，并只输出候选集合内的 ID？
 3. **成本对比**：分级路由比 all-craft 节省了多少？
 4. **Agent 循环**：一次对话中，多少次用 lite、多少次用 default、多少次用 craft？
 

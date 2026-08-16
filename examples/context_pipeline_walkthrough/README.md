@@ -186,7 +186,7 @@ manifest 保留四层可观察证据：
 | `budget_violation_rate` | 0.0 |
 | `deterministic_replay` | 1.0 |
 
-这些指标不评价模型回答质量。下一层可以增加 claim-to-citation 对齐、引用覆盖率和无证据拒答，但不应把 provider 能力混进当前 plumbing 基线。
+这些指标不评价模型回答质量。下一层的 claim-to-citation 对齐、引用覆盖率、citation integrity 和无证据拒答由 [Answer-grounded RAG Evaluation](../answer_grounding_eval/) 演示，并继续保持无 provider 的离线基线。
 
 ## 测试入口
 

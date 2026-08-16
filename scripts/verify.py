@@ -229,6 +229,15 @@ def run_offline_demos() -> None:
             ],
             timeout=30,
         )
+        run(
+            [
+                sys.executable,
+                "examples/answer_grounding_eval/code.py",
+                "--output-dir",
+                str(Path(tmp) / "answer-grounding-eval"),
+            ],
+            timeout=30,
+        )
         layered_output = run_capture(
             [
                 sys.executable,
@@ -367,7 +376,7 @@ def check_project_shape() -> None:
         text = readme.read_text(encoding="utf-8")
         if "## 代码架构图" not in text or "```mermaid" not in text:
             readme_diagram_missing.append(readme.relative_to(ROOT).as_posix())
-    if missing or missing_images or bad_readmes or readme_diagram_missing or len(images) != 30:
+    if missing or missing_images or bad_readmes or readme_diagram_missing or len(images) != 31:
         raise SystemExit(
             "Project shape failed:\n"
             + "\n".join(missing)

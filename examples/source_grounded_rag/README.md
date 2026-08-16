@@ -125,13 +125,16 @@ fixture 中的 `untrusted-note.md` 故意包含提示覆盖语句。它可能和
 | `unsafe_evidence_rate` | 0.0 |
 | `prompt_budget_violation_rate` | 0.0 |
 
-这里评测的是 Harness plumbing，不是模型答案质量。若要评测回答，还应增加 claim-to-citation 对齐、引用覆盖率和无证据时拒答等指标。
+这里评测的是 Harness plumbing，不是模型答案质量。回答级的 claim-to-citation 对齐、引用覆盖率、证据集防重放和无证据拒答由后续的 [Answer-grounded RAG Evaluation](../answer_grounding_eval/) 单独验证。
 
 ## 与现有示例的边界
 
 ```text
 source_grounded_rag
   文档 → 可验证、带来源的 evidence candidates
+
+answer_grounding_eval
+  selected evidence → claim/citation integrity → fixture-backed gold evaluation
 
 retrieval_routing_eval
   已有 Skill / Memory / Reflection candidates → policy-first routing

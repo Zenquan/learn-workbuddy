@@ -9,9 +9,14 @@ objects that are often both called "memory":
 * ``RecallHit`` is a scored candidate produced for one ``RecallQuery``.
 
 A hit is not a second stored memory and it is not automatically trusted prompt
-context.  The teaching ranker is intentionally small (lexical overlap plus a
-recency feature) so query, source, score, and selection remain inspectable.  A
-production provider can replace the ranker without changing those contracts.
+context.  The recall path stays explicit and inspectable:
+
+    normalize -> candidate -> score -> stable rank -> render
+
+The teaching scorer is intentionally small (lexical coverage plus recency),
+but every contribution is carried into the hit contract.  A production
+provider can replace candidate generation or scoring without changing the
+scope, provenance, ranking, and rendering boundaries taught here.
 
 Usage:
     python s12_cloud_memory/code.py --demo
@@ -27,12 +32,13 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 
 # Machine-readable learning path metadata.  The chapter preserves s11's user
@@ -44,7 +50,8 @@ PROGRESSION = {
     "adds": [
         "source-bearing remote memory records",
         "query-scoped recall hits",
-        "explainable retrieval scores",
+        "normalize-candidate-score-rank-render recall pipeline",
+        "per-hit score breakdown, scope, and provenance",
     ],
     "preserves": ["workspace and user memory ownership boundaries"],
 }
@@ -109,6 +116,9 @@ def runtime_client() -> tuple[Anthropic, str]:
 SCHEMA_VERSION = 1
 MAX_RECALL_LIMIT = 10
 MAX_RECORD_CHARS = 20_000
+LEXICAL_WEIGHT = 0.85
+RECENCY_WEIGHT = 0.15
+RECENCY_WINDOW_DAYS = 30.0
 DEFAULT_REMOTE_ROOT = tutorial_workbuddy_home() / "remote-memory"
 
 
@@ -194,35 +204,143 @@ class StoredMemory:
 
 @dataclass(frozen=True)
 class RecallQuery:
-    """A self-contained retrieval request scoped to one user and one turn."""
+    """A normalized, self-contained request scoped to one user and one turn.
+
+    text preserves a readable form of the caller's input. Retrieval uses
+    normalized_text and deterministic terms instead, so whitespace, case, and
+    Unicode width do not silently change matching behavior.
+    """
 
     query_id: str
     text: str
+    normalized_text: str
+    terms: tuple[str, ...]
     user_scope: str
     limit: int
     issued_at: str
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "query_id": self.query_id,
+            "text": self.text,
+            "normalized_text": self.normalized_text,
+            "terms": list(self.terms),
+            "user_scope": self.user_scope,
+            "limit": self.limit,
+            "issued_at": self.issued_at,
+        }
+
+
+@dataclass(frozen=True)
+class RecallScope:
+    """The ownership and record-kind boundary attached to every hit."""
+
+    user_scope: str
+    memory_kind: MemoryKind
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "user_scope": self.user_scope,
+            "memory_kind": self.memory_kind.value,
+        }
+
+
+@dataclass(frozen=True)
+class RecallCandidate:
+    """One stored record that shares searchable terms with the query.
+
+    Candidate generation is deliberately separate from scoring. This object
+    remains an internal derived view: it neither copies nor mutates the durable
+    StoredMemory record.
+    """
+
+    query_id: str
+    record: StoredMemory
+    searchable_terms: tuple[str, ...]
+    matched_terms: tuple[str, ...]
+    captured_at: datetime
+
+
+@dataclass(frozen=True)
+class RecallScoreBreakdown:
+    """Auditable components of the small offline teaching score."""
+
+    matched_terms: tuple[str, ...]
+    query_term_count: int
+    lexical_coverage: float
+    recency: float
+    lexical_contribution: float
+    recency_contribution: float
+    total: float
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "matched_terms": list(self.matched_terms),
+            "query_term_count": self.query_term_count,
+            "lexical_coverage": self.lexical_coverage,
+            "recency": self.recency,
+            "weights": {
+                "lexical": LEXICAL_WEIGHT,
+                "recency": RECENCY_WEIGHT,
+            },
+            "contributions": {
+                "lexical": self.lexical_contribution,
+                "recency": self.recency_contribution,
+            },
+            "total": self.total,
+        }
+
+
+@dataclass(frozen=True)
+class ScoredRecallCandidate:
+    """A candidate paired with its score before stable ranking assigns rank."""
+
+    candidate: RecallCandidate
+    score_breakdown: RecallScoreBreakdown
+
 
 @dataclass(frozen=True)
 class RecallHit:
-    """A query-dependent candidate; never a new durable memory record."""
+    """A ranked query view carrying scope, provenance, and score evidence."""
 
     query_id: str
     memory_id: str
     rank: int
     snippet: str
-    source: MemorySource
-    score: float
-    matched_terms: tuple[str, ...]
+    scope: RecallScope
+    provenance: MemorySource
+    score_breakdown: RecallScoreBreakdown
+
+    @property
+    def source(self) -> MemorySource:
+        """Compatibility view used by the layered-memory walkthrough."""
+
+        return self.provenance
+
+    @property
+    def score(self) -> float:
+        """Compatibility scalar; new consumers should inspect the breakdown."""
+
+        return self.score_breakdown.total
+
+    @property
+    def matched_terms(self) -> tuple[str, ...]:
+        return self.score_breakdown.matched_terms
 
     def to_dict(self) -> dict[str, object]:
+        provenance = asdict(self.provenance)
         return {
             "query_id": self.query_id,
             "memory_id": self.memory_id,
             "rank": self.rank,
             "snippet": self.snippet,
-            "source": asdict(self.source),
+            "scope": self.scope.to_dict(),
+            "provenance": provenance,
+            # Keep the former field as a serialized compatibility alias while
+            # teaching that these source fields are provenance, not content.
+            "source": provenance,
             "score": self.score,
+            "score_breakdown": self.score_breakdown.to_dict(),
             "matched_terms": list(self.matched_terms),
         }
 
@@ -234,12 +352,16 @@ class RecallResult:
     query: RecallQuery
     hits: tuple[RecallHit, ...]
     searched_records: int
+    candidate_records: int
+    empty_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "query": asdict(self.query),
+            "query": self.query.to_dict(),
             "hits": [hit.to_dict() for hit in self.hits],
             "searched_records": self.searched_records,
+            "candidate_records": self.candidate_records,
+            "empty_reason": self.empty_reason,
         }
 
 
@@ -293,22 +415,178 @@ def _validate_source(source: MemorySource) -> MemorySource:
     )
 
 
-def _tokenize(text: str) -> set[str]:
-    """Return deterministic lexical features for English and Chinese text.
+def _normalize_search_text(text: str) -> str:
+    """Normalize width, case, and whitespace without hiding readable input."""
 
-    This is a transparent offline baseline, not a claim about a production
-    retrieval stack.  English uses word tokens; consecutive Chinese text also
-    contributes character bi-grams so short topical queries can overlap.
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _tokenize(text: str) -> tuple[str, ...]:
+    """Return stable lexical features for English and Chinese text.
+
+    This transparent offline baseline is intentionally language-light, not a
+    production segmentation claim. English uses word tokens; consecutive
+    Chinese text contributes character bi-grams so short topical queries can
+    overlap without an optional tokenizer dependency.
     """
 
-    normalized = text.casefold()
+    normalized = _normalize_search_text(text)
     terms = set(re.findall(r"[a-z0-9_]+", normalized))
     for segment in re.findall(r"[\u4e00-\u9fff]+", normalized):
         if len(segment) == 1:
             terms.add(segment)
         else:
-            terms.update(segment[index : index + 2] for index in range(len(segment) - 1))
-    return terms
+            terms.update(
+                segment[index : index + 2] for index in range(len(segment) - 1)
+            )
+    return tuple(sorted(terms))
+
+
+def normalize_recall_query(
+    text: str,
+    *,
+    user_scope: str,
+    limit: int,
+    query_id: str | None,
+    issued_at: datetime,
+) -> RecallQuery:
+    """Build the sole normalized query object used by downstream stages."""
+
+    readable_text = _clean_text(text, field_name="recall query", max_chars=2_000)
+    normalized_text = _normalize_search_text(readable_text)
+    terms = _tokenize(normalized_text)
+    if not terms:
+        raise RemoteMemoryValidationError("recall query has no searchable terms")
+    try:
+        parsed_limit = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise RemoteMemoryValidationError("limit must be an integer") from exc
+    if not 1 <= parsed_limit <= MAX_RECALL_LIMIT:
+        raise RemoteMemoryValidationError(
+            f"limit must be between 1 and {MAX_RECALL_LIMIT}"
+        )
+    return RecallQuery(
+        query_id=_clean_text(
+            query_id or uuid.uuid4().hex,
+            field_name="query_id",
+            max_chars=200,
+        ),
+        text=readable_text,
+        normalized_text=normalized_text,
+        terms=terms,
+        user_scope=_clean_text(
+            user_scope,
+            field_name="recall user_scope",
+            max_chars=200,
+        ),
+        limit=parsed_limit,
+        issued_at=_iso(issued_at),
+    )
+
+
+def build_recall_candidates(
+    query: RecallQuery,
+    records: Sequence[StoredMemory],
+) -> tuple[RecallCandidate, ...]:
+    """Create query-dependent candidates without assigning scores or ranks."""
+
+    query_terms = set(query.terms)
+    candidates: list[RecallCandidate] = []
+    for record in records:
+        if record.user_scope != query.user_scope:
+            raise RemoteMemoryScopeError(
+                f"memory {record.memory_id} belongs to another user scope"
+            )
+        if record.kind is not MemoryKind.CONVERSATION:
+            continue
+        searchable_terms = _tokenize(f"{record.summary} {record.content}")
+        matched_terms = tuple(sorted(query_terms & set(searchable_terms)))
+        if not matched_terms:
+            continue
+        candidates.append(
+            RecallCandidate(
+                query_id=query.query_id,
+                record=record,
+                searchable_terms=searchable_terms,
+                matched_terms=matched_terms,
+                captured_at=_parse_timestamp(record.source.captured_at),
+            )
+        )
+    return tuple(candidates)
+
+
+def score_recall_candidate(
+    query: RecallQuery,
+    candidate: RecallCandidate,
+    *,
+    as_of: datetime,
+) -> RecallScoreBreakdown:
+    """Score one candidate and retain each contribution for inspection."""
+
+    if candidate.query_id != query.query_id:
+        raise RemoteMemoryValidationError("candidate belongs to another recall query")
+    coverage = len(candidate.matched_terms) / len(query.terms)
+    age_days = max(
+        (_utc(as_of) - candidate.captured_at).total_seconds() / 86_400,
+        0.0,
+    )
+    recency = 1.0 / (1.0 + age_days / RECENCY_WINDOW_DAYS)
+    lexical_contribution = LEXICAL_WEIGHT * coverage
+    recency_contribution = RECENCY_WEIGHT * recency
+    return RecallScoreBreakdown(
+        matched_terms=candidate.matched_terms,
+        query_term_count=len(query.terms),
+        lexical_coverage=round(coverage, 6),
+        recency=round(recency, 6),
+        lexical_contribution=round(lexical_contribution, 6),
+        recency_contribution=round(recency_contribution, 6),
+        total=round(lexical_contribution + recency_contribution, 6),
+    )
+
+
+def stable_rank_recall_candidates(
+    query: RecallQuery,
+    candidates: Sequence[RecallCandidate],
+    *,
+    as_of: datetime,
+) -> tuple[RecallHit, ...]:
+    """Score then rank with explicit keys independent of storage iteration."""
+
+    scored = [
+        ScoredRecallCandidate(
+            candidate=candidate,
+            score_breakdown=score_recall_candidate(
+                query,
+                candidate,
+                as_of=as_of,
+            ),
+        )
+        for candidate in candidates
+    ]
+    scored.sort(
+        key=lambda item: (
+            -item.score_breakdown.total,
+            -item.score_breakdown.lexical_coverage,
+            -item.candidate.captured_at.timestamp(),
+            item.candidate.record.memory_id,
+        )
+    )
+    return tuple(
+        RecallHit(
+            query_id=query.query_id,
+            memory_id=item.candidate.record.memory_id,
+            rank=rank,
+            snippet=item.candidate.record.summary,
+            scope=RecallScope(
+                user_scope=item.candidate.record.user_scope,
+                memory_kind=item.candidate.record.kind,
+            ),
+            provenance=item.candidate.record.source,
+            score_breakdown=item.score_breakdown,
+        )
+        for rank, item in enumerate(scored[: query.limit], start=1)
+    )
 
 
 class RemoteMemoryStore:
@@ -400,15 +678,13 @@ class RemoteMemoryStore:
 
 
 class RecallEngine:
-    """Create ranked conversation candidates for one explicit query.
+    """Orchestrate the explicit recall pipeline over durable records.
 
-    The score is intentionally explainable:
+    The engine owns sequencing, not hidden retrieval behavior. Each stage is a
+    pure function that can be tested or replaced independently:
 
-    ``0.85 * query-term coverage + 0.15 * recency``
-
-    There is no hidden reranker.  This lets the lesson focus on the retrieval
-    boundary; a later implementation may add embeddings or reranking while
-    preserving ``RecallQuery`` and ``RecallHit``.
+    normalize_recall_query -> build_recall_candidates
+    -> score_recall_candidate -> stable_rank_recall_candidates
     """
 
     def __init__(self, store: RemoteMemoryStore):
@@ -422,85 +698,78 @@ class RecallEngine:
         query_id: str | None = None,
         as_of: datetime | None = None,
     ) -> RecallResult:
-        query_text = _clean_text(text, field_name="recall query", max_chars=2_000)
-        if not 1 <= int(limit) <= MAX_RECALL_LIMIT:
-            raise RemoteMemoryValidationError(
-                f"limit must be between 1 and {MAX_RECALL_LIMIT}"
-            )
         current = _utc(as_of)
-        query = RecallQuery(
-            query_id=query_id or uuid.uuid4().hex,
-            text=query_text,
+        query = normalize_recall_query(
+            text,
             user_scope=self.store.user_scope,
-            limit=int(limit),
-            issued_at=_iso(current),
+            limit=limit,
+            query_id=query_id,
+            issued_at=current,
         )
-        query_terms = _tokenize(query.text)
-        if not query_terms:
-            raise RemoteMemoryValidationError("recall query has no searchable terms")
-
-        candidates: list[tuple[float, datetime, StoredMemory, tuple[str, ...]]] = []
         conversation_records = [
             record
             for record in self.store.read_all()
             if record.kind is MemoryKind.CONVERSATION
         ]
-        for record in conversation_records:
-            record_terms = _tokenize(f"{record.summary} {record.content}")
-            matched = tuple(sorted(query_terms & record_terms))
-            if not matched:
-                continue
-            coverage = len(matched) / len(query_terms)
-            captured_at = _parse_timestamp(record.source.captured_at)
-            age_days = max((current - captured_at).total_seconds() / 86_400, 0.0)
-            recency = 1.0 / (1.0 + age_days / 30.0)
-            score = round(0.85 * coverage + 0.15 * recency, 6)
-            candidates.append((score, captured_at, record, matched))
-
-        # Stable secondary keys make the offline lesson deterministic when two
-        # records receive the same simple score.
-        candidates.sort(
-            key=lambda item: (-item[0], -item[1].timestamp(), item[2].memory_id)
-        )
-        hits = tuple(
-            RecallHit(
-                query_id=query.query_id,
-                memory_id=record.memory_id,
-                rank=rank,
-                snippet=record.summary,
-                source=record.source,
-                score=score,
-                matched_terms=matched,
-            )
-            for rank, (score, _captured_at, record, matched) in enumerate(
-                candidates[: query.limit], start=1
-            )
+        candidates = build_recall_candidates(query, conversation_records)
+        hits = stable_rank_recall_candidates(
+            query,
+            candidates,
+            as_of=current,
         )
         return RecallResult(
             query=query,
             hits=hits,
             searched_records=len(conversation_records),
+            candidate_records=len(candidates),
+            empty_reason=None if hits else "no_matching_terms",
         )
 
 
 def render_recall_context(result: RecallResult) -> str:
-    """Render selected hits for prompt assembly without hiding provenance."""
+    """Render ranked hits while preserving scope, provenance, and score parts.
+
+    A no-match result renders no prompt context. The structured RecallResult
+    still exposes the empty reason to tools and traces, but prompt assembly does
+    not spend tokens on an empty wrapper.
+    """
 
     if not result.hits:
         return ""
     lines = [
         f'<recalled_context query_id="{html.escape(result.query.query_id)}" '
-        f'query="{html.escape(result.query.text)}">'
+        f'query="{html.escape(result.query.text)}" '
+        f'normalized_query="{html.escape(result.query.normalized_text)}" '
+        f'user_scope="{html.escape(result.query.user_scope)}" '
+        f'searched_records="{result.searched_records}" '
+        f'candidate_records="{result.candidate_records}">'
     ]
     for hit in result.hits:
+        breakdown = hit.score_breakdown
         lines.extend(
             [
                 (
-                    f'  <hit rank="{hit.rank}" score="{hit.score:.6f}" '
+                    f'  <hit rank="{hit.rank}" '
                     f'memory_id="{html.escape(hit.memory_id)}" '
-                    f'source_id="{html.escape(hit.source.source_id)}">'
+                    f'user_scope="{html.escape(hit.scope.user_scope)}" '
+                    f'memory_kind="{html.escape(hit.scope.memory_kind.value)}">'
                 ),
-                f"    {html.escape(hit.snippet)}",
+                (
+                    f'    <score total="{breakdown.total:.6f}" '
+                    f'lexical_coverage="{breakdown.lexical_coverage:.6f}" '
+                    f'recency="{breakdown.recency:.6f}" '
+                    f'lexical_contribution="{breakdown.lexical_contribution:.6f}" '
+                    f'recency_contribution="{breakdown.recency_contribution:.6f}" '
+                    f'matched_terms="{html.escape(",".join(breakdown.matched_terms))}"/>'
+                ),
+                (
+                    f'    <provenance '
+                    f'source_id="{html.escape(hit.provenance.source_id)}" '
+                    f'source_type="{html.escape(hit.provenance.source_type)}" '
+                    f'title="{html.escape(hit.provenance.title)}" '
+                    f'captured_at="{html.escape(hit.provenance.captured_at)}"/>'
+                ),
+                f"    <snippet>{html.escape(hit.snippet)}</snippet>",
                 "  </hit>",
             ]
         )

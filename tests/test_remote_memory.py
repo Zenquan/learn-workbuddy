@@ -150,15 +150,110 @@ def test_recall_returns_query_hit_source_score_contract(s12, tmp_path: Path) -> 
 
     assert result.query.query_id == "query-1"
     assert result.query.user_scope == store.user_scope
+    assert result.query.normalized_text == "continue the layered memory design"
+    assert result.query.terms == ("continue", "design", "layered", "memory", "the")
     assert result.searched_records == 2
+    assert result.candidate_records == 1
     assert len(result.hits) == 1
     hit = result.hits[0]
     assert hit.query_id == "query-1"
     assert hit.memory_id == "memory-new"
+    assert hit.scope.user_scope == store.user_scope
+    assert hit.scope.memory_kind is s12.MemoryKind.CONVERSATION
+    assert hit.provenance.source_id == "transcript-new"
+    # ``source`` remains a compatibility view for the layered walkthrough.
     assert hit.source.source_id == "transcript-new"
     assert hit.rank == 1
     assert 0 < hit.score <= 1
     assert "memory" in hit.matched_terms
+    assert hit.score == hit.score_breakdown.total
+    assert hit.score_breakdown.lexical_contribution > 0
+    assert hit.score_breakdown.recency_contribution > 0
+
+
+def test_recall_normalizes_english_and_chinese_queries(s12, tmp_path: Path) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-bilingual",
+        content="We documented layered memory boundaries，并讨论分层记忆的作用域隔离。",
+        summary="Layered memory / 分层记忆 boundary.",
+        source=_source(s12, "transcript-bilingual", 9),
+        stored_at=_time(9),
+    )
+    engine = s12.RecallEngine(store)
+
+    english = engine.recall("  LAYERED   Memory  ", query_id="query-en", as_of=_time(10))
+    chinese = engine.recall("分层记忆", query_id="query-zh", as_of=_time(10))
+
+    assert english.query.text == "LAYERED Memory"
+    assert english.query.normalized_text == "layered memory"
+    assert english.query.terms == ("layered", "memory")
+    assert english.hits[0].memory_id == "memory-bilingual"
+    assert chinese.query.normalized_text == "分层记忆"
+    assert chinese.query.terms == ("分层", "层记", "记忆")
+    assert chinese.hits[0].score_breakdown.matched_terms == ("分层", "层记", "记忆")
+
+
+def test_stable_rank_uses_explicit_tie_breakers(s12, tmp_path: Path) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+    # Append in reverse ID order. Equal content and timestamps must not leak
+    # storage iteration order into the ranked result.
+    for memory_id in ("memory-b", "memory-a"):
+        store.append(
+            kind=s12.MemoryKind.CONVERSATION,
+            memory_id=memory_id,
+            content="Memory retrieval contract.",
+            summary="Memory retrieval contract.",
+            source=_source(s12, f"transcript-{memory_id}", 9),
+            stored_at=_time(9),
+        )
+
+    result = s12.RecallEngine(store).recall(
+        "memory retrieval", query_id="query-tie", as_of=_time(10)
+    )
+
+    assert [hit.memory_id for hit in result.hits] == ["memory-a", "memory-b"]
+    assert [hit.rank for hit in result.hits] == [1, 2]
+    assert result.hits[0].score_breakdown == result.hits[1].score_breakdown
+
+
+@pytest.mark.parametrize(
+    ("query", "error"),
+    [
+        ("   ", "must not be empty"),
+        ("!!!", "no searchable terms"),
+    ],
+)
+def test_recall_rejects_empty_or_unsearchable_queries(
+    s12, tmp_path: Path, query: str, error: str
+) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+
+    with pytest.raises(s12.RemoteMemoryValidationError, match=error):
+        s12.RecallEngine(store).recall(query, as_of=_time(10))
+
+
+def test_no_match_is_explicit_data_and_renders_no_context(s12, tmp_path: Path) -> None:
+    store = s12.RemoteMemoryStore(tmp_path / "records.jsonl", user_id="alice")
+    store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        memory_id="memory-1",
+        content="Agent loop dispatch contract.",
+        summary="Agent loop dispatch.",
+        source=_source(s12, "transcript-1", 9),
+        stored_at=_time(9),
+    )
+
+    result = s12.RecallEngine(store).recall(
+        "database migration", query_id="query-miss", as_of=_time(10)
+    )
+
+    assert result.searched_records == 1
+    assert result.candidate_records == 0
+    assert result.hits == ()
+    assert result.empty_reason == "no_matching_terms"
+    assert s12.render_recall_context(result) == ""
 
 
 def test_recall_is_a_derived_view_and_never_appends_to_store(s12, tmp_path: Path) -> None:
@@ -265,9 +360,12 @@ def test_rendered_context_preserves_query_source_and_score(s12, tmp_path: Path) 
     context = s12.render_recall_context(result)
 
     assert 'query_id="query-xml"' in context
+    assert f'user_scope="{store.user_scope}"' in context
     assert 'memory_id="memory-1"' in context
     assert 'source_id="transcript-1"' in context
-    assert 'score="' in context
+    assert '<score total="' in context
+    assert 'lexical_coverage="' in context
+    assert '<provenance source_id="transcript-1"' in context
 
 
 def test_tool_payload_is_structured_json_not_preformatted_history(
@@ -288,6 +386,21 @@ def test_tool_payload_is_structured_json_not_preformatted_history(
 
     payload = json.loads(s12.recall_history("layered memory design", limit=2))
 
-    assert set(payload) == {"query", "hits", "searched_records"}
+    assert set(payload) == {
+        "query",
+        "hits",
+        "searched_records",
+        "candidate_records",
+        "empty_reason",
+    }
     assert payload["query"]["text"] == "layered memory design"
-    assert all("source" in hit and "score" in hit for hit in payload["hits"])
+    assert all(
+        {
+            "scope",
+            "provenance",
+            "source",
+            "score",
+            "score_breakdown",
+        }.issubset(hit)
+        for hit in payload["hits"]
+    )

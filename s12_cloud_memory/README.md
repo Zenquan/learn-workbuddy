@@ -21,23 +21,28 @@ s10 和 s11 已经分别定义了 Workspace Memory 与 User Memory。它们解�
 - 检索命中不等于事实正确，也不等于必须进入 Prompt；
 - 召回不应因为读到了某条记录，就把它重新写成一条新记忆。
 
-本章将这条链路拆成四个可观察对象：
+本章把召回主路径拆成五个可独立验证的阶段：
 
 ```text
-StoredMemory -> RecallQuery -> RecallHit -> RecallResult
+normalize -> candidate -> score -> stable rank -> render
 ```
+
+这些阶段围绕 `RecallQuery`、`RecallCandidate`、`RecallScoreBreakdown`、
+`RecallHit` 和 `RecallResult` 传递结构化数据。任何阶段失败都能定位到
+输入、候选、评分、排序或上下文渲染，而不是只看到一个无法解释的最终分数。
 
 ## 代码架构图
 
 ```mermaid
 flowchart LR
-    S["Source transcript / profile snapshot"] --> M["StoredMemory"]
-    M --> DB["RemoteMemoryStore JSONL"]
-    Q["RecallQuery"] --> R["Explainable RecallEngine"]
-    DB --> R
-    R --> H["RecallHit: source + score + rank"]
-    H --> V["RecallResult for this query"]
-    V --> C["Recalled context candidate"]
+    S["Source transcript / profile snapshot"] --> DB["StoredMemory JSONL"]
+    Q["Raw recall text"] --> N["Normalize: NFKC + case + whitespace"]
+    N --> C["Candidate: lexical overlap"]
+    DB --> C
+    C --> E["Score: coverage + recency breakdown"]
+    E --> R["Stable rank: score + coverage + time + ID"]
+    R --> H["RecallHit: scope + provenance + breakdown"]
+    H --> V["Render selected context"]
     P["Latest PROFILE record"] --> I["Session-start profile injection"]
     DB --> P
 ```
@@ -87,12 +92,52 @@ class MemorySource:
 class RecallQuery:
     query_id: str
     text: str
+    normalized_text: str
+    terms: tuple[str, ...]
     user_scope: str
     limit: int
     issued_at: str
 ```
 
-召回服务看不到当前聊天，因此 `text` 必须自包含：说明要找什么历史信息，而不是只写“继续上次”。`query_id` 把所有 hits 绑定到同一次检索，便于工具结果、审计和 Prompt context 对齐。
+召回服务看不到当前聊天，因此 `text` 必须自包含：说明要找什么历史信息，
+而不是只写“继续上次”。原始输入先折叠空白，`normalized_text` 再执行
+NFKC、casefold 和空白归一化；后续所有阶段只使用稳定排序的 `terms`。
+`query_id` 把 candidates、scores 和 hits 绑定到同一次检索，便于工具结果、
+审计和 Prompt context 对齐。
+
+### RecallCandidate：未评分候选
+
+```python
+@dataclass(frozen=True)
+class RecallCandidate:
+    query_id: str
+    record: StoredMemory
+    searchable_terms: tuple[str, ...]
+    matched_terms: tuple[str, ...]
+    captured_at: datetime
+```
+
+Candidate 只表示某条 conversation record 与 query 存在 lexical overlap。
+它还没有 score 和 rank，也不会复制或改写 `StoredMemory`。把候选构造单独
+建模后，可以替换成倒排索引、向量召回或 hybrid retrieval，而不用改排序契约。
+
+### RecallScoreBreakdown：可解释评分
+
+```python
+@dataclass(frozen=True)
+class RecallScoreBreakdown:
+    matched_terms: tuple[str, ...]
+    query_term_count: int
+    lexical_coverage: float
+    recency: float
+    lexical_contribution: float
+    recency_contribution: float
+    total: float
+```
+
+`total` 不是孤立数字。每条候选都携带 matched terms、query term 数量、
+coverage、recency、权重和两项 contribution，因此调用方能解释“为什么命中”
+以及“每部分为最终分数贡献了多少”。
 
 ### RecallHit：候选视图
 
@@ -103,12 +148,18 @@ class RecallHit:
     memory_id: str
     rank: int
     snippet: str
-    source: MemorySource
-    score: float
-    matched_terms: tuple[str, ...]
+    scope: RecallScope
+    provenance: MemorySource
+    score_breakdown: RecallScoreBreakdown
 ```
 
-`RecallHit` 不是复制出来的新记忆。它只是某条 `StoredMemory` 针对当前 query 的检索投影，包含本次 score、rank 和 matched terms。再次查询时，这些字段可以完全不同。
+`RecallHit` 不是复制出来的新记忆。它只是某条 `StoredMemory` 针对当前 query
+的检索投影。`scope` 明确用户边界与 memory kind，`provenance` 指回原始来源，
+`score_breakdown` 解释本次排序。再次查询时，这些字段可以完全不同。
+
+为避免破坏已有 Layered Memory walkthrough，Python 对象仍提供 `hit.source`
+和标量 `hit.score` 兼容视图；新代码应读取 `provenance` 与
+`score_breakdown`。JSON 工具结果也暂时保留 `source` 兼容别名。
 
 ## 主要代码流程
 
@@ -131,30 +182,57 @@ store.append(
 
 写入前会验证内容和重复 `memory_id`，并把 `user_scope` 写进每条 JSONL 记录。读取时 scope 不一致会失败，避免远端历史跨用户泄漏。
 
-### 2. Query：构造一次自包含检索
+### 2. Normalize：构造唯一的规范化 Query
 
 ```python
 result = RecallEngine(store).recall(
-    "continue the previous layered memory design",
+    "  LAYERED   Memory  ",
     limit=5,
 )
 ```
 
-RecallEngine 为本次调用创建 `RecallQuery`。它不会访问 Agent 当前 messages，因此工具描述明确要求模型重述历史主题。
+RecallEngine 不会访问 Agent 当前 messages，因此工具描述明确要求模型重述历史
+主题。`normalize_recall_query()` 保留可读文本 `"LAYERED Memory"`，同时生成
+`normalized_text="layered memory"` 和稳定 terms。英文按单词切分；连续中文
+补充二元字符特征，例如“分层记忆”得到“分层 / 层记 / 记忆”。空白 query
+直接拒绝，只有标点且没有 searchable term 的 query 也明确失败。
 
-### 3. Retrieve：生成可解释 hits
+### 3. Candidate：只构造存在 lexical overlap 的候选
+
+`build_recall_candidates()` 只读取 `CONVERSATION` records，并再次校验每条
+record 的 `user_scope` 与 query 一致。候选保存 searchable terms、matched
+terms 和来源时间，但此时没有 score、rank，也没有写回 durable store。
+
+`searched_records` 表示检查了多少条 conversation records；
+`candidate_records` 表示其中多少条进入评分。两者分开后，无结果时可以判断
+问题发生在语料为空、没有词项重合，还是后续 top-k 选择。
+
+### 4. Score 与 Stable Rank：解释分数，固定并列顺序
 
 教学 ranker 使用一个透明的离线基线：
 
 ```text
-score = 0.85 * query-term coverage + 0.15 * recency
+lexical_contribution = 0.85 * query-term coverage
+recency_contribution = 0.15 * recency
+total = lexical_contribution + recency_contribution
 ```
 
-英文使用单词 token，连续中文增加二元字符特征。没有 lexical overlap 的记录不会产生 hit。分数相同时再按来源时间和 `memory_id` 稳定排序。
+`score_recall_candidate()` 返回完整 breakdown，而不是只返回 total。
+`stable_rank_recall_candidates()` 使用以下显式排序键：
+
+```text
+total DESC
+-> lexical_coverage DESC
+-> source.captured_at DESC
+-> memory_id ASC
+```
+
+最后一个稳定 ID 消除了 JSONL 插入顺序对并列结果的影响。相同输入、相同
+`as_of` 和相同 records 会得到相同排名。
 
 这个公式不是对生产检索实现的描述，而是为了让课程可以离线测试：读者能直接解释一条记录为什么命中、为什么排在另一条之前。
 
-### 4. Result：返回结构化工具结果
+### 5. Result：返回结构化工具结果
 
 `recall_history` 返回 JSON，而不是预先排版的 Markdown：
 
@@ -162,7 +240,9 @@ score = 0.85 * query-term coverage + 0.15 * recency
 {
   "query": {
     "query_id": "...",
-    "text": "continue the layered memory design",
+    "text": "LAYERED Memory",
+    "normalized_text": "layered memory",
+    "terms": ["layered", "memory"],
     "user_scope": "...",
     "limit": 5
   },
@@ -170,30 +250,73 @@ score = 0.85 * query-term coverage + 0.15 * recency
     {
       "memory_id": "conversation-003",
       "rank": 1,
-      "source": {"source_id": "transcript-conversation-003"},
-      "score": 0.63,
-      "matched_terms": ["memory"]
+      "scope": {
+        "user_scope": "...",
+        "memory_kind": "conversation"
+      },
+      "provenance": {
+        "source_id": "transcript-conversation-003",
+        "source_type": "conversation_transcript",
+        "title": "layered memory design",
+        "captured_at": "..."
+      },
+      "source": {
+        "source_id": "transcript-conversation-003",
+        "source_type": "conversation_transcript",
+        "title": "layered memory design",
+        "captured_at": "..."
+      },
+      "score": 0.995161,
+      "score_breakdown": {
+        "matched_terms": ["layered", "memory"],
+        "query_term_count": 2,
+        "lexical_coverage": 1.0,
+        "recency": 0.967742,
+        "weights": {
+          "lexical": 0.85,
+          "recency": 0.15
+        },
+        "contributions": {
+          "lexical": 0.85,
+          "recency": 0.145161
+        },
+        "total": 0.995161
+      }
     }
   ],
-  "searched_records": 6
+  "searched_records": 6,
+  "candidate_records": 1,
+  "empty_reason": null
 }
 ```
 
 结构化结果让 Harness 可以记录审计、显示来源、根据 Context budget 截断，或在后续版本中插入 reranker，而不必再解析人类文本。
 
-### 5. Context：只渲染选中的候选
+### 6. Render：只渲染选中的候选
 
 ```xml
-<recalled_context query_id="query-1" query="layered memory design">
-  <hit rank="1" score="0.630000"
-       memory_id="conversation-003"
-       source_id="transcript-conversation-003">
-    Separated workspace, user and remote memory boundaries.
+<recalled_context query_id="query-1"
+                   normalized_query="layered memory"
+                   user_scope="...">
+  <hit rank="1" memory_id="conversation-003"
+       user_scope="..." memory_kind="conversation">
+    <score total="0.995161"
+           lexical_coverage="1.000000"
+           recency="0.967742"
+           lexical_contribution="0.850000"
+           recency_contribution="0.145161"/>
+    <provenance source_id="transcript-conversation-003"
+                source_type="conversation_transcript"
+                captured_at="..."/>
+    <snippet>Separated workspace, user and remote memory boundaries.</snippet>
   </hit>
 </recalled_context>
 ```
 
-即使进入 Prompt，hit 仍保留 query、source 和 score。模型看到的是“本轮召回候选”，而不是没有来源的事实段落。
+即使进入 Prompt，hit 仍保留 query、scope、provenance 和 score breakdown。
+模型看到的是“本轮召回候选”，而不是没有来源的事实段落。无匹配时
+`RecallResult` 返回 `empty_reason="no_matching_terms"`，renderer 返回空字符串，
+避免为一个空 wrapper 消耗 Prompt budget。
 
 ## Profile 为什么单独加载
 
@@ -222,15 +345,23 @@ Remote Profile 也是一种 stored record，但选择策略不同：
 当前章节要先稳定的是接口，而不是追求更花哨的召回分数：
 
 ```text
-query -> candidates -> source-bearing hits -> context
+normalized query
+-> source-bearing candidates
+-> score breakdown
+-> stable rank
+-> scoped/provenanced hits
+-> rendered context
 ```
 
 如果现在同时加入 embedding、hybrid search、LLM reranker、时间过滤和反馈学习，读者很难判断问题发生在召回、排序还是 Prompt 注入。保持 ranker 简单，可以先验证：
 
 - query 是否自包含；
+- normalize 是否让中英文输入稳定；
+- candidate 数量是否能和 searched records 区分；
 - hit 是否绑定正确 query；
-- source 是否完整；
-- score 是否可观察；
+- scope 与 provenance 是否完整；
+- score 的每项 contribution 是否可解释；
+- 并列分数是否不依赖存储迭代顺序；
 - limit 和 scope 是否生效；
 - recall 是否保持只读。
 
@@ -249,11 +380,13 @@ s09 transcript 可以成为 s12 StoredMemory 的 source，但“有 transcript�
 
 ## 失败与边界行为
 
-- 空 query 或没有可检索 token：拒绝调用；
+- 空 query：在 normalize 阶段拒绝调用；
+- 只有标点、没有 searchable term：明确拒绝，而不是退化成全量召回；
 - `limit` 不在 1 到 10：拒绝调用；
 - 重复 `memory_id`：拒绝写入；
 - JSONL 中的 `user_scope` 不匹配：拒绝读取；
-- 没有匹配：返回带 query 的空 `hits`，不是伪造低质量结果；
+- 没有匹配：返回带 query、searched/candidate count 和
+  `empty_reason="no_matching_terms"` 的空 `hits`，renderer 不注入空上下文；
 - Recall 多次执行：不会改变 durable store；
 - Profile snapshot：只用于 profile selection，不混入 conversation hits。
 
@@ -273,7 +406,11 @@ runtime_client()   -> online agent_loop 真正请求模型时才校验 MODEL_ID
 新增测试覆盖：
 
 - StoredMemory 的 source provenance 和跨重启读取；
-- Query、Hit、Source、Score、Rank 的结构化契约；
+- Query normalization、Candidate、Score breakdown、Scope、Provenance 与 Rank 契约；
+- 英文大小写/空白归一化与中文二元字符召回；
+- 空白、纯标点 query 的失败边界；
+- 分数并列时按显式 tie-breakers 稳定排序；
+- 无结果时的 candidate count、empty reason 和空 renderer；
 - Recall 是只读派生视图，不会追加存储；
 - 最新 Profile 注入与 conversation recall 隔离；
 - 跨用户 scope 文件拒绝；
@@ -304,7 +441,12 @@ MODEL_ID=<model> ANTHROPIC_API_KEY=<key> python s12_cloud_memory/code.py
 
 ## 面试表达
 
-我把远端记忆的存储模型和召回模型拆开了：StoredMemory 是带用户作用域和原始 source 的持久记录，RecallHit 是绑定某次 query 的临时候选，包含 score、rank 和 matched terms。召回过程只读，不会把命中结果重新写成记忆；Profile 快照与 conversation history 使用不同选择策略。这样后续接 embedding 或 reranker 时，查询、来源、结果和 Prompt context 的 Harness 契约仍然稳定。
+我把远端记忆的召回主路径设计成
+`normalize -> candidate -> score -> stable rank -> render`：Query 同时保留可读文本
+与稳定 terms；Candidate 和 Scoring 分离；每个 hit 都携带 scope、provenance 与
+score breakdown；并列分数使用确定性的时间和 ID 键排序。召回是只读派生视图，
+无匹配也以显式数据返回。这样后续替换成 embedding、hybrid retrieval 或
+reranker 时，所有权、来源、排序证据和 Prompt renderer 的 Harness 契约仍稳定。
 
 ## 下一课
 

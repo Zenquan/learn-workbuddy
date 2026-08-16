@@ -272,6 +272,8 @@ python3 examples/retrieval_routing_eval/code.py
 python3 examples/source_grounded_rag/code.py
 # RAG + Skill/Memory/Reflection routing + S15 总预算的端到端组合（完全离线）：
 python3 examples/context_pipeline_walkthrough/code.py
+# 回答 Claim、引用完整性、gold source 对齐和无证据拒答评测（完全离线）：
+python3 examples/answer_grounding_eval/code.py
 # 分层 Memory 写入、去重、隔离、召回、压缩和跨重启恢复（完全离线）：
 python3 examples/layered_memory_walkthrough/code.py
 # 一次跑遍所有 harness 层（provider/session/记忆/权限/外部化/JSONL/HTTP/审计），产出 artifacts：
@@ -287,7 +289,7 @@ python3 scripts/verify.py
 - 24 个章节的 `--demo` 离线学习入口
 - 离线交互模式：关键章节 `--interactive` 能正常进入和退出
 - mini HTTP server smoke
-- 24 章目录、每个 README 的代码架构图、28 张配图引用、clean-room 脱敏扫描
+- 24 章目录、每个 README 的代码架构图、所有配图引用、clean-room 脱敏扫描
 
 像 learn-claude-code 一样填 key 在线跑，推荐先用 DeepSeek。每个章节都有两种入口：
 
@@ -416,6 +418,8 @@ python3 scripts/model_benchmark.py --providers deepseek openai-chat --max-lesson
 核心心法：**上下文窗口是 RAM，JSONL、SQLite、记忆文件和 tool-results 是磁盘。**
 
 想看五类状态如何在不混淆所有权的前提下协作，可以运行完全离线的 [Layered Memory Walkthrough](./examples/layered_memory_walkthrough/)。它直接串联 S09–S14，演示写入、重复事实蒸馏、用户隔离、带来源召回、Artifact 引用、压缩不变量和 fresh-process 恢复，不新增第二套 Memory 包。
+
+想验证“检索正确之后，回答是否真的被证据支持”，可以运行 [Answer-grounded RAG Evaluation](./examples/answer_grounding_eval/)。它把 evidence-set/citation 完整性与 fixture-backed claim/source 对齐分开评测，并覆盖无证据拒答、引用洗白和跨 query 回答重放。
 
 ---
 

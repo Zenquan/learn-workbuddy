@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -160,3 +161,176 @@ def test_preference_json_is_stable_and_addressable(s11, tmp_path: Path) -> None:
         "editor.indent",
         "response.detail",
     ]
+
+
+def test_expired_preference_stays_canonical_but_never_reaches_prompt(
+    s11, tmp_path: Path
+) -> None:
+    memory = s11.UserMemory(tmp_path / "user-memory", user_id="alice")
+    _establish_identity(memory)
+    memory.set_preference(
+        "response.detail",
+        "verbose during onboarding",
+        source="transcript",
+        source_event_id="session-7:event-42",
+        updated_at="2026-08-01T09:00:00+08:00",
+        expires_at="2026-08-02T09:00:00+08:00",
+    )
+    before_expiry = datetime(2026, 8, 2, 0, 59, 59, tzinfo=timezone.utc)
+    at_expiry = datetime(2026, 8, 2, 1, 0, 0, tzinfo=timezone.utc)
+
+    preference = memory.list_preferences()[0]
+    assert preference.updated_at == "2026-08-01T01:00:00Z"
+    assert preference.expires_at == "2026-08-02T01:00:00Z"
+    assert preference.source_event_id == "session-7:event-42"
+    assert preference.status(as_of=before_expiry) is s11.PreferenceStatus.ACTIVE
+    assert preference.status(as_of=at_expiry) is s11.PreferenceStatus.EXPIRED
+    assert "response.detail" in memory.get_context_for_agent(as_of=before_expiry)
+    assert "response.detail" not in memory.get_context_for_agent(as_of=at_expiry)
+
+    # Time-travel reads are pure and expired records remain auditable.
+    current_projection = memory.memory_path.read_text(encoding="utf-8")
+    assert "response.detail" in memory.read_memory(as_of=before_expiry)
+    assert memory.memory_path.read_text(encoding="utf-8") == current_projection
+    payload = json.loads(memory.preferences_path.read_text(encoding="utf-8"))
+    assert len(payload["preferences"]) == 1
+
+
+def test_lifecycle_and_provenance_changes_are_revisioned_but_retries_are_not(
+    s11, tmp_path: Path
+) -> None:
+    memory = s11.UserMemory(tmp_path / "user-memory", user_id="alice")
+    common = {
+        "source": "transcript",
+        "source_event_id": "event-1",
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    created = memory.set_preference(
+        "response.language",
+        "Chinese",
+        updated_at="2026-08-01T00:00:00Z",
+        **common,
+    )
+    retry = memory.set_preference(
+        "response.language",
+        "Chinese",
+        updated_at="2026-08-02T00:00:00Z",
+        **common,
+    )
+    extended = memory.set_preference(
+        "response.language",
+        "Chinese",
+        source="transcript",
+        source_event_id="event-1",
+        updated_at="2026-08-03T00:00:00Z",
+        expires_at="2099-02-01T00:00:00Z",
+    )
+    new_evidence = memory.set_preference(
+        "response.language",
+        "Chinese",
+        source="transcript",
+        source_event_id="event-2",
+        updated_at="2026-08-04T00:00:00Z",
+        expires_at="2099-02-01T00:00:00Z",
+    )
+
+    assert created.status is s11.WriteStatus.CREATED
+    assert retry.status is s11.WriteStatus.UNCHANGED
+    assert retry.revision == 1
+    assert extended.status is s11.WriteStatus.UPDATED
+    assert extended.revision == 2
+    assert new_evidence.status is s11.WriteStatus.UPDATED
+    assert new_evidence.revision == 3
+    recovered = s11.UserMemory(tmp_path / "user-memory", user_id="alice")
+    assert recovered.list_preferences()[0].source_event_id == "event-2"
+
+    with pytest.raises(s11.StalePreferenceUpdateError, match="newer canonical"):
+        recovered.set_preference(
+            "response.language",
+            "English",
+            source="transcript",
+            source_event_id="stale-event",
+            updated_at="2026-08-03T12:00:00Z",
+        )
+    assert recovered.list_preferences()[0].value == "Chinese"
+
+
+def test_timestamps_and_source_event_ids_fail_closed(s11, tmp_path: Path) -> None:
+    memory = s11.UserMemory(tmp_path / "user-memory", user_id="alice")
+
+    with pytest.raises(s11.UserMemoryValidationError, match="timezone"):
+        memory.set_preference(
+            "response.detail",
+            "concise",
+            updated_at="2026-08-01T00:00:00",
+        )
+    with pytest.raises(s11.UserMemoryValidationError, match="later than"):
+        memory.set_preference(
+            "response.detail",
+            "concise",
+            updated_at="2026-08-02T00:00:00Z",
+            expires_at="2026-08-02T00:00:00Z",
+        )
+    with pytest.raises(s11.UserMemoryValidationError, match="source_event_id"):
+        memory.set_preference(
+            "response.detail",
+            "concise",
+            source_event_id="event id with spaces",
+        )
+    with pytest.raises(s11.UserMemoryValidationError, match="as_of"):
+        memory.list_active_preferences(as_of=datetime(2026, 8, 1))
+
+
+def test_schema_one_preferences_migrate_on_next_observable_update(
+    s11, tmp_path: Path
+) -> None:
+    memory = s11.UserMemory(tmp_path / "user-memory", user_id="alice")
+    memory.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+    memory.preferences_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "user_scope": memory.scope_id,
+                "preferences": [
+                    {
+                        "key": "response.language",
+                        "value": "Chinese",
+                        "source": "explicit",
+                        "updated_at": "2026-08-01T00:00:00Z",
+                        "revision": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    legacy = memory.list_preferences()[0]
+    assert legacy.expires_at is None
+    assert legacy.source_event_id is None
+    memory.set_preference(
+        "response.language",
+        "Chinese",
+        updated_at="2026-08-02T00:00:00Z",
+        expires_at="2099-01-01T00:00:00Z",
+        source_event_id="event-migration",
+    )
+    migrated = json.loads(memory.preferences_path.read_text(encoding="utf-8"))
+
+    assert migrated["schema_version"] == 2
+    record = migrated["preferences"][0]
+    assert record["revision"] == 2
+    assert record["expires_at"] == "2099-01-01T00:00:00Z"
+    assert record["source_event_id"] == "event-migration"
+
+
+def test_model_tool_can_set_expiry_but_cannot_forge_source_event_id(s11) -> None:
+    tool = next(
+        item
+        for item in s11.IdentityAwareAgent._build_tools()
+        if item["name"] == "save_user_preference"
+    )
+    properties = tool["input_schema"]["properties"]
+
+    assert properties["expires_at"]["format"] == "date-time"
+    assert "source_event_id" not in properties

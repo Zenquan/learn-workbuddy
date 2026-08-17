@@ -42,6 +42,8 @@ PROGRESSION = {
         "user-scoped profile",
         "explicit preference updates",
         "idempotent preference dedupe",
+        "expiring preference lifecycle",
+        "source-event provenance",
     ],
     "preserves": ["workspace memory remains a separate ownership layer"],
 }
@@ -81,12 +83,15 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 # The tutorial namespace cannot collide with a real product's ~/.workbuddy.
 USER_MEMORY_ROOT = tutorial_workbuddy_home() / "user-memory"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, SCHEMA_VERSION})
 MAX_PREFERENCE_CHARS = 4_000
+MAX_SOURCE_EVENT_ID_CHARS = 200
 PROFILE_FIELDS = frozenset(
     {"name", "call_them", "pronouns", "city", "timezone", "notes"}
 )
 PREFERENCE_KEY = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+SOURCE_EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 
 
 BOOTSTRAP_TEMPLATE = """# Bootstrap
@@ -134,6 +139,10 @@ class UserMemoryValidationError(UserMemoryError):
     """Raised before invalid profile or preference data reaches disk."""
 
 
+class StalePreferenceUpdateError(UserMemoryError):
+    """Raised when older evidence attempts to replace a newer preference."""
+
+
 class WriteStatus(str, Enum):
     """Observable result of an explicit preference mutation."""
 
@@ -141,6 +150,13 @@ class WriteStatus(str, Enum):
     UPDATED = "updated"
     UNCHANGED = "unchanged"
     DELETED = "deleted"
+
+
+class PreferenceStatus(str, Enum):
+    """Time-derived state; expiration never deletes canonical evidence."""
+
+    ACTIVE = "active"
+    EXPIRED = "expired"
 
 
 @dataclass(frozen=True)
@@ -152,16 +168,59 @@ class Preference:
     source: str
     updated_at: str
     revision: int = 1
+    expires_at: str | None = None
+    source_event_id: str | None = None
+
+    def status(self, *, as_of: datetime | None = None) -> PreferenceStatus:
+        if self.expires_at is None:
+            return PreferenceStatus.ACTIVE
+        return (
+            PreferenceStatus.ACTIVE
+            if _as_utc(as_of)
+            < _parse_timestamp(self.expires_at, field_name="expires_at")
+            else PreferenceStatus.EXPIRED
+        )
+
+    def is_active(self, *, as_of: datetime | None = None) -> bool:
+        return self.status(as_of=as_of) is PreferenceStatus.ACTIVE
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "Preference":
         try:
+            revision = int(payload.get("revision", 1))
+            if revision < 1:
+                raise ValueError("revision must be positive")
+            updated_at = _normalize_timestamp(
+                str(payload["updated_at"]), field_name="updated_at"
+            )
+            raw_expiry = payload.get("expires_at")
+            expires_at = (
+                None
+                if raw_expiry in (None, "")
+                else _normalize_timestamp(str(raw_expiry), field_name="expires_at")
+            )
+            if expires_at is not None and _parse_timestamp(
+                expires_at, field_name="expires_at"
+            ) <= _parse_timestamp(updated_at, field_name="updated_at"):
+                raise ValueError("expires_at must be later than updated_at")
             return cls(
-                key=str(payload["key"]),
-                value=str(payload["value"]),
-                source=str(payload.get("source", "explicit")),
-                updated_at=str(payload["updated_at"]),
-                revision=int(payload.get("revision", 1)),
+                key=_preference_key(str(payload["key"])),
+                value=_clean_text(
+                    payload["value"],
+                    field_name="preference value",
+                    max_chars=MAX_PREFERENCE_CHARS,
+                ),
+                source=_clean_text(
+                    payload.get("source", "explicit"),
+                    field_name="source",
+                    max_chars=100,
+                ),
+                updated_at=updated_at,
+                revision=revision,
+                expires_at=expires_at,
+                source_event_id=_optional_source_event_id(
+                    payload.get("source_event_id")
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise UserMemoryValidationError(f"invalid preference record: {exc}") from exc
@@ -186,8 +245,35 @@ class ProfileWrite:
     unchanged: tuple[str, ...] = field(default_factory=tuple)
 
 
+def _as_utc(value: datetime | None = None) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise UserMemoryValidationError("as_of must include a timezone")
+    return current.astimezone(timezone.utc)
+
+
+def _format_timestamp(value: datetime) -> str:
+    return _as_utc(value).isoformat().replace("+00:00", "Z")
+
+
+def _parse_timestamp(value: str, *, field_name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UserMemoryValidationError(
+            f"{field_name} must be an ISO-8601 timestamp"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise UserMemoryValidationError(f"{field_name} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_timestamp(value: str, *, field_name: str) -> str:
+    return _format_timestamp(_parse_timestamp(value, field_name=field_name))
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return _format_timestamp(datetime.now(timezone.utc))
 
 
 def _scope_id(user_id: str) -> str:
@@ -217,6 +303,21 @@ def _clean_text(value: object, *, field_name: str, max_chars: int) -> str:
             f"{field_name} exceeds the {max_chars}-character teaching limit"
         )
     return text
+
+
+def _optional_source_event_id(value: object | None) -> str | None:
+    if value is None:
+        return None
+    event_id = _clean_text(
+        value,
+        field_name="source_event_id",
+        max_chars=MAX_SOURCE_EVENT_ID_CHARS,
+    )
+    if not SOURCE_EVENT_ID.fullmatch(event_id):
+        raise UserMemoryValidationError(
+            "source_event_id must be an opaque event identifier"
+        )
+    return event_id
 
 
 class UserMemory:
@@ -328,6 +429,8 @@ class UserMemory:
     # ── Preferences: addressable, explicit cross-project rules ─
 
     def list_preferences(self) -> list[Preference]:
+        """Return every canonical record, including expired audit evidence."""
+
         payload = self._read_scoped_json(
             self.preferences_path, default_key="preferences"
         )
@@ -339,6 +442,18 @@ class UserMemory:
             raise UserMemoryValidationError("duplicate preference keys in canonical state")
         return sorted(preferences, key=lambda item: item.key)
 
+    def list_active_preferences(
+        self, *, as_of: datetime | None = None
+    ) -> list[Preference]:
+        """Return the time-bounded projection eligible for prompt injection."""
+
+        current = _as_utc(as_of)
+        return [
+            preference
+            for preference in self.list_preferences()
+            if preference.is_active(as_of=current)
+        ]
+
     def set_preference(
         self,
         key: str,
@@ -346,12 +461,14 @@ class UserMemory:
         *,
         source: str = "explicit",
         updated_at: str | None = None,
+        expires_at: str | None = None,
+        source_event_id: str | None = None,
     ) -> PreferenceWrite:
         """Create or replace one preference using its stable semantic key.
 
-        Repeating the same key/value pair is a true no-op: no revision bump and
-        no disk rewrite.  A different value is an update, not a second line in
-        MEMORY.md, so stale and current rules cannot both reach the prompt.
+        A retry is a true no-op only when value, source, expiry, and source event
+        all match. Changing lifecycle or provenance is an observable revision,
+        even when the user-facing value stays the same.
         """
 
         normalized_key = _preference_key(key)
@@ -359,10 +476,33 @@ class UserMemory:
             value, field_name="preference value", max_chars=MAX_PREFERENCE_CHARS
         )
         normalized_source = _clean_text(source, field_name="source", max_chars=100)
+        normalized_updated_at = _normalize_timestamp(
+            updated_at or _now_iso(), field_name="updated_at"
+        )
+        normalized_expires_at = (
+            None
+            if expires_at is None
+            else _normalize_timestamp(expires_at, field_name="expires_at")
+        )
+        if normalized_expires_at is not None and _parse_timestamp(
+            normalized_expires_at, field_name="expires_at"
+        ) <= _parse_timestamp(normalized_updated_at, field_name="updated_at"):
+            raise UserMemoryValidationError("expires_at must be later than updated_at")
+        normalized_source_event_id = _optional_source_event_id(source_event_id)
         preferences = {item.key: item for item in self.list_preferences()}
         previous = preferences.get(normalized_key)
 
-        if previous and previous.value == normalized_value:
+        if previous and (
+            previous.value,
+            previous.source,
+            previous.expires_at,
+            previous.source_event_id,
+        ) == (
+            normalized_value,
+            normalized_source,
+            normalized_expires_at,
+            normalized_source_event_id,
+        ):
             return PreferenceWrite(
                 WriteStatus.UNCHANGED,
                 normalized_key,
@@ -371,13 +511,22 @@ class UserMemory:
                 previous.revision,
             )
 
+        if previous and _parse_timestamp(
+            normalized_updated_at, field_name="updated_at"
+        ) <= _parse_timestamp(previous.updated_at, field_name="updated_at"):
+            raise StalePreferenceUpdateError(
+                f"preference {normalized_key} has newer canonical evidence"
+            )
+
         revision = previous.revision + 1 if previous else 1
         preferences[normalized_key] = Preference(
             key=normalized_key,
             value=normalized_value,
             source=normalized_source,
-            updated_at=updated_at or _now_iso(),
+            updated_at=normalized_updated_at,
             revision=revision,
+            expires_at=normalized_expires_at,
+            source_event_id=normalized_source_event_id,
         )
         self._store_preferences(preferences.values())
         return PreferenceWrite(
@@ -407,11 +556,15 @@ class UserMemory:
             previous.revision,
         )
 
-    def read_memory(self) -> str:
-        """Return the derived preference view, repairing stale projections."""
+    def read_memory(self, *, as_of: datetime | None = None) -> str:
+        """Return active preferences without deleting expired canonical state.
 
-        expected = self._render_preferences(self.list_preferences())
-        if self._read_text(self.memory_path) != expected:
+        Historical ``as_of`` reads are pure: they never replace the current
+        MEMORY.md projection with a time-travel view.
+        """
+
+        expected = self._render_preferences(self.list_active_preferences(as_of=as_of))
+        if as_of is None and self._read_text(self.memory_path) != expected:
             self._atomic_write_text(self.memory_path, expected)
         return expected
 
@@ -446,7 +599,7 @@ class UserMemory:
         )
         self.update_profile(profile)
 
-    def load_identity(self) -> dict[str, str]:
+    def load_identity(self, *, as_of: datetime | None = None) -> dict[str, str]:
         """Load readable prompt blocks without exposing canonical JSON."""
 
         profile = self.read_profile()
@@ -456,18 +609,18 @@ class UserMemory:
             "soul": self._read_text(self.soul_path),
             "identity": self._read_text(self.identity_path),
             "user": self._read_text(self.user_path),
-            "memory": self.read_memory(),
+            "memory": self.read_memory(as_of=as_of),
         }
 
     def is_identity_established(self) -> bool:
         return bool(self.read_profile()) and self.soul_path.exists() and self.identity_path.exists()
 
-    def get_context_for_agent(self) -> str:
+    def get_context_for_agent(self, *, as_of: datetime | None = None) -> str:
         """Build only user-owned prompt blocks; workspace context is a caller concern."""
 
         if not self.is_identity_established():
             return "(user identity not yet established)"
-        identity = self.load_identity()
+        identity = self.load_identity(as_of=as_of)
         parts = [
             f"## Assistant values\n{identity['soul'].strip()}",
             f"## Assistant identity\n{identity['identity'].strip()}",
@@ -497,6 +650,16 @@ class UserMemory:
             raise UserMemoryValidationError(f"{path.name} root must be a JSON object")
         if payload.get("user_scope") != self.scope_id:
             raise UserScopeError(f"{path.name} belongs to another user scope")
+        try:
+            schema_version = int(payload.get("schema_version", 1))
+        except (TypeError, ValueError) as exc:
+            raise UserMemoryValidationError(
+                f"{path.name} has an invalid schema version"
+            ) from exc
+        if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            raise UserMemoryValidationError(
+                f"{path.name} uses unsupported schema {schema_version}"
+            )
         return payload
 
     def _write_scoped_json(
@@ -518,7 +681,8 @@ class UserMemory:
             "preferences",
             [asdict(item) for item in ordered],
         )
-        self._atomic_write_text(self.memory_path, self._render_preferences(ordered))
+        active = [item for item in ordered if item.is_active()]
+        self._atomic_write_text(self.memory_path, self._render_preferences(active))
 
     def _write_profile_projection(self, profile: Mapping[str, str]) -> None:
         labels = {
@@ -540,7 +704,9 @@ class UserMemory:
         if not preferences:
             return ""
         lines = ["# Explicit User Preferences", ""]
-        lines.extend(f"- `{item.key}`: {item.value}" for item in preferences)
+        for item in preferences:
+            expiry = f" (expires {item.expires_at})" if item.expires_at else ""
+            lines.append(f"- `{item.key}`: {item.value}{expiry}")
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -705,7 +871,9 @@ class IdentityAwareAgent:
 {self.memory.get_context_for_agent()}
 
 Only persist a profile or preference when the user explicitly asks. User memory
-is cross-project; project decisions belong to workspace memory instead."""
+is cross-project; project decisions belong to workspace memory instead. Use
+expires_at for explicitly temporary preferences. Provenance IDs are attached by
+the harness and must never be invented from conversation text."""
 
     @staticmethod
     def _build_tools() -> list[dict]:
@@ -737,6 +905,14 @@ is cross-project; project decisions belong to workspace memory instead."""
                     "properties": {
                         "key": {"type": "string"},
                         "value": {"type": "string"},
+                        "expires_at": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": (
+                                "Optional timezone-aware expiry for a temporary "
+                                "cross-project preference"
+                            ),
+                        },
                     },
                     "required": ["key", "value"],
                 },
@@ -779,7 +955,14 @@ is cross-project; project decisions belong to workspace memory instead."""
             return json.dumps(asdict(result), ensure_ascii=False)
         if name == "save_user_preference":
             result = self.memory.set_preference(
-                str(arguments.get("key", "")), str(arguments.get("value", ""))
+                str(arguments.get("key", "")),
+                str(arguments.get("value", "")),
+                source="model_tool",
+                expires_at=(
+                    None
+                    if arguments.get("expires_at") in (None, "")
+                    else str(arguments["expires_at"])
+                ),
             )
             return json.dumps(asdict(result), ensure_ascii=False, default=str)
         return f"Error: unknown tool {name}"

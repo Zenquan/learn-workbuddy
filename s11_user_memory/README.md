@@ -2,7 +2,7 @@
 
 > 工作区记忆回答“这个项目长期有效的事实是什么”；用户记忆回答“这个人跨项目仍然有效的稳定信息与明确偏好是什么”。
 >
-> **Harness 层**：Memory ownership、显式状态变更与 Prompt context。
+> **Harness 层**：Memory ownership、显式状态变更、有效期、证据来源与 Prompt context。
 
 ---
 
@@ -35,9 +35,11 @@ s10 已经能把项目决策、约定和踩坑经验蒸馏成工作区记忆，�
 
 1. **Owner 是谁？** 每份状态都带稳定 `user_scope`，同一根目录可安全承载多个用户。
 2. **写入是否明确？** 只有 `update_user_profile` 和 `save_user_preference` 等显式工具能改变状态。
-3. **重复调用会怎样？** 相同 key/value 是 no-op，不增长文件、不增加 revision。
-4. **偏好变化会怎样？** 相同 key 的新 value 替换旧 value，Prompt 中不会同时出现冲突规则。
-5. **进程重启后信谁？** JSON 是 canonical state，Markdown 只是可读与 Prompt-facing projection，可从 JSON 修复。
+3. **重复调用会怎样？** value、source、expiry 和 source event 全部相同才是 no-op，不增长文件、不增加 revision。
+4. **偏好变化会怎样？** 相同 key 的新状态替换旧状态，旧时间戳不能回滚较新的 canonical evidence。
+5. **临时偏好何时失效？** `expires_at` 到达后记录仍可审计，但不再进入 `MEMORY.md` 或 Prompt。
+6. **偏好从哪里来？** Harness 可保存 s09 transcript event ID；该字段不开放给模型自行编造。
+7. **进程重启后信谁？** JSON 是 canonical state，Markdown 只是 active、Prompt-facing projection，可从 JSON 修复。
 
 ## 代码架构图
 
@@ -45,11 +47,14 @@ s10 已经能把项目决策、约定和踩坑经验蒸馏成工作区记忆，�
 flowchart LR
     U["Explicit user request"] --> T{"Memory tool"}
     T -->|"profile patch"| P["profile.json"]
-    T -->|"key + value"| D["Preference deduper"]
+    T -->|"key + value + expiry"| D["Preference lifecycle gate"]
+    E["s09 event ID"] -->|"Harness attaches"| D
     D -->|"create / update"| J["preferences.json"]
-    D -->|"same key + value"| N["UNCHANGED / no disk write"]
+    D -->|"same complete state"| N["UNCHANGED / no disk write"]
+    J --> G{"active at as_of?"}
+    G -->|"yes"| MP["MEMORY.md"]
+    G -->|"expired"| H["canonical audit only"]
     P --> UP["persona/user.md"]
-    J --> MP["MEMORY.md"]
     UP --> C["User context block"]
     MP --> C
     C --> A["Agent prompt assembly"]
@@ -85,7 +90,7 @@ flowchart LR
 | 文件 | 角色 | 是否作为真相来源 |
 |---|---|---|
 | `profile.json` | 结构化用户资料 | 是 |
-| `preferences.json` | 带 key、revision、source 的偏好集合 | 是 |
+| `preferences.json` | 带 key、revision、expiry、source event 的完整偏好集合 | 是，包括已过期记录 |
 | `persona/user.md` | 便于人阅读的 Profile 投影 | 否，可重建 |
 | `MEMORY.md` | 便于检查和注入 Prompt 的 Preference 投影 | 否，可重建 |
 | `persona/core.md` | 助手价值与边界 | 独立的 assistant identity |
@@ -134,7 +139,28 @@ UPDATED   revision=2  previous=Chinese  current=English
 
 去重不能只比较整段文本。例如“回复使用中文”和“以后回复使用英文”不是两条并存的长期事实，而是同一个 `response.language` 偏好的两个版本。稳定 key 提供冲突域，value 表示当前状态。
 
-### 3. 显式删除
+完整幂等身份还包含 `source`、`expires_at` 和 `source_event_id`。相同 value 但延长期限或补充新的来源证据属于可观察更新，会增加 revision；仅 `updated_at` 不同的完整重试仍然是 `UNCHANGED`。不同状态的写入时间必须晚于 canonical `updated_at`，避免重放旧 transcript 时回滚新偏好。
+
+### 3. 临时偏好与 active projection
+
+```python
+memory.set_preference(
+    "response.detail",
+    "verbose during onboarding",
+    source="transcript",
+    source_event_id="session-7:event-42",
+    updated_at="2026-08-01T01:00:00Z",
+    expires_at="2026-08-02T01:00:00Z",
+)
+```
+
+时间戳必须包含时区并统一保存为 UTC。偏好在 `as_of < expires_at` 时 active；到达 `expires_at` 的瞬间即 expired。`list_preferences()` 返回全部 canonical records，`list_active_preferences(as_of=...)` 才返回可注入集合。
+
+过期不是删除：记录继续留在 `preferences.json`，以便解释它曾经为何生效；`MEMORY.md` 和 `get_context_for_agent()` 只投影 active records。显式历史 `as_of` 查询是纯读取，不会把历史视图写回当前 `MEMORY.md`。
+
+`source_event_id` 是 Harness provenance，不是模型生成内容。程序化调用方可以把 s09 的稳定 event ID 附在写入上；`save_user_preference` 模型工具只接受 value 和可选 expiry，不能提交或伪造 event ID。
+
+### 4. 显式删除
 
 ```python
 memory.delete_preference("response.language")
@@ -142,7 +168,7 @@ memory.delete_preference("response.language")
 
 删除按 key 精确执行，不对自然语言做模糊匹配。Harness 因此可以向用户展示将删除的具体偏好，也能在审计日志中记录明确目标。
 
-### 4. 多用户隔离
+### 5. 多用户隔离
 
 ```python
 alice = UserMemory(root, user_id="alice")
@@ -154,7 +180,7 @@ bob.set_preference("editor.indent", "spaces")
 
 两者共享状态根目录，但落入不同 `scope-id`。读取时还会校验 JSON 内部的 `user_scope`：路径隔离负责正常路由，scope marker 负责发现错误复制或调用方传错用户。
 
-### 5. Prompt context
+### 6. Prompt context
 
 ```text
 ## Assistant values
@@ -203,7 +229,9 @@ validate -> serialize -> write temp file -> fsync -> os.replace
 
 如果写临时文件时进程失败，旧 canonical file 仍然存在；成功替换后，不会留下“写了一半的 JSON”。新进程重新创建 `UserMemory(root, user_id=...)` 即可恢复状态，不依赖内存缓存。
 
-`MEMORY.md` 被人工改坏或处于旧版本时，`read_memory()` 会根据 `preferences.json` 重新生成投影。这体现了 Harness 中常见的原则：可读视图可以修复，canonical state 必须有清晰边界。
+`MEMORY.md` 被人工改坏、过期或处于旧版本时，`read_memory()` 会根据 canonical records 和当前时间重新生成 active projection。这体现了 Harness 中常见的原则：可读视图可以修复，canonical state 必须有清晰边界。
+
+当前 schema 为 v2，读取器仍接受 v1 profile 与 preferences。v1 Preference 缺少的 `expires_at` 和 `source_event_id` 按 `None` 恢复，下一次发生可观察写入时统一保存为 v2；读取本身不会为了迁移而修改 canonical state。
 
 ## 离线验证
 
@@ -211,6 +239,10 @@ validate -> serialize -> write temp file -> fsync -> os.replace
 
 - Profile partial update、删除和跨重启读取；
 - Preference create/update/unchanged revision 语义；
+- expiry 的时区校验、到期边界和 active/expired 投影；
+- source event provenance、跨重启恢复与模型不可伪造边界；
+- stale timestamp 防回滚与 lifecycle/provenance revision；
+- schema v1 兼容读取和下一次可观察更新迁移；
 - 同 key 只保留当前值；
 - 两个用户共享 root 时仍然隔离；
 - 错误复制的跨 scope JSON 被拒绝；
@@ -248,8 +280,8 @@ python s11_user_memory/code.py
 
 ## 练习
 
-1. 给 `set_preference` 增加可选的 `expires_at`，让临时跨项目偏好自动失效。
-2. 在不改变存储所有权的前提下，为 Preference 增加来源事件 ID，连接 s09 transcript 证据。
+1. 把单个 `source_event_id` 扩展为有界 evidence set，同时保持同一证据重试幂等。
+2. 为即将过期的偏好增加显式续期确认流程，比较“自动续期”和“用户确认”的权限边界。
 3. 在 s15 Prompt assembly 中实现明确的优先级：本轮用户指令 > workspace override > user default。
 
 ## 下一课

@@ -1,60 +1,53 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-"""
-s15_prompt_assembly.py - System Prompt Assembly: Runtime Segment Concatenation
+"""s15_prompt_assembly - select, pack, and assemble runtime context.
 
-The system prompt is NOT a static string — it's assembled at runtime
-from multiple segments. Each segment is independently maintained,
-conditionally included, and concatenated in order.
+The system prompt is not a static string. The harness builds independently
+owned segments, gives required rules priority over optional context, and emits
+an audit trail for every include/drop decision.
 
-Ten segment types:
-  1. Base instructions (always)
-  2. Identity injection (SOUL/IDENTITY/USER files, if exist)
-  3. Cloud memory (<memory> block, if profile exists)
-  4. Project context (always — file structure, workdir)
-  5. Tool descriptions (dynamic from registered tools)
-  6. Expert instructions (if expert is active)
-  7. Skill instructions (if skills are loaded)
-  8. Connector status (if MCP connectors available)
-  9. Regional conventions (stock colors, currency)
-  10. Working mode (craft/plan/ask)
+Memory needs one extra boundary before it becomes a prompt segment. S12 returns
+ranked, query-scoped recall hits; S15 decides which of those hits are safe and
+useful enough to enter the current context:
 
-  ┌─────────┐ ┌──────────┐ ┌────────┐ ┌─────────┐ ┌──────┐
-  │  base   │ │ identity │ │ memory │ │ project │ │ tools│
-  │ (always)│ │ (if file)│ │(if mem)│ │ (always)│ │(dyn) │
-  └────┬────┘ └────┬─────┘ └───┬────┘ └────┬────┘ └──┬───┘
-       └───────────┴───────────┴───────────┴─────────┘
-                         │ joiner
-       ┌─────────────────┼──────────────────┐
-       ▼                 ▼                  ▼
-  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐
-  │ expert  │  │  skills  │  │ region  │  │  mode   │
-  │ (if exp)│  │ (if skil)│  │(always) │  │(always) │
-  └─────────┘  └──────────┘  └─────────┘  └─────────┘
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │ Final system prompt │
-              └─────────────────────┘
+    RecallHit -> scope -> confidence -> dedupe -> conflict -> top-k/budget
+              -> <recalled_memory> -> total prompt segment planner
 
-Reassembled when: skill loaded, expert changed, mode switched,
-connector status changed, identity file modified.
+The selector never writes back to durable memory and never guesses semantic
+conflicts from prose. Callers attach an explicit ``conflict_key`` when several
+records describe the same fact slot. Character and token budgets are both
+observable; an injected target-model token counter can replace the deterministic
+offline estimator without changing the selection contract.
 
-Production harnesses often use: same 10-segment assembly in agent bridge, 100KB+ prompts.
-Teaching version uses: simplified segments, ~5-20KB prompts.
+The remaining runtime segments preserve the chapter's original teaching scope:
+base rules, identity, recalled memory, project context, tools, expert, skills,
+connectors, regional conventions, and working mode. State changes trigger
+reassembly, while the offline planners remain importable without an API key.
 
 Usage:
+    python s15_prompt_assembly/code.py --demo
     python s15_prompt_assembly/code.py
 """
 
+from __future__ import annotations
 
 
-# Machine-readable learning path metadata. Tests enforce that every
-# chapter declares what it inherits and what it adds.
-PROGRESSION = {'chapter': 's15_prompt_assembly',
- 'builds_on': ['s14_context_compact'],
- 'adds': ['runtime prompt segments', 'budgeted context blocks', 'assembly order'],
- 'preserves': ['memory and compaction inputs']}
+# Machine-readable learning path metadata. Tests enforce that every chapter
+# declares both the inherited boundary and the new mechanism taught here.
+PROGRESSION = {
+    "chapter": "s15_prompt_assembly",
+    "builds_on": ["s14_context_compact"],
+    "adds": [
+        "scope- and confidence-gated memory selection",
+        "stable deduplication and explicit conflict resolution",
+        "top-k character/token context packing",
+        "per-candidate selection and rejection decisions",
+        "runtime prompt segments and total prompt budget",
+    ],
+    "preserves": [
+        "s12 recall scope, score, rank, and provenance",
+        "memory and compaction inputs",
+    ],
+}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
 import sys as _wb_sys
@@ -66,10 +59,16 @@ from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
 from mini_workbuddy.chapter_demo import prepare_chapter_provider as _wb_prepare_chapter_provider
 _wb_prepare_chapter_provider()
-import os, sys, time, json
-from pathlib import Path
+import html
+import math
+import os
+import re
+import unicodedata
 from dataclasses import dataclass, field
-from typing import Callable
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
 
 try:
     import readline
@@ -90,6 +89,8 @@ except ImportError:
 from mini_workbuddy.paths import tutorial_workbuddy_home
 
 DEFAULT_PROMPT_BUDGET_CHARS = 12_000
+DEFAULT_MEMORY_BUDGET_CHARS = 3_000
+DEFAULT_MEMORY_BUDGET_TOKENS = 800
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"): os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -125,6 +126,490 @@ def runtime_client():
             "install requirements.txt first"
         ) from exc
     return Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL")), model
+
+
+# ======================================================================
+# Recalled memory selection and context packing
+# ======================================================================
+
+
+class MemoryDecisionStatus(str, Enum):
+    """Whether a recalled candidate entered the rendered context."""
+
+    SELECTED = "selected"
+    REJECTED = "rejected"
+
+
+class MemoryDecisionReason(str, Enum):
+    """Stable reason codes for traces, tests, and offline evaluation."""
+
+    SELECTED = "selected"
+    SCOPE_MISMATCH = "scope_mismatch"
+    LOW_CONFIDENCE = "low_confidence"
+    DUPLICATE_CONTENT = "duplicate_content"
+    CONFLICT_LOSER = "conflict_loser"
+    TOP_K_REACHED = "top_k_reached"
+    CHAR_BUDGET_EXCEEDED = "char_budget_exceeded"
+    TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
+
+
+def _required_text(value: object, *, field_name: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{field_name} must not be empty")
+    return text
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    """Parse one provenance time so ranking never falls back to string order."""
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"invalid captured_at timestamp: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalized_memory_text(value: str) -> str:
+    """Create a deterministic exact-content key without claiming semantics."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+@dataclass(frozen=True)
+class MemoryContextProvenance:
+    """Source evidence that must survive the recall-to-prompt projection."""
+
+    source_id: str
+    source_type: str
+    title: str
+    captured_at: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.source_id, field_name="provenance source_id")
+        _required_text(self.source_type, field_name="provenance source_type")
+        _required_text(self.title, field_name="provenance title")
+        _parse_utc_timestamp(self.captured_at)
+
+
+@dataclass(frozen=True)
+class MemoryContextCandidate:
+    """A query-scoped recall hit projected into S15's selection contract.
+
+    ``conflict_key`` is deliberately explicit. Detecting contradictions from
+    arbitrary prose would hide a second model call inside prompt assembly; a
+    typed fact producer can instead mark records that compete for one slot.
+    """
+
+    memory_id: str
+    text: str
+    user_scope: str
+    score: float
+    source_rank: int
+    provenance: MemoryContextProvenance
+    conflict_key: str | None = None
+
+    def __post_init__(self) -> None:
+        _required_text(self.memory_id, field_name="memory_id")
+        _required_text(self.text, field_name="memory text")
+        _required_text(self.user_scope, field_name="memory user_scope")
+        if not math.isfinite(self.score) or not 0.0 <= self.score <= 1.0:
+            raise ValueError("memory score must be finite and between 0 and 1")
+        if self.source_rank < 1:
+            raise ValueError("memory source_rank must be positive")
+        if self.conflict_key is not None:
+            _required_text(self.conflict_key, field_name="memory conflict_key")
+
+
+@dataclass(frozen=True)
+class MemorySelectionPolicy:
+    """Selection gates and the memory-specific slice of context budget."""
+
+    min_score: float = 0.35
+    top_k: int = 5
+    max_chars: int | None = DEFAULT_MEMORY_BUDGET_CHARS
+    max_tokens: int | None = DEFAULT_MEMORY_BUDGET_TOKENS
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.min_score) or not 0.0 <= self.min_score <= 1.0:
+            raise ValueError("min_score must be finite and between 0 and 1")
+        if self.top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if self.max_chars is not None and self.max_chars < 0:
+            raise ValueError("max_chars must be non-negative or None")
+        if self.max_tokens is not None and self.max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative or None")
+
+
+@dataclass(frozen=True)
+class MemorySelectionDecision:
+    """One candidate's terminal outcome and the evidence for that outcome."""
+
+    memory_id: str
+    status: MemoryDecisionStatus
+    reason: MemoryDecisionReason
+    score: float
+    source_rank: int
+    candidate_chars: int
+    candidate_tokens: int
+    related_memory_id: str | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class MemoryContextPlan:
+    """Rendered memory context plus a complete, deterministic decision log."""
+
+    context: str
+    user_scope: str
+    policy: MemorySelectionPolicy
+    candidate_count: int
+    used_chars: int
+    used_tokens: int
+    decisions: tuple[MemorySelectionDecision, ...]
+
+    @property
+    def selected_memory_ids(self) -> tuple[str, ...]:
+        return tuple(
+            decision.memory_id
+            for decision in self.decisions
+            if decision.status is MemoryDecisionStatus.SELECTED
+        )
+
+    @property
+    def rejected_memory_ids(self) -> tuple[str, ...]:
+        return tuple(
+            decision.memory_id
+            for decision in self.decisions
+            if decision.status is MemoryDecisionStatus.REJECTED
+        )
+
+
+TokenCounter = Callable[[str], int]
+
+
+def estimate_context_tokens(text: str) -> int:
+    """Return deterministic teaching units, not a provider tokenizer claim.
+
+    Latin word runs, individual CJK characters, and punctuation each count as
+    one unit. Production adapters should inject the target model's tokenizer;
+    the policy and decision report remain unchanged.
+    """
+
+    return len(
+        re.findall(r"[a-zA-Z0-9_]+|[\u3400-\u9fff]|[^\s]", text)
+    )
+
+
+def _count_tokens(token_counter: TokenCounter, text: str) -> int:
+    """Validate an injected tokenizer before its result controls admission."""
+
+    count = token_counter(text)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("token_counter must return a non-negative integer")
+    return count
+
+
+def _candidate_order(candidate: MemoryContextCandidate) -> tuple[object, ...]:
+    """Rank independently of provider/storage iteration order."""
+
+    return (
+        -candidate.score,
+        candidate.source_rank,
+        -_parse_utc_timestamp(candidate.provenance.captured_at).timestamp(),
+        candidate.memory_id,
+    )
+
+
+def render_memory_hit(candidate: MemoryContextCandidate) -> str:
+    """Render one candidate atomically with its scope and provenance."""
+
+    provenance = candidate.provenance
+    conflict_attr = (
+        f' conflict_key="{html.escape(candidate.conflict_key, quote=True)}"'
+        if candidate.conflict_key
+        else ""
+    )
+    return (
+        f'<memory_hit memory_id="{html.escape(candidate.memory_id, quote=True)}" '
+        f'score="{candidate.score:.6f}" source_rank="{candidate.source_rank}" '
+        f'user_scope="{html.escape(candidate.user_scope, quote=True)}" '
+        f'source_id="{html.escape(provenance.source_id, quote=True)}" '
+        f'source_type="{html.escape(provenance.source_type, quote=True)}" '
+        f'captured_at="{html.escape(provenance.captured_at, quote=True)}"'
+        f'{conflict_attr}>'
+        f'{html.escape(candidate.text)}'
+        "</memory_hit>"
+    )
+
+
+def render_memory_context(
+    user_scope: str,
+    candidates: Sequence[MemoryContextCandidate],
+) -> str:
+    """Render the selected candidates without hiding wrapper budget cost."""
+
+    if not candidates:
+        return ""
+    raw_scope = _required_text(user_scope, field_name="user_scope")
+    mismatched = sorted(
+        candidate.memory_id
+        for candidate in candidates
+        if candidate.user_scope != raw_scope
+    )
+    if mismatched:
+        raise ValueError(
+            "cannot render candidates from another scope: " + ", ".join(mismatched)
+        )
+    scope = html.escape(raw_scope, quote=True)
+    hits = "\n".join(render_memory_hit(candidate) for candidate in candidates)
+    return (
+        f'<recalled_memory user_scope="{scope}" selected="{len(candidates)}">\n'
+        f"{hits}\n"
+        "</recalled_memory>"
+    )
+
+
+def _decision(
+    candidate: MemoryContextCandidate,
+    *,
+    status: MemoryDecisionStatus,
+    reason: MemoryDecisionReason,
+    token_counter: TokenCounter,
+    related_memory_id: str | None = None,
+    detail: str = "",
+) -> MemorySelectionDecision:
+    rendered = render_memory_hit(candidate)
+    return MemorySelectionDecision(
+        memory_id=candidate.memory_id,
+        status=status,
+        reason=reason,
+        score=candidate.score,
+        source_rank=candidate.source_rank,
+        candidate_chars=len(rendered),
+        candidate_tokens=_count_tokens(token_counter, rendered),
+        related_memory_id=related_memory_id,
+        detail=detail,
+    )
+
+
+def select_memory_context(
+    candidates: Sequence[MemoryContextCandidate],
+    *,
+    user_scope: str,
+    policy: MemorySelectionPolicy | None = None,
+    token_counter: TokenCounter = estimate_context_tokens,
+) -> MemoryContextPlan:
+    """Select and atomically pack recalled memory under explicit constraints.
+
+    The order is intentional: security scope and confidence are gates; exact
+    duplicates and typed conflicts are resolved before scarce budget is spent;
+    top-k and budgets then pack the strongest surviving records. An oversized
+    record does not stop packing, so a smaller lower-ranked record can still use
+    the remaining budget. Conflict losers never backfill because they represent
+    facts superseded by the chosen winner, not merely expensive context.
+    """
+
+    scope = _required_text(user_scope, field_name="user_scope")
+    active_policy = policy or MemorySelectionPolicy()
+    candidate_ids = [candidate.memory_id for candidate in candidates]
+    duplicates = sorted(
+        memory_id
+        for memory_id in set(candidate_ids)
+        if candidate_ids.count(memory_id) > 1
+    )
+    if duplicates:
+        raise ValueError("duplicate memory candidate ids: " + ", ".join(duplicates))
+
+    ranked = sorted(candidates, key=_candidate_order)
+    decisions: dict[str, MemorySelectionDecision] = {}
+    eligible: list[MemoryContextCandidate] = []
+
+    for candidate in ranked:
+        if candidate.user_scope != scope:
+            decisions[candidate.memory_id] = _decision(
+                candidate,
+                status=MemoryDecisionStatus.REJECTED,
+                reason=MemoryDecisionReason.SCOPE_MISMATCH,
+                token_counter=token_counter,
+                detail=f"candidate scope {candidate.user_scope!r} != query scope {scope!r}",
+            )
+        elif candidate.score < active_policy.min_score:
+            decisions[candidate.memory_id] = _decision(
+                candidate,
+                status=MemoryDecisionStatus.REJECTED,
+                reason=MemoryDecisionReason.LOW_CONFIDENCE,
+                token_counter=token_counter,
+                detail=(
+                    f"score {candidate.score:.6f} is below "
+                    f"min_score {active_policy.min_score:.6f}"
+                ),
+            )
+        else:
+            eligible.append(candidate)
+
+    deduplicated: list[MemoryContextCandidate] = []
+    content_winners: dict[str, MemoryContextCandidate] = {}
+    for candidate in eligible:
+        key = _normalized_memory_text(candidate.text)
+        winner = content_winners.get(key)
+        if winner is not None:
+            decisions[candidate.memory_id] = _decision(
+                candidate,
+                status=MemoryDecisionStatus.REJECTED,
+                reason=MemoryDecisionReason.DUPLICATE_CONTENT,
+                token_counter=token_counter,
+                related_memory_id=winner.memory_id,
+                detail=f"normalized content duplicates {winner.memory_id}",
+            )
+            continue
+        content_winners[key] = candidate
+        deduplicated.append(candidate)
+
+    conflict_free: list[MemoryContextCandidate] = []
+    conflict_winners: dict[str, MemoryContextCandidate] = {}
+    for candidate in deduplicated:
+        conflict_key = candidate.conflict_key
+        if conflict_key is None:
+            conflict_free.append(candidate)
+            continue
+        normalized_key = _normalized_memory_text(conflict_key)
+        winner = conflict_winners.get(normalized_key)
+        if winner is not None:
+            decisions[candidate.memory_id] = _decision(
+                candidate,
+                status=MemoryDecisionStatus.REJECTED,
+                reason=MemoryDecisionReason.CONFLICT_LOSER,
+                token_counter=token_counter,
+                related_memory_id=winner.memory_id,
+                detail=f"conflict slot {conflict_key!r} won by {winner.memory_id}",
+            )
+            continue
+        conflict_winners[normalized_key] = candidate
+        conflict_free.append(candidate)
+
+    selected: list[MemoryContextCandidate] = []
+    for candidate in conflict_free:
+        if len(selected) >= active_policy.top_k:
+            decisions[candidate.memory_id] = _decision(
+                candidate,
+                status=MemoryDecisionStatus.REJECTED,
+                reason=MemoryDecisionReason.TOP_K_REACHED,
+                token_counter=token_counter,
+                detail=f"top_k {active_policy.top_k} already filled",
+            )
+            continue
+
+        proposed_context = render_memory_context(scope, [*selected, candidate])
+        proposed_chars = len(proposed_context)
+        proposed_tokens = _count_tokens(token_counter, proposed_context)
+        if (
+            active_policy.max_chars is not None
+            and proposed_chars > active_policy.max_chars
+        ):
+            decisions[candidate.memory_id] = _decision(
+                candidate,
+                status=MemoryDecisionStatus.REJECTED,
+                reason=MemoryDecisionReason.CHAR_BUDGET_EXCEEDED,
+                token_counter=token_counter,
+                detail=(
+                    f"would use {proposed_chars} chars; "
+                    f"budget is {active_policy.max_chars}"
+                ),
+            )
+            continue
+        if (
+            active_policy.max_tokens is not None
+            and proposed_tokens > active_policy.max_tokens
+        ):
+            decisions[candidate.memory_id] = _decision(
+                candidate,
+                status=MemoryDecisionStatus.REJECTED,
+                reason=MemoryDecisionReason.TOKEN_BUDGET_EXCEEDED,
+                token_counter=token_counter,
+                detail=(
+                    f"would use {proposed_tokens} tokens; "
+                    f"budget is {active_policy.max_tokens}"
+                ),
+            )
+            continue
+
+        selected.append(candidate)
+        decisions[candidate.memory_id] = _decision(
+            candidate,
+            status=MemoryDecisionStatus.SELECTED,
+            reason=MemoryDecisionReason.SELECTED,
+            token_counter=token_counter,
+            detail="passed gates and fits top-k/context budgets",
+        )
+
+    context = render_memory_context(scope, selected)
+    return MemoryContextPlan(
+        context=context,
+        user_scope=scope,
+        policy=active_policy,
+        candidate_count=len(candidates),
+        used_chars=len(context),
+        used_tokens=_count_tokens(token_counter, context),
+        decisions=tuple(decisions[candidate.memory_id] for candidate in ranked),
+    )
+
+
+def memory_candidates_from_recall(
+    result: object,
+    *,
+    conflict_keys: Mapping[str, str] | None = None,
+) -> tuple[MemoryContextCandidate, ...]:
+    """Adapt S12's public RecallResult shape without coupling chapter imports.
+
+    The bridge uses structural attributes so S15 remains independently runnable.
+    Scope, score, provider rank, and provenance are copied rather than recomputed;
+    selection policy belongs here, while retrieval evidence continues to belong
+    to S12.
+    """
+
+    query = getattr(result, "query", None)
+    query_scope = getattr(query, "user_scope", None)
+    converted: list[MemoryContextCandidate] = []
+    for hit in getattr(result, "hits", ()):
+        memory_id = _required_text(
+            getattr(hit, "memory_id", ""), field_name="recall memory_id"
+        )
+        scope = getattr(hit, "scope", None)
+        hit_scope = getattr(scope, "user_scope", query_scope)
+        provenance = getattr(hit, "provenance", None)
+        if provenance is None:
+            provenance = getattr(hit, "source", None)
+        if provenance is None:
+            raise ValueError(f"recall hit {memory_id} has no provenance")
+        breakdown = getattr(hit, "score_breakdown", None)
+        score = getattr(breakdown, "total", getattr(hit, "score", None))
+        if score is None:
+            raise ValueError(f"recall hit {memory_id} has no score")
+        converted.append(
+            MemoryContextCandidate(
+                memory_id=memory_id,
+                text=_required_text(
+                    getattr(hit, "snippet", ""), field_name="recall snippet"
+                ),
+                user_scope=_required_text(
+                    hit_scope, field_name="recall user_scope"
+                ),
+                score=float(score),
+                source_rank=int(getattr(hit, "rank", 0)),
+                provenance=MemoryContextProvenance(
+                    source_id=str(getattr(provenance, "source_id", "")),
+                    source_type=str(getattr(provenance, "source_type", "")),
+                    title=str(getattr(provenance, "title", "")),
+                    captured_at=str(getattr(provenance, "captured_at", "")),
+                ),
+                conflict_key=(conflict_keys or {}).get(memory_id),
+            )
+        )
+    return tuple(converted)
 
 
 # ======================================================================
@@ -336,6 +821,15 @@ work_mode: str = "craft"  # craft | plan | ask
 region: str = "CN"
 connectors: list[dict] = []
 
+# S12 recall output is installed as runtime state, just like skills or an
+# expert. Reassembly reruns selection because the active query scope and the
+# target model's budget may have changed since the previous provider turn.
+recalled_memory_candidates: tuple[MemoryContextCandidate, ...] = ()
+recalled_memory_user_scope: str | None = None
+memory_selection_policy = MemorySelectionPolicy()
+memory_token_counter: TokenCounter = estimate_context_tokens
+LAST_MEMORY_CONTEXT_PLAN: MemoryContextPlan | None = None
+
 
 # ======================================================================
 # Segment builders
@@ -381,14 +875,24 @@ def build_identity() -> str | None:
 
 
 def build_cloud_memory() -> str | None:
-    """Segment 3: Cloud memory — <memory> block from s12."""
-    # Simulated profile (s12 handles real implementation)
-    profile = (
-        "偏好: Python, TypeScript, 函数式风格, 简洁回答\n"
-        "工具: zsh, git, vscode\n"
-        "项目: learn-workbuddy 教程"
+    """Segment 3: select and pack current S12 recall candidates.
+
+    The historical function name remains as a compatibility entrypoint, but
+    the returned block is no longer a hard-coded profile. No current recall
+    means the segment is inactive instead of injecting stale example data.
+    """
+
+    global LAST_MEMORY_CONTEXT_PLAN
+    if not recalled_memory_candidates or recalled_memory_user_scope is None:
+        LAST_MEMORY_CONTEXT_PLAN = None
+        return None
+    LAST_MEMORY_CONTEXT_PLAN = select_memory_context(
+        recalled_memory_candidates,
+        user_scope=recalled_memory_user_scope,
+        policy=memory_selection_policy,
+        token_counter=memory_token_counter,
     )
-    return f"<memory>\n{profile}\n</memory>"
+    return LAST_MEMORY_CONTEXT_PLAN.context or None
 
 
 def build_project_context() -> str:
@@ -495,7 +999,7 @@ SEGMENTS: list[PromptSegment] = [
     ),
     PromptSegment(
         "memory", build_cloud_memory, priority=25, budget_priority=60,
-        provenance="remote:profile-recall",
+        provenance="remote:ranked-recall-selection",
     ),
     PromptSegment(
         "project", build_project_context, priority=30, budget_priority=80,
@@ -546,6 +1050,28 @@ def assemble_system_prompt(
     LAST_PROMPT_PLAN = plan_prompt(SEGMENTS, budget_chars=budget_chars)
 
     if verbose:
+        if LAST_MEMORY_CONTEXT_PLAN is not None:
+            print(
+                f"\n\033[90m{'memory':<18} {'rank':>5} {'score':>8} "
+                f"{'status':>9} reason / detail\033[0m"
+            )
+            for decision in LAST_MEMORY_CONTEXT_PLAN.decisions:
+                print(
+                    f"\033[90m{decision.memory_id:<18} "
+                    f"{decision.source_rank:>5} {decision.score:>8.3f} "
+                    f"{decision.status.value:>9} {decision.reason.value} / "
+                    f"{decision.detail}\033[0m"
+                )
+            memory_budget = LAST_MEMORY_CONTEXT_PLAN.policy
+            print(
+                f"\033[90mmemory used "
+                f"{LAST_MEMORY_CONTEXT_PLAN.used_chars:,}/"
+                f"{memory_budget.max_chars} chars; "
+                f"{LAST_MEMORY_CONTEXT_PLAN.used_tokens:,}/"
+                f"{memory_budget.max_tokens} tokens; selected="
+                f"{list(LAST_MEMORY_CONTEXT_PLAN.selected_memory_ids)}"
+                f"\033[0m\n"
+            )
         print(
             f"\n\033[90m{'segment':<12} {'order':>5} {'value':>5} "
             f"{'status':>9} {'chars':>7} source / reason\033[0m"
@@ -578,6 +1104,54 @@ def reassemble_prompt():
     global SYSTEM_PROMPT
     SYSTEM_PROMPT = assemble_system_prompt()
     print(f"\033[90m[prompt] 重新组装, 长度: {len(SYSTEM_PROMPT):,} 字符\033[0m")
+
+
+def set_recalled_memory(
+    candidates: Sequence[MemoryContextCandidate],
+    *,
+    user_scope: str,
+    policy: MemorySelectionPolicy | None = None,
+    token_counter: TokenCounter = estimate_context_tokens,
+) -> None:
+    """Install current-query recall candidates and trigger prompt reassembly.
+
+    Runtime state stores candidates, not a pre-rendered string. Replanning here
+    guarantees that a scope/policy/tokenizer change cannot reuse context chosen
+    under the previous turn's constraints.
+    """
+
+    global recalled_memory_candidates
+    global recalled_memory_user_scope
+    global memory_selection_policy
+    global memory_token_counter
+    recalled_memory_candidates = tuple(candidates)
+    recalled_memory_user_scope = _required_text(
+        user_scope, field_name="recalled memory user_scope"
+    )
+    memory_selection_policy = policy or MemorySelectionPolicy()
+    memory_token_counter = token_counter
+    reassemble_prompt()
+    selected = (
+        list(LAST_MEMORY_CONTEXT_PLAN.selected_memory_ids)
+        if LAST_MEMORY_CONTEXT_PLAN is not None
+        else []
+    )
+    print(
+        f"\033[32m[prompt] recall 候选 {len(candidates)} 条, "
+        f"已选择 {selected}\033[0m"
+    )
+
+
+def clear_recalled_memory() -> None:
+    """Remove query-scoped recall state so it cannot leak into another turn."""
+
+    global recalled_memory_candidates
+    global recalled_memory_user_scope
+    global LAST_MEMORY_CONTEXT_PLAN
+    recalled_memory_candidates = ()
+    recalled_memory_user_scope = None
+    LAST_MEMORY_CONTEXT_PLAN = None
+    reassemble_prompt()
 
 
 def load_skill(title: str, content: str):
@@ -615,6 +1189,87 @@ def add_connector(name: str, tool_count: int = 5):
     })
     reassemble_prompt()
     print(f"\033[32m[prompt] 连接器 '{name}' 已连接 ({tool_count} tools)\033[0m")
+
+
+def load_demo_recalled_memory() -> None:
+    """Install a keyless fixture that exposes every important selector gate."""
+
+    def demo_candidate(
+        memory_id: str,
+        text: str,
+        *,
+        score: float,
+        rank: int,
+        conflict_key: str | None = None,
+        user_scope: str = "demo-user-scope",
+    ) -> MemoryContextCandidate:
+        return MemoryContextCandidate(
+            memory_id=memory_id,
+            text=text,
+            user_scope=user_scope,
+            score=score,
+            source_rank=rank,
+            provenance=MemoryContextProvenance(
+                source_id=f"demo-transcript:{memory_id}",
+                source_type="transcript",
+                title="S15 offline selection fixture",
+                captured_at=f"2026-08-{18-rank:02d}T09:00:00Z",
+            ),
+            conflict_key=conflict_key,
+        )
+
+    set_recalled_memory(
+        [
+            demo_candidate(
+                "python-current",
+                "Prefer Python for automation tasks.",
+                score=0.93,
+                rank=1,
+                conflict_key="preference:automation-language",
+            ),
+            demo_candidate(
+                "python-copy",
+                " prefer PYTHON for automation tasks. ",
+                score=0.86,
+                rank=2,
+                conflict_key="preference:automation-language",
+            ),
+            demo_candidate(
+                "typescript-old",
+                "Prefer TypeScript for automation tasks.",
+                score=0.72,
+                rank=3,
+                conflict_key="preference:automation-language",
+            ),
+            demo_candidate(
+                "source-grounding",
+                "Answers should cite the source evidence.",
+                score=0.81,
+                rank=4,
+                conflict_key="preference:source-grounding",
+            ),
+            demo_candidate(
+                "weak-overlap",
+                "An incidental lexical match.",
+                score=0.18,
+                rank=5,
+            ),
+            demo_candidate(
+                "other-user",
+                "This must never cross the user boundary.",
+                score=0.99,
+                rank=1,
+                user_scope="another-user-scope",
+            ),
+        ],
+        user_scope="demo-user-scope",
+        policy=MemorySelectionPolicy(
+            min_score=0.35,
+            top_k=2,
+            max_chars=1_200,
+            max_tokens=400,
+        ),
+    )
 
 
 # ======================================================================
@@ -709,6 +1364,8 @@ if __name__ == "__main__":
     print("\033[90m  expert   — 模拟切换专家 (触发重新组装)\033[0m")
     print("\033[90m  mode X   — 切换工作模式 craft/plan/ask\033[0m")
     print("\033[90m  conn     — 模拟连接器上线 (触发重新组装)\033[0m")
+    print("\033[90m  memory   — 加载离线召回候选并查看选择/拒绝原因\033[0m")
+    print("\033[90m  memory clear — 清除本轮召回, 防止跨查询泄漏\033[0m")
     print("\033[90m  stats    — 查看系统提示统计\033[0m")
     print()
 
@@ -755,6 +1412,16 @@ if __name__ == "__main__":
             add_connector("github", tool_count=8)
             continue
 
+        if cmd == "memory":
+            load_demo_recalled_memory()
+            assemble_system_prompt(verbose=True)
+            continue
+
+        if cmd == "memory clear":
+            clear_recalled_memory()
+            print("\033[32m[prompt] 本轮 recall 已清除\033[0m")
+            continue
+
         if cmd == "stats":
             print(f"\033[90m系统提示长度: {len(SYSTEM_PROMPT):,} 字符\033[0m")
             print(f"\033[90m估算 token: {len(SYSTEM_PROMPT)//4:,}\033[0m")
@@ -762,6 +1429,15 @@ if __name__ == "__main__":
             print(f"\033[90m激活专家: {active_expert['name'] if active_expert else '无'}\033[0m")
             print(f"\033[90m工作模式: {work_mode}\033[0m")
             print(f"\033[90m连接器: {len(connectors)}\033[0m")
+            if LAST_MEMORY_CONTEXT_PLAN is None:
+                print("\033[90mRecall: 无当前查询候选\033[0m")
+            else:
+                print(
+                    f"\033[90mRecall: {LAST_MEMORY_CONTEXT_PLAN.candidate_count} "
+                    f"候选 / {len(LAST_MEMORY_CONTEXT_PLAN.selected_memory_ids)} "
+                    f"已选择 / {LAST_MEMORY_CONTEXT_PLAN.used_chars} chars / "
+                    f"{LAST_MEMORY_CONTEXT_PLAN.used_tokens} tokens\033[0m"
+                )
             continue
 
         # Normal query — send to agent

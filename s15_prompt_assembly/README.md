@@ -1,372 +1,276 @@
-# s15: Prompt Assembly — prompt 是组装出来的, 不是写死的
+# s15: Prompt Assembly — 从召回候选到预算内上下文
 
-> *"prompt 是组装出来的, 不是写死的"* — 运行时分段拼接 + 身份注入。
+> Prompt 不是写死的字符串，也不是把所有召回结果直接拼进去。Harness 必须先选择，再装箱，最后才组装。
 >
-> **Harness 层**: 上下文管理 — 系统提示的运行时组装。
+> **Harness 层**：RAG / Context 的 selection → pack 边界。
 
 ---
 
-![Prompt 运行时组装](./images/prompt-assembly.svg)
+![S15 Memory Selection 与 Prompt Assembly](./images/prompt-assembly.svg)
+
+## 本章解决什么问题
+
+S12 已经把远端记录重写为一条可解释召回链：
+
+```text
+query → candidate → score → stable rank → RecallResult
+```
+
+但“召回到”不等于“应该进入 Prompt”。召回结果还可能包含：
+
+- 其他用户作用域的数据；
+- 只有弱词法重合的低置信度记录；
+- 内容重复、来源不同的记录；
+- 同一个事实槽位中的新旧冲突；
+- 排名靠后、超过 top-k 的记录；
+- 单条很长、会挤掉其他上下文的记录。
+
+因此 S15 负责后半条链：
+
+```text
+RecallResult
+  → scope gate
+  → confidence gate
+  → exact dedupe
+  → explicit conflict resolution
+  → stable top-k / budget packing
+  → <recalled_memory>
+  → total prompt segment planner
+```
+
+这条路径中的每个候选最终都有一个 `selected` 或 `rejected` 决策，以及机器可读的原因码。
 
 ## 代码架构图
 
 ```mermaid
 flowchart LR
-    A["Base Rules"] --> B["Memory Blocks"]
-    B --> C["Skills/Tools"]
-    C --> D["Budget Planner"]
-    D --> E["Required First"]
-    E --> F["Value Selection"]
-    F --> G["System Prompt + Decisions"]
-    C -. "state" .-> S["runtime state"]
-    S -. "recover" .-> C
+    A["S12 RecallHit"] --> B["S15 Candidate Adapter"]
+    B --> C["Scope + Confidence"]
+    C --> D["Dedupe + Conflict"]
+    D --> E["Stable top-k"]
+    E --> F["Char / Token Pack"]
+    F --> G["Recalled Memory Segment"]
+    G --> H["Total Prompt Planner"]
+    H --> I["System Prompt + Two Decision Logs"]
 ```
 
-## 学习前置知识
+## S12 与 S15 的职责边界
 
-- System prompt 应该是运行时组装物, 不是一个巨型静态字符串。
-- 每个上下文块都要有来源、优先级和预算。
-- Prompt 组装是 context engineering 的最后一公里。
+| 章节 | 负责 | 不负责 |
+|---|---|---|
+| S12 Remote Memory | query 规范化、候选生成、score breakdown、稳定排名、scope 与 provenance | 不决定最终 Prompt 使用哪些 hit |
+| S15 Prompt Assembly | scope/置信度门禁、去重、冲突、top-k、字符/token 预算、Prompt 片段组装 | 不重算检索分数，不写回长期记忆 |
 
-## 本章抓住的 WorkBuddy-style 机制
+`memory_candidates_from_recall()` 只做结构适配：复制 S12 的 `scope`、`score`、`rank` 和 `provenance`，不偷偷重排。这样 retrieval 与 selection 可以独立测试和演进。
 
-- 把 persona、memory、profile、skills、tools、hooks 作为片段按条件组装。
-- 演示预算裁剪和重新组装触发。
-- 连接 s10-s14 的记忆/压缩结果。
+## Memory Selection 的核心契约
 
-## 常见误区
+### `MemoryContextCandidate`
 
-- 把所有配置常驻 prompt, 会造成隐性 token 税。
-- 片段没有优先级, 裁剪时容易删掉安全规则。
-- 运行中状态变化后不重组装, 模型会拿过期上下文工作。
-## 问题
+一条候选包含：
 
-很多人以为系统提示就是一段写死的文字——"你是一个有用的助手"开头，加几条规则，完事。但在真实的 agent harness 里，系统提示是一个**动态拼装的产物**。
+- `memory_id`：稳定身份；
+- `text`：准备进入上下文的紧凑文本；
+- `user_scope`：所有权边界；
+- `score`：S12 产生的召回分数；
+- `source_rank`：S12 的稳定排名；
+- `provenance`：来源 ID、类型、标题与采集时间；
+- `conflict_key`：可选的显式事实槽位。
 
-WorkBuddy 的系统提示可能有 100KB+。它包含：基础指令、身份文件内容、云端记忆、项目上下文、工具描述、专家指令、技能指令、连接器状态、区域约定、工作模式。这些片段**不是每次都一样**——加载了新技能，技能指令就加进去；切换了专家，专家指令就换一份；用户切换工作模式，相关约束就变。
+`conflict_key` 不由 S15 从自然语言里猜。例如“自动化语言偏好”可以由结构化记忆生产者标成 `preference:automation-language`。让 Prompt Assembly 再调用一个模型判断矛盾，会把不可观察的第二次推理藏进关键路径。
 
-如果系统提示是写死的字符串，你无法做到这些。你需要一个**分段组装机制**：每个片段独立维护，按条件包含，运行时拼接。
+### `MemorySelectionPolicy`
 
----
-
-## 解决方案
-
-系统提示不是一个字符串，而是一组**片段（segments）**的有序拼接：
-
-| # | 片段 | 来源 | 条件 | 预算策略 |
-|---|------|------|------|----------|
-| 1 | 基础指令 | Harness 基础规则 | 始终包含 | required，不允许删除 |
-| 2 | 身份注入 | 用户 persona | 文件存在时 | 可选，高价值 |
-| 3 | 云端记忆 | `<memory>` 块 (s12) | Profile 非空时 | 可选，中等价值，整块取舍 |
-| 4 | 项目上下文 | 工作区文件结构 | 始终构建 | 可选，高价值 |
-| 5 | 工具描述 | Harness 工具注册表 | 有工具时 | required，防止模型臆造工具 |
-| 6 | 专家指令 | 当前激活专家 | 专家激活时 | 可选，高价值 |
-| 7 | 技能指令 | 已加载 SKILL.md | 技能加载时 | 可选，高价值 |
-| 8 | 连接器状态 | 运行时连接器 | 有连接器时 | 可选，较低价值 |
-| 9 | 区域约定 | 当前区域配置 | 按区域 | 可选，低价值 |
-| 10 | 工作模式 | Harness 当前模式 | 始终包含 | required，不允许删除 |
-
-```
-运行时组装:
-
-  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-  │ 基础指令  │  │ 身份注入  │  │ 云端记忆  │  │ 项目上下文│
-  │ (always) │  │ (if file)│  │ (if mem) │  │ (always) │
-  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
-       │              │              │              │
-       ▼              ▼              ▼              ▼
-  ┌─────────────────────────────────────────────────────┐
-  │                   拼接器 (joiner)                    │
-  └──────────────────────┬──────────────────────────────┘
-                         │
-       ┌─────────────────┼──────────────────┐
-       ▼                 ▼                  ▼
-  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-  │ 工具描述  │  │ 专家指令  │  │ 技能指令  │  │ 工作模式  │
-  │ (dynamic)│  │ (if exp) │  │ (if skill)│  │ (always) │
-  └──────────┘  └──────────┘  └──────────┘  └──────────┘
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │  最终系统提示 (100KB+)│
-              └─────────────────────┘
+```python
+policy = MemorySelectionPolicy(
+    min_score=0.35,
+    top_k=5,
+    max_chars=3_000,
+    max_tokens=800,
+)
 ```
 
----
+字符和 token 是两条独立约束。字符预算适合完全离线、确定性的教学回归；token 预算可以注入目标模型 tokenizer：
 
-## 工作原理
+```python
+plan = select_memory_context(
+    candidates,
+    user_scope=current_scope,
+    policy=policy,
+    token_counter=target_model_tokenizer,
+)
+```
 
-### 两种顺序不能混为一谈
+默认 `estimate_context_tokens()` 只是透明的离线估算：拉丁词组、单个 CJK 字符和标点分别计一个教学单位。它不会冒充任何供应商 tokenizer。
 
-`priority` 决定最终 Prompt 中片段的展示顺序，`budget_priority` 决定预算不足时谁先获得空间。两者刻意分开：工作模式可以放在 Prompt 最后，但仍然是不可删除的 required 片段；项目上下文可以排在 Memory 后面，却比区域格式更值得保留。
+### `MemoryContextPlan`
 
-规划器分两阶段执行：
+Plan 同时返回：
+
+- `context`：预算内的 `<recalled_memory>`；
+- `used_chars` / `used_tokens`：包括 XML wrapper 与 provenance 属性的真实装箱成本；
+- `selected_memory_ids` / `rejected_memory_ids`；
+- `decisions`：每条候选的状态、原因、关联 winner 和解释文本。
+
+## 选择顺序为什么不能交换
+
+### 1. Scope gate
+
+候选的 `user_scope` 必须与当前查询作用域一致。即使跨用户候选分数最高，也先以 `scope_mismatch` 拒绝，不能让排序覆盖安全边界。
+
+### 2. Confidence gate
+
+低于 `min_score` 的记录以 `low_confidence` 拒绝。低置信度不是“排在最后也许能用”，而是默认 abstain，避免预算宽松时把噪声重新放回 Prompt。
+
+### 3. Exact dedupe
+
+内容经过 NFKC、大小写折叠和空白归一化后做确定性精确去重。排序更强的候选保留，其他候选记录 `duplicate_content` 以及 winner ID。
+
+这里刻意不声称完成了语义去重。生产环境可以在上游增加 embedding cluster，但必须继续输出可追踪的 winner/loser 关系。
+
+### 4. Explicit conflict resolution
+
+相同 `conflict_key` 的不同内容竞争同一事实槽位。候选先按以下键稳定排序：
+
+```text
+score desc → source_rank asc → captured_at desc → memory_id asc
+```
+
+第一条成为 winner，其余以 `conflict_loser` 拒绝。冲突败者不会因为 winner 太长或当前预算变化而回填，因为它表达的是已被裁决掉的事实，不只是昂贵上下文。
+
+### 5. Top-k 与预算装箱
+
+存活候选按稳定顺序逐条尝试：
+
+- 已经选满时：`top_k_reached`；
+- 加入后字符超限：`char_budget_exceeded`；
+- 加入后 token 超限：`token_budget_exceeded`；
+- 两条预算都满足：`selected`。
+
+每个 `<memory_hit>` 是原子块，不做中间截断。某条高分记录过长时会被拒绝，但不会停止装箱；较小的后续候选仍可填入剩余预算，直到选满 top-k。
+
+## 两层预算，而不是一个模糊的长度限制
+
+S15 有两次不同的决策：
+
+```text
+Memory candidates
+  └─ MemorySelectionPolicy
+       └─ <recalled_memory> segment
+            └─ plan_prompt(total prompt budget)
+                 └─ final system prompt
+```
+
+第一层在 memory 内部选择事实，能解释每条 hit 为什么被拒绝；第二层在系统提示全局比较 persona、memory、project、skills 等片段的价值。如果总 Prompt 预算更紧，整个 memory 片段仍可能被原子舍弃，并由 `SegmentDecision` 记录原因。
+
+这两个决策日志不能合并：一个回答“为什么没选这条记忆”，另一个回答“为什么最终没放这个 Prompt 片段”。
+
+## 系统提示的十类片段
+
+| # | 片段 | 来源 | 条件 | 总预算策略 |
+|---|---|---|---|---|
+| 1 | Base instructions | Harness 基础规则 | 始终 | required |
+| 2 | Identity | SOUL / IDENTITY / USER | 文件存在或教学默认值 | 可选，高价值 |
+| 3 | Recalled memory | S12 → S15 selection plan | 当前查询有选中 hit | 可选，中等价值 |
+| 4 | Project context | 工作区结构 | 始终构建 | 可选，高价值 |
+| 5 | Tool descriptions | 工具注册表 | 有工具 | required |
+| 6 | Expert instructions | 当前专家 | 激活时 | 可选，高价值 |
+| 7 | Skill instructions | 已加载 SKILL.md | 加载时 | 可选，高价值 |
+| 8 | Connector status | MCP connectors | 有连接器时 | 可选，较低价值 |
+| 9 | Regional conventions | 当前区域 | 按区域 | 可选，低价值 |
+| 10 | Working mode | craft / plan / ask | 始终 | required |
+
+### 展示顺序和预算价值是两件事
+
+`priority` 决定片段最后出现在 Prompt 的位置，`budget_priority` 决定预算紧张时谁先获得空间。工作模式可以放在 Prompt 最后，却仍然是不可删除的 required 片段。
+
+总 Prompt 规划流程为：
 
 ```text
 构建片段并记录 provenance
-  → 先预留 required 片段
-  → required 已超预算则 fail-closed
-  → 可选片段按 budget_priority 从高到低尝试放入
-  → 已选片段按 priority 排序并拼接
-  → 返回 Prompt + included/dropped/inactive 决策
+  → 先预留 required
+  → required 超预算时 fail-closed
+  → optional 按 budget_priority 尝试加入
+  → 已选片段按 priority 渲染
+  → PromptPlan + SegmentDecision
 ```
 
-本章使用字符数作为确定性的离线预算单位。它不是声称所有模型都采用同一种 tokenizer；生产适配器可以把长度函数替换为目标模型的 tokenizer，但 required、价值选择、provenance 和决策报告契约不变。
+如果 required 本身超过预算，`PromptBudgetError` 会阻止 provider 调用，而不是静默删除安全规则。
 
-教学 CLI 默认预算是 12,000 字符，也可以通过环境变量收紧后观察决策：
+## 运行时重新组装
 
-```bash
-PROMPT_BUDGET_CHARS=2000 python s15_prompt_assembly/code.py
-```
-
-如果 required 片段本身已经超过预算，组装会抛出 `PromptBudgetError`，而不是删除安全规则后继续调用模型。
-
-### 离线组合与在线 provider 的边界
-
-`PromptSegment`、`PromptPlan` 和 `plan_prompt()` 是纯离线契约。导入本章并调用预算规划器不需要 provider SDK、`MODEL_ID`、API key 或网络；只有真正进入 `agent_loop()` 时，`runtime_client()` 才检查在线配置并构造 Anthropic client。
-
-这个延迟初始化边界让其他教学示例可以直接组合 S15，而不需要伪造模型配置。缺少 `MODEL_ID` 或 SDK 时，在线入口仍会在调用点明确失败。
-
-### 片段定义
-
-每个片段是一个函数，返回字符串（或 None 表示不包含）：
-
-```python
-class PromptSegment:
-    """系统提示的一个片段。"""
-    def __init__(self, name: str, builder, condition=None,
-                 priority=50, required=False,
-                 budget_priority=50, provenance="runtime"):
-        self.name = name        # 片段名 (用于调试)
-        self.builder = builder  # 构建函数 -> str | None
-        self.condition = condition or (lambda: True)
-        self.priority = priority              # Prompt 展示顺序
-        self.required = required              # 预算不能删除
-        self.budget_priority = budget_priority # 预算保留价值
-        self.provenance = provenance          # 来源标签
-
-    def build(self) -> str | None:
-        if not self.condition():
-            return None
-        return self.builder()
-```
-
-### 片段实现示例
-
-```python
-def build_base_instructions() -> str:
-    """基础指令 — 始终包含。"""
-    return f"""你是一个桌面 AI 助手。
-工作目录: {WORKDIR}
-
-核心规则:
-- 使用工具解决问题, 不要只说不做
-- 遵循权限系统 (s04)
-- 工具执行前后有 hooks 扩展点"""
-
-def build_identity() -> str | None:
-    """身份注入 — 读取 SOUL/IDENTITY/USER 文件。"""
-    parts = []
-    for name, path in [("SOUL", "~/.workbuddy/persona/core.md"),
-                       ("IDENTITY", "~/.workbuddy/persona/identity.md"),
-                       ("USER", "~/.workbuddy/persona/user.md")]:
-        p = Path(path).expanduser()
-        if p.exists():
-            parts.append(f"## {name}\n{p.read_text().strip()}")
-    return "\n\n".join(parts) if parts else None
-
-def build_cloud_memory() -> str | None:
-    """云端记忆 — 来自 s12 的 Profile 注入。"""
-    profile = load_cloud_profile()
-    if not profile:
-        return None
-    return f"<memory>\n{profile}\n</memory>"
-
-def build_tool_descriptions() -> str:
-    """工具描述 — 从注册工具动态生成。"""
-    if not TOOLS:
-        return ""
-    lines = ["## 可用工具"]
-    for tool in TOOLS:
-        lines.append(f"- {tool['name']}: {tool['description']}")
-    return "\n".join(lines)
-```
-
-### 条件包含
-
-有些片段只在特定条件下才包含：
-
-```python
-def build_expert_instructions() -> str | None:
-    """专家指令 — 只有激活了专家时才包含。"""
-    if not active_expert:
-        return None
-    return f"## 专家: {active_expert['name']}\n{active_expert['instructions']}"
-
-def build_skill_instructions() -> str | None:
-    """技能指令 — 加载了技能时才包含。"""
-    if not loaded_skills:
-        return None
-    parts = []
-    for skill in loaded_skills:
-        parts.append(f"## 技能: {skill['title']}\n{skill['content']}")
-    return "\n\n".join(parts)
-```
-
-### 预算规划与拼接
-
-```python
-plan = plan_prompt(segments, budget_chars=12_000)
-system_prompt = plan.prompt
-
-print(plan.included_names)
-print(plan.dropped_names)
-for decision in plan.decisions:
-    print(decision.name, decision.status,
-          decision.provenance, decision.reason)
-```
-
-规划器把片段当成原子的信任与来源边界。预算不足时会完整舍弃一个可选 Memory 或 Skill，而不是把它从中间切断；如果某类内容支持安全压缩，应由它自己的 builder 先生成紧凑投影，再交给规划器选择。
-
-### 重新组装的时机
-
-系统提示**不是每次 API 调用都重新组装**——那样太浪费。它在以下事件发生时重新组装：
+系统提示会缓存，但下列状态变化会触发重新组装：
 
 | 事件 | 影响的片段 |
-|------|-----------|
-| 会话启动 | 全部 |
-| 加载新技能 | 技能指令 |
-| 切换专家 | 专家指令 |
-| 切换工作模式 | 工作模式 |
-| 连接器上线/下线 | 连接器状态 |
-| 用户修改身份文件 | 身份注入 |
+|---|---|
+| 新查询安装 S12 recall candidates | Memory selection 与 memory segment |
+| 查询结束或切换用户 scope | 清除 memory segment，防止跨查询泄漏 |
+| 加载技能 | Skill instructions |
+| 切换专家 | Expert instructions |
+| 切换工作模式 | Working mode |
+| 连接器上线/下线 | Connector status |
+| 身份文件修改 | Identity |
 
-```python
-def on_skill_loaded(skill):
-    """技能加载后, 重新组装系统提示。"""
-    loaded_skills.append(skill)
-    global SYSTEM_PROMPT
-    SYSTEM_PROMPT = assemble_system_prompt()
-    print(f"[prompt] 重新组装, 新长度: {len(SYSTEM_PROMPT)} 字符")
-```
+`set_recalled_memory()` 保存的是候选，不是上一次渲染好的字符串。每次重组装都会在当前 scope、policy 和 tokenizer 下重新规划。`clear_recalled_memory()` 则显式结束查询期状态。
 
----
-
-## WorkBuddy 架构对照
-
-生产级桌面 agent 的系统提示组装是 `agent bridge` 中的核心流程。它的片段比教学版更多：
-
-### 组装流程
-
-```javascript
-// agent bridge 中的系统提示组装 (简化)
-function assembleSystemPrompt(context) {
-    const segments = [];
-
-    // 1. 基础指令 — agent loop 规则, 工具使用指南
-    segments.push(BASE_INSTRUCTIONS);
-
-    // 2. 身份注入 — persona/core.md, persona/identity.md, persona/user.md, persona/bootstrap.md
-    const identity = readIdentityFiles();
-    if (identity) segments.push(identity);
-
-    // 3. 云端记忆 — <memory> 块 (s12)
-    if (context.cloudProfile) {
-        segments.push(`<memory>\n${context.cloudProfile}\n</memory>`);
-    }
-
-    // 4. 项目上下文 — 文件结构, git 状态, CODEBUDDY.md
-    segments.push(buildProjectContext(context.workdir));
-
-    // 5. 工具描述 — 从注册工具动态生成
-    segments.push(buildToolSection(context.tools));
-
-    // 6. 专家指令 — 激活的专家包内容
-    if (context.activeExpert) {
-        segments.push(context.activeExpert.instructions);
-    }
-
-    // 7. 技能指令 — 已加载技能的 SKILL.md
-    for (const skill of context.loadedSkills) {
-        segments.push(skill.content);
-    }
-
-    // 8. 连接器状态 — 可用 MCP 连接器及其工具
-    if (context.connectors.length > 0) {
-        segments.push(buildConnectorStatus(context.connectors));
-    }
-
-    // 9. 区域约定 — 股市颜色, 货币符号, 日期格式
-    segments.push(buildRegionalConventions(context.region));
-
-    // 10. 工作模式 — craft / plan / ask
-    segments.push(buildWorkModeInstructions(context.mode));
-
-    return segments.join('\n\n---\n\n');
-}
-```
-
-### 身份文件
-
-WorkBuddy 的身份系统由四个文件组成：
-
-| 文件 | 内容 | 作用 |
-|------|------|------|
-| `persona/core.md` | 核心人格、价值观 | 定义 agent "是谁" |
-| `persona/identity.md` | 名字、角色、语气 | 定义 agent "叫什么" |
-| `persona/user.md` | 用户信息、偏好 | 定义 "服务谁" |
-| `persona/bootstrap.md` | 初始化引导 | 首次使用时的引导 |
-
-这些文件在 `~/.workbuddy/` 下，用户可编辑。每次组装时读取最新内容。
-
-### 重新组装的触发
-
-```javascript
-// 事件驱动重新组装
-eventBus.on('skill:loaded', () => reassemble());
-eventBus.on('expert:changed', () => reassemble());
-eventBus.on('mode:switched', () => reassemble());
-eventBus.on('connector:status', () => reassemble());
-eventBus.on('identity:changed', () => reassemble());
-```
-
-系统提示组装后缓存，直到下一个触发事件才重新组装。
-
----
-
-## 代码 walkthrough
-
-`code.py` 演示了系统提示的分段组装：
-
-1. **`PromptSegment` 类** — 每个片段有名字、构建条件、展示顺序、预算价值、required 标志和 provenance
-2. **10 个片段构建器** — 模拟 WorkBuddy 的全部片段类型
-3. **`plan_prompt()`** — 先保 required，再按价值选择可选片段，并计算分隔符成本
-4. **`PromptPlan` / `SegmentDecision`** — 输出 Prompt 以及可解释的纳入、舍弃与 inactive 决策
-5. **重新组装触发** — 演示加载技能、切换专家、切换模式时重新规划
-6. **agent 循环** — 使用预算内的系统提示，支持运行时重新组装
-
-运行后可以输入 `prompt` 查看当前系统提示的结构，输入 `skill` 模拟加载技能（触发重新组装），输入 `expert` 模拟切换专家。
-
----
-
-## 运行
+## 无 API key 的演示
 
 ```bash
 python s15_prompt_assembly/code.py
 ```
 
----
+进入交互后输入：
+
+```text
+memory
+```
+
+教学 fixture 会同时产生：正确候选、重复候选、同槽冲突、低置信度候选和跨用户候选。终端会展示每条记录的 rank、score、selected/rejected、原因码和解释，并展示 memory 与总 Prompt 两层预算。
+
+继续输入：
+
+```text
+memory clear
+```
+
+即可观察查询结束后 Memory 片段变为 inactive。
+
+也可以收紧总 Prompt 字符预算：
+
+```bash
+PROMPT_BUDGET_CHARS=2000 python s15_prompt_assembly/code.py
+```
+
+`PromptSegment`、`MemoryContextCandidate`、`select_memory_context()` 和 `plan_prompt()` 都是纯标准库离线契约。只有真正进入 `agent_loop()` 时，`runtime_client()` 才检查 `MODEL_ID`、provider SDK 和 API 配置。
+
+## 常见误区
+
+- **把 RecallHit 直接拼进 Prompt**：跳过 scope、冲突和预算决策。
+- **只保留 total score**：无法解释低置信度或冲突 winner。
+- **用输入顺序决定冲突**：JSONL 顺序变化会让事实翻转。
+- **对长记忆直接切字符串**：可能切断 provenance、XML 和事实语义。
+- **把未命中写成空 `<memory>`**：浪费 token，且让模型误以为存在记忆证据。
+- **把字符估算叫真实 token**：不同模型 tokenizer 不同，应显式注入。
+- **总预算不足就删除安全规则**：required 必须 fail-closed。
+- **查询结束后不清 memory state**：可能把上一轮候选泄漏到下一用户或下一问题。
+
+## 面试时应能讲清楚
+
+1. Retrieval、selection、packing、prompt assembly 分别解决什么问题？
+2. 为什么 scope 和 confidence 必须在去重、冲突、预算之前？
+3. 为什么 conflict 需要显式 slot，而不能靠字符串去重代替？
+4. 高分长候选超预算后，为什么允许小候选 backfill，而 conflict loser 不允许？
+5. 为什么需要 memory decision log 和 segment decision log 两套审计？
+6. 如何接入真实 tokenizer，而不破坏离线回归和上层 API？
+7. 如何把精确去重升级为语义去重，同时保持 deterministic replay？
 
 ## 练习
 
-1. 加一个 `build_codebuddy_md()` 片段——读取工作目录下的 `CODEBUDDY.md` 文件，如果存在就注入项目级指令。思考：这个片段和身份注入有什么区别？
-2. 为目标模型接入 tokenizer，把字符预算替换为 token 预算，并证明预算决策顺序不随长度实现改变。
-3. 为某个可选片段实现安全的紧凑 builder；比较“先压缩再选择”与“直接舍弃”的上下文质量和来源完整性。
-
----
+1. 注入目标模型 tokenizer，对比默认 estimator 的选择差异，并验证每次运行的 decision log 可复现。
+2. 在上游增加结构化 `fact_type + subject`，生成更可靠的 conflict key。
+3. 增加“必须保留”的 Memory 类型，思考它与 Harness required 安全规则有何不同，以及预算不足时是否应该 fail-closed。
+4. 把 decision reason 汇总为 offline eval 指标，例如 scope rejection rate、low-confidence abstention rate 和 budget utilization。
 
 ## 下一课
 
-系统提示组装好了，工具和身份都注入了。但 agent 还需要一种能力——按需加载扩展知识。不是所有知识都要一开始就塞进提示里，而是用到时才展开。
-
-s16 Skills System → SKILL.md frontmatter, 按需加载。
+S15 已经能把检索结果选择并装进 Prompt。下一步 S16 处理按需加载的 Skills，让扩展知识不必从会话开始就常驻上下文。

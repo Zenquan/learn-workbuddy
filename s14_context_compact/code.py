@@ -33,7 +33,7 @@ Four layers, triggered from lightest to heaviest:
   │    ├─ L3: prune old messages (keep recent N)         │
   │    └─ L4: generate summary (model call)              │
   │                                                      │
-  │  NEVER compact: durable facts, pending work, sources │
+  │  NEVER compact: facts, pending work, retrieval proof │
   └──────────────────────────────────────────────────────┘
 
 Production harnesses often use: precise tiktoken counting, priority-based pruning,
@@ -45,10 +45,11 @@ Usage:
 """
 import copy
 import json
+import math
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,7 @@ PROGRESSION = {
         "token pressure detection",
         "structured compaction",
         "durable state preservation",
+        "selected retrieval evidence retention",
     ],
     "preserves": [
         "externalized output pointers",
@@ -139,14 +141,20 @@ def _required_text(value: str, *, field_name: str) -> str:
     return normalized
 
 
-def _confirmed_at(value: str) -> str:
-    """Require an explicit timezone so recency remains comparable after restart."""
+def _zoned_timestamp(value: str, *, field_name: str) -> str:
+    """Require an explicit timezone so evidence stays comparable after restart."""
 
-    normalized = _required_text(value, field_name="last_confirmed_at")
+    normalized = _required_text(value, field_name=field_name)
     parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        raise ValueError("last_confirmed_at must include a timezone")
+        raise ValueError(f"{field_name} must include a timezone")
     return normalized
+
+
+def _confirmed_at(value: str) -> str:
+    """Validate a durable fact or pending item's confirmation time."""
+
+    return _zoned_timestamp(value, field_name="last_confirmed_at")
 
 
 @dataclass(frozen=True)
@@ -194,23 +202,139 @@ class PendingItem:
 
 
 @dataclass(frozen=True)
+class RetrievalEvidence:
+    """Lossless audit metadata copied from one already-selected memory hit.
+
+    The recalled text may later appear only in a generated summary.  These
+    fields therefore keep the independent route back to its source and the
+    ranking/conflict decision that admitted it.  S14 does not select hits or
+    recompute scores; it only freezes evidence produced by the retrieval path.
+    """
+
+    memory_id: str
+    source_id: str
+    source_type: str
+    source_title: str
+    captured_at: str
+    score: float
+    source_rank: int
+    conflict_key: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "memory_id",
+            _required_text(self.memory_id, field_name="retrieval memory_id"),
+        )
+        object.__setattr__(
+            self,
+            "source_id",
+            _required_text(self.source_id, field_name="retrieval source_id"),
+        )
+        object.__setattr__(
+            self,
+            "source_type",
+            _required_text(self.source_type, field_name="retrieval source_type"),
+        )
+        object.__setattr__(
+            self,
+            "source_title",
+            # S12 treats titles as presentation metadata: source ID and type are
+            # the required identity, while an untitled source remains valid.
+            " ".join(str(self.source_title).split()),
+        )
+        object.__setattr__(
+            self,
+            "captured_at",
+            _zoned_timestamp(self.captured_at, field_name="captured_at"),
+        )
+        if (
+            isinstance(self.score, bool)
+            or not isinstance(self.score, (int, float))
+            or not math.isfinite(self.score)
+            or not 0.0 <= self.score <= 1.0
+        ):
+            raise ValueError("retrieval score must be finite and between 0 and 1")
+        object.__setattr__(self, "score", float(self.score))
+        if (
+            isinstance(self.source_rank, bool)
+            or not isinstance(self.source_rank, int)
+            or self.source_rank < 1
+        ):
+            raise ValueError("retrieval source_rank must be a positive integer")
+        if self.conflict_key is not None:
+            object.__setattr__(
+                self,
+                "conflict_key",
+                _required_text(
+                    self.conflict_key,
+                    field_name="retrieval conflict_key",
+                ),
+            )
+
+
+def capture_retrieval_evidence(
+    selected_hits: Sequence[object],
+) -> tuple[RetrievalEvidence, ...]:
+    """Copy source/ranking fields from hits selected by an upstream policy.
+
+    Both S12 ``RecallHit`` and S15 ``MemoryContextCandidate`` expose this
+    structural shape; their rank attribute is named ``rank`` and
+    ``source_rank`` respectively.  Accepting the shape instead of importing a
+    later chapter keeps S14 independently runnable.  Callers must pass only
+    selected hits: compaction must never rerun scope, confidence, conflict, or
+    budget policy against a different context window.
+    """
+
+    captured: list[RetrievalEvidence] = []
+    for hit in selected_hits:
+        provenance = getattr(hit, "provenance", None)
+        if provenance is None:
+            raise ValueError("selected retrieval hit must carry provenance")
+        source_rank = getattr(hit, "source_rank", None)
+        if source_rank is None:
+            source_rank = getattr(hit, "rank", None)
+        captured.append(
+            RetrievalEvidence(
+                memory_id=getattr(hit, "memory_id", ""),
+                source_id=getattr(provenance, "source_id", ""),
+                source_type=getattr(provenance, "source_type", ""),
+                source_title=getattr(provenance, "title", ""),
+                captured_at=getattr(provenance, "captured_at", ""),
+                score=getattr(hit, "score", None),
+                source_rank=source_rank,
+                conflict_key=getattr(hit, "conflict_key", None),
+            )
+        )
+    memory_ids = [item.memory_id for item in captured]
+    if len(memory_ids) != len(set(memory_ids)):
+        raise ValueError("selected retrieval hit memory ids must be unique")
+    return tuple(captured)
+
+
+@dataclass(frozen=True)
 class DurableContextState:
     """Typed state carried around compaction rather than summarized by it."""
 
     facts: tuple[DurableFact, ...] = ()
     pending_items: tuple[PendingItem, ...] = ()
+    retrieval_evidence: tuple[RetrievalEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         # Type hints do not stop callers from passing lists. Normalize them here
         # so a frozen state cannot still be mutated through a list reference.
         object.__setattr__(self, "facts", tuple(self.facts))
         object.__setattr__(self, "pending_items", tuple(self.pending_items))
+        object.__setattr__(self, "retrieval_evidence", tuple(self.retrieval_evidence))
         fact_ids = [item.fact_id for item in self.facts]
         pending_ids = [item.item_id for item in self.pending_items]
+        retrieval_ids = [item.memory_id for item in self.retrieval_evidence]
         if len(fact_ids) != len(set(fact_ids)):
             raise ValueError("durable fact ids must be unique")
         if len(pending_ids) != len(set(pending_ids)):
             raise ValueError("pending item ids must be unique")
+        if len(retrieval_ids) != len(set(retrieval_ids)):
+            raise ValueError("retrieval evidence memory ids must be unique")
 
 
 EMPTY_DURABLE_STATE = DurableContextState()
@@ -230,7 +354,7 @@ class CompactionResult:
 def render_durable_context(state: DurableContextState) -> str:
     """Render source-bearing state separately from a generated conversation summary."""
 
-    if not state.facts and not state.pending_items:
+    if not state.facts and not state.pending_items and not state.retrieval_evidence:
         return ""
     lines = ["[Durable context — do not reinterpret as conversation summary]"]
     if state.facts:
@@ -246,6 +370,20 @@ def render_durable_context(state: DurableContextState) -> str:
             lines.append(
                 f"- {item.item_id}: {item.description} "
                 f"(source={item.source_pointer}; confirmed={item.last_confirmed_at})"
+            )
+    if state.retrieval_evidence:
+        lines.append("Selected retrieval evidence:")
+        for evidence in state.retrieval_evidence:
+            conflict = (
+                f"; conflict_winner={evidence.conflict_key}"
+                if evidence.conflict_key
+                else "; conflict=none"
+            )
+            lines.append(
+                f"- {evidence.memory_id}: "
+                f"source={evidence.source_type}:{evidence.source_id}; "
+                f"title={evidence.source_title}; captured={evidence.captured_at}; "
+                f"score={evidence.score}; rank={evidence.source_rank}{conflict}"
             )
     return "\n".join(lines)
 

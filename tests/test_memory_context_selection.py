@@ -15,6 +15,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(scope="module")
+def s14():
+    module_name = "s14_retrieval_evidence_test_module"
+    spec = importlib.util.spec_from_file_location(
+        module_name, ROOT / "s14_context_compact" / "code.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    yield module
+    sys.modules.pop(module_name, None)
+
+
+@pytest.fixture(scope="module")
 def s15(tmp_path_factory: pytest.TempPathFactory):
     stub_dir = ROOT / "tests" / "stubs"
     state_root = tmp_path_factory.mktemp("s15-memory-selection-state")
@@ -250,6 +264,73 @@ def test_recall_adapter_preserves_scope_score_rank_and_provenance(s15) -> None:
             conflict_key="preference:grounding",
         ),
     )
+
+
+def test_selected_memory_evidence_survives_lossy_compaction(
+    s14,
+    s15,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    winner = candidate(
+        s15,
+        "python-new",
+        "Prefer Python for automation",
+        score=0.95,
+        conflict_key="preference:automation-language",
+    )
+    loser = candidate(
+        s15,
+        "typescript-old",
+        "Prefer TypeScript for automation",
+        score=0.70,
+        source_rank=2,
+        conflict_key="preference:automation-language",
+    )
+    plan = s15.select_memory_context(
+        [loser, winner],
+        user_scope="scope-a",
+        policy=s15.MemorySelectionPolicy(min_score=0.1),
+    )
+    selected_ids = set(plan.selected_memory_ids)
+    selected = [item for item in (loser, winner) if item.memory_id in selected_ids]
+    evidence = s14.capture_retrieval_evidence(selected)
+    state = s14.DurableContextState(retrieval_evidence=evidence)
+    messages = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"turn {index}: " + "disposable detail " * 40,
+        }
+        for index in range(10)
+    ]
+    monkeypatch.setattr(s14, "TOKEN_THRESHOLD", 1)
+
+    result = s14.compact_context(
+        messages,
+        state,
+        summarizer=lambda _conversation: "Old memory content was compressed.",
+        verbose=False,
+    )
+    rendered = s14.render_durable_context(result.durable_state)
+
+    assert result.durable_state is state
+    assert result.durable_state.retrieval_evidence == evidence
+    assert "conversation_summary" in result.applied_layers
+    assert evidence == (
+        s14.RetrievalEvidence(
+            memory_id="python-new",
+            source_id="source-python-new",
+            source_type="conversation",
+            source_title="Memory python-new",
+            captured_at="2026-08-17T08:00:00Z",
+            score=0.95,
+            source_rank=1,
+            conflict_key="preference:automation-language",
+        ),
+    )
+    assert "source-python-new" in rendered
+    assert "score=0.95" in rendered
+    assert "conflict_winner=preference:automation-language" in rendered
+    assert "typescript-old" not in rendered
 
 
 def test_empty_input_is_explicit_and_duplicate_ids_fail_closed(s15) -> None:

@@ -46,6 +46,18 @@ def _durable_state(s14):
                 last_confirmed_at="2026-08-12T10:00:00+08:00",
             ),
         ),
+        retrieval_evidence=(
+            s14.RetrievalEvidence(
+                memory_id="memory-db",
+                source_id="transcript:session-42:17",
+                source_type="transcript",
+                source_title="Persistence decision",
+                captured_at="2026-08-12T09:30:00+08:00",
+                score=0.923456,
+                source_rank=1,
+                conflict_key="architecture:persistence",
+            ),
+        ),
     )
 
 
@@ -129,6 +141,9 @@ def test_untrusted_summary_cannot_rewrite_fact_pending_source_or_confirmation(
     assert "Run the migration rollback test." in rendered
     assert "transcript:session-42:17" in rendered
     assert "artifact:session-42:tool_result_003.txt:abc123" in rendered
+    assert "memory-db" in rendered
+    assert "score=0.923456" in rendered
+    assert "conflict_winner=architecture:persistence" in rendered
     assert "2026-08-12T09:30:00+08:00" in rendered
     assert "2026-08-12T10:00:00+08:00" in rendered
 
@@ -157,9 +172,33 @@ def test_durable_state_normalizes_mutable_collections(s14) -> None:
 
 def test_duplicate_durable_ids_fail_before_prompt_assembly(s14) -> None:
     fact = _durable_state(s14).facts[0]
+    evidence = _durable_state(s14).retrieval_evidence[0]
 
     with pytest.raises(ValueError, match="fact ids"):
         s14.DurableContextState(facts=(fact, fact))
+    with pytest.raises(ValueError, match="retrieval evidence memory ids"):
+        s14.DurableContextState(retrieval_evidence=(evidence, evidence))
+
+
+def test_retrieval_evidence_rejects_untraceable_ranking_metadata(s14) -> None:
+    values = {
+        "memory_id": "memory-1",
+        "source_id": "transcript-1",
+        "source_type": "transcript",
+        "source_title": "Decision",
+        "captured_at": "2026-08-18T09:00:00+08:00",
+        "score": 0.8,
+        "source_rank": 1,
+    }
+
+    with pytest.raises(ValueError, match="score"):
+        s14.RetrievalEvidence(**{**values, "score": 1.1})
+    with pytest.raises(ValueError, match="source_rank"):
+        s14.RetrievalEvidence(**{**values, "source_rank": 0})
+    with pytest.raises(ValueError, match="captured_at.*timezone"):
+        s14.RetrievalEvidence(
+            **{**values, "captured_at": "2026-08-18T09:00:00"}
+        )
 
 
 def test_failed_or_empty_summary_keeps_original_messages(s14) -> None:

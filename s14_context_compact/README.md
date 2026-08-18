@@ -15,7 +15,9 @@ flowchart LR
     A["Transcript-derived messages"] --> B["Deep-copy prompt view"]
     B --> C["L1 truncate → L2 dedup → L3 prune → L4 summary"]
     C --> D["Compacted messages"]
-    S["DurableContextState"] --> R["Lossless renderer"]
+    H["Selected MemoryHit"] --> P["capture source / score / rank / conflict"]
+    P --> S["DurableContextState"]
+    S --> R["Lossless renderer"]
     R --> E["Next API call"]
     D --> E
     S -. "bypasses lossy layers" .-> C
@@ -32,8 +34,9 @@ flowchart LR
 
 - 吸收公开 Agent 架构中的分层压缩与结构化摘要思路。
 - 四层策略只处理可丢弃、可重建的 messages 副本，不修改 Transcript 派生输入。
-- 用不可变 `DurableContextState` 单独携带已确认事实和未决事项。
+- 用不可变 `DurableContextState` 单独携带已确认事实、未决事项和已选检索证据。
 - 每条 durable item 强制保留 source pointer 与 `last_confirmed_at`，并在下一轮 system context 中结构化渲染。
+- `capture_retrieval_evidence()` 只冻结上游已经选中的 hit，不在压缩阶段重做 scope、score、冲突或预算裁决。
 
 ## 常见误区
 
@@ -98,7 +101,7 @@ agent 跑得越久，消息历史越长。一次对话可能产生几十条消�
   └─────────────────────────────────────┘
 ```
 
-**关键原则**：系统提示、工具定义与 `DurableContextState` **永远不进入有损压缩层**。压缩器先深拷贝 messages，四层只操作这份可丢弃 Prompt 视图；已确认事实、未决事项、来源指针和最近确认时间沿旁路进入下一次 API 调用。
+**关键原则**：系统提示、工具定义与 `DurableContextState` **永远不进入有损压缩层**。压缩器先深拷贝 messages，四层只操作这份可丢弃 Prompt 视图；已确认事实、未决事项，以及已选 MemoryHit 的来源、分数、排名和冲突标记沿旁路进入下一次 API 调用。
 
 ### 压缩对象边界：Messages 可以有损，Durable state 必须无损
 
@@ -118,12 +121,24 @@ class PendingItem:
     last_confirmed_at: str
 
 @dataclass(frozen=True)
+class RetrievalEvidence:
+    memory_id: str
+    source_id: str
+    source_type: str
+    source_title: str
+    captured_at: str
+    score: float
+    source_rank: int
+    conflict_key: str | None = None
+
+@dataclass(frozen=True)
 class DurableContextState:
     facts: tuple[DurableFact, ...] = ()
     pending_items: tuple[PendingItem, ...] = ()
+    retrieval_evidence: tuple[RetrievalEvidence, ...] = ()
 ```
 
-`frozen=True` 防止压缩流程就地改写字段，tuple 防止在 state 内追加或删除条目。构造时还会拒绝空 ID、空 source pointer、重复 ID 和没有时区的确认时间。这里的 `source_pointer` 可以指向 s09 Transcript event，也可以指向 s13 Artifact；压缩后仍能回到原始证据。
+`frozen=True` 防止压缩流程就地改写字段，tuple 防止在 state 内追加或删除条目。构造时还会拒绝空 ID、空 source、重复 ID、越界 score、非正 rank 和没有时区的时间。这里的 `source_pointer` 可以指向 s09 Transcript event，也可以指向 s13 Artifact；`RetrievalEvidence` 则保存一次已选检索结果的来源与裁决元数据。两者都让压缩后的上下文仍能回到原始证据。
 
 ```text
 可压缩 messages                     不可有损 durable state
@@ -132,6 +147,7 @@ class DurableContextState:
 重复文件读取                        未决事项
 大工具结果的上下文副本              source pointer
 探索过程                            last_confirmed_at
+已召回正文的重复表述                retrieval source / score / rank / conflict
 ```
 
 生成式摘要即使遗漏任务，甚至错误地把“SQLite WAL”写成“JSON 文件”，也只能污染一次 conversation summary，不能修改 `DurableContextState`。下一轮 Prompt 由 `render_durable_context()` 重新注入原始结构化事实。
@@ -342,6 +358,23 @@ Memory records ───────────> DurableContextState ──无�
 
 两条路径只在下一次模型请求时汇合。摘要说“任务已完成”不会自动关闭 pending item；只有经过 Memory 自己的确认与写入流程，durable state 才能改变。这也是为什么本章保留 source pointer：压缩后仍能回到 Transcript 或 Artifact 核验证据。
 
+### 已选 MemoryHit：压缩正文，不压缩选择依据
+
+检索结果的正文可能已经出现在旧消息里，L3/L4 可以删除或摘要这段正文；但如果来源、分数和冲突裁决也只存在于旧消息中，压缩后就无法回答“这条记忆为什么进入上下文”。本章把两部分拆开：
+
+```text
+Recall candidates
+      │  scope → confidence → dedupe → conflict → top-k / budget
+      ▼
+selected hits ──capture_retrieval_evidence()──> immutable RetrievalEvidence
+      │                                              │
+      └── recalled text 进入 Prompt                  └── 绕过 L1–L4
+```
+
+`capture_retrieval_evidence()` 接收的是**已经选中的** hit，而不是全部候选。它用结构属性同时适配 S12 的 `RecallHit.rank` 和 S15 的 `MemoryContextCandidate.source_rank`，复制 `memory_id`、完整 provenance、原 score、rank 与可选 `conflict_key`。压缩层不重新排序，也不允许冲突败者因为窗口变化而回填；否则同一次检索会在压缩前后产生两套决策。
+
+`conflict_key` 存在时，渲染结果明确标成 `conflict_winner=<key>`；不存在则标成 `conflict=none`。它不是让摘要模型再次判断冲突，而是保存上游裁决的可审计标记。正文可以变短，选择依据必须保持原值。
+
 ---
 
 ## 生产化时还要补什么
@@ -355,6 +388,7 @@ Memory records ───────────> DurableContextState ──无�
 | 协议完整性 | 避免以孤立 tool result 开头 | 按 tool-use ID 成对裁剪完整调用组 |
 | 摘要失败 | 原消息原样保留 | 加超时、重试预算和可观测失败原因 |
 | 长期事实 | durable state 旁路 | 接入带版本、冲突处理和来源校验的 Memory store |
+| 检索证据 | 已选 hit 的不可变元数据 | 持久化 query/decision trace，并校验 source 可访问性 |
 
 这些是可验证的设计方向，不代表任何特定闭源产品的内部实现。
 
@@ -365,15 +399,16 @@ Memory records ───────────> DurableContextState ──无�
 `code.py` 实现了完整的四层压缩管线：
 
 1. **`DurableFact` / `PendingItem`** — 不可变的事实与未决事项，强制携带 source pointer 和带时区的最近确认时间
-2. **`DurableContextState`** — 在有损管线旁路传递的 Memory 输入，并拒绝重复 ID
-3. **`render_durable_context()`** — 把 durable state 独立渲染进 system context，不混入生成式摘要
-4. **`estimate_tokens()`** — 粗略估算 messages 的 token 数（4 字符 ≈ 1 token）
-5. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
-6. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新
-7. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，删除旧消息
-8. **`generate_summary()`** — Layer 4: 用模型生成摘要替换历史；失败或空摘要时保留原历史
-9. **`compact_context()`** — 深拷贝 messages，依次尝试四层，并返回 `CompactionResult`
-10. **Agent 循环** — 每次 API 调用前压缩 disposable messages，再把 durable state 独立注入
+2. **`RetrievalEvidence` / `capture_retrieval_evidence()`** — 从已选 hit 冻结来源、分数、排名与冲突标记，不复制召回正文
+3. **`DurableContextState`** — 在有损管线旁路传递的 Memory 输入，并按各自 ID 域拒绝重复条目
+4. **`render_durable_context()`** — 把 durable state 独立渲染进 system context，不混入生成式摘要
+5. **`estimate_tokens()`** — 粗略估算 messages 的 token 数（4 字符 ≈ 1 token）
+6. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
+7. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新
+8. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，删除旧消息
+9. **`generate_summary()`** — Layer 4: 用模型生成摘要替换历史；失败或空摘要时保留原历史
+10. **`compact_context()`** — 深拷贝 messages，依次尝试四层，并返回 `CompactionResult`
+11. **Agent 循环** — 每次 API 调用前压缩 disposable messages，再把 durable state 独立注入
 
 运行后会看到压缩日志——每层触发时打印 `[compact]` 消息，可以看到哪些层在什么时候被触发。
 

@@ -12,8 +12,8 @@
   </defs>
 
   <rect width="1000" height="700" fill="#f8fafc"/>
-  <text x="500" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#111827">S15：Memory Selection 与 Context Budget Assembly</text>
-  <text x="500" y="62" text-anchor="middle" font-size="13" fill="#475569">召回是候选，只有通过策略与预算的记录才进入 Prompt</text>
+  <text x="500" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#111827">S15：Preference Precedence 与 Context Budget Assembly</text>
+  <text x="500" y="62" text-anchor="middle" font-size="13" fill="#475569">本轮指令 &gt; Workspace Override &gt; User Default，然后才按证据与预算装箱</text>
 
   <!-- Selection pipeline -->
   <rect x="35" y="92" width="170" height="92" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
@@ -38,9 +38,9 @@
   <line x1="565" y1="138" x2="602" y2="138" stroke="#1f2937" stroke-width="2" marker-end="url(#arrow)"/>
 
   <rect x="610" y="92" width="155" height="92" rx="10" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
-  <text x="687.5" y="120" text-anchor="middle" font-size="15" font-weight="700" fill="#92400e">Dedupe / Conflict</text>
-  <text x="687.5" y="145" text-anchor="middle" font-size="12" fill="#b45309">exact content</text>
-  <text x="687.5" y="164" text-anchor="middle" font-size="12" fill="#b45309">explicit fact slot</text>
+  <text x="687.5" y="120" text-anchor="middle" font-size="15" font-weight="700" fill="#92400e">Authority / Conflict</text>
+  <text x="687.5" y="145" text-anchor="middle" font-size="12" fill="#b45309">turn &gt; workspace &gt; user</text>
+  <text x="687.5" y="164" text-anchor="middle" font-size="12" fill="#b45309">dedupe · explicit slot</text>
 
   <line x1="765" y1="138" x2="802" y2="138" stroke="#1f2937" stroke-width="2" marker-end="url(#arrow)"/>
 
@@ -57,14 +57,14 @@
 
   <rect x="90" y="225" width="820" height="88" rx="10" fill="#fff1f2" stroke="#e11d48" stroke-width="1.7"/>
   <text x="500" y="250" text-anchor="middle" font-size="15" font-weight="700" fill="#9f1239">MemorySelectionDecision：每个候选都有终态</text>
-  <text x="500" y="275" text-anchor="middle" font-size="12" fill="#be123c">scope_mismatch · low_confidence · duplicate_content · conflict_loser</text>
+  <text x="500" y="275" text-anchor="middle" font-size="12" fill="#be123c">scope_mismatch · low_confidence · duplicate_content · authority_loser · conflict_loser</text>
   <text x="500" y="296" text-anchor="middle" font-size="12" fill="#be123c">top_k_reached · char_budget_exceeded · token_budget_exceeded · selected</text>
 
   <!-- Selected memory context -->
   <path d="M965 138 H980 V330 H790 V338" fill="none" stroke="#2563eb" stroke-width="2.2" marker-end="url(#arrowBlue)"/>
   <rect x="210" y="345" width="580" height="92" rx="12" fill="#dbeafe" stroke="#2563eb" stroke-width="2.2"/>
   <text x="500" y="373" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">&lt;recalled_memory&gt;</text>
-  <text x="500" y="398" text-anchor="middle" font-size="13" fill="#1e40af">原子 memory_hit · scope · score · rank · provenance</text>
+  <text x="500" y="398" text-anchor="middle" font-size="13" fill="#1e40af">原子 memory_hit · authority · scope · score · rank · provenance</text>
   <text x="500" y="420" text-anchor="middle" font-size="12" fill="#1e40af">used_chars / used_tokens 与 selected IDs 可回放</text>
 
   <!-- Total prompt planner -->

@@ -74,6 +74,7 @@ def candidate(
     source_rank: int = 1,
     captured_at: str = "2026-08-17T08:00:00Z",
     conflict_key: str | None = None,
+    authority: str = "user_default",
 ):
     return s15.MemoryContextCandidate(
         memory_id=memory_id,
@@ -88,6 +89,7 @@ def candidate(
             captured_at=captured_at,
         ),
         conflict_key=conflict_key,
+        authority=authority,
     )
 
 
@@ -175,6 +177,126 @@ def test_deduplication_and_conflict_resolution_are_stable(s15) -> None:
     assert decisions["typescript-old"].related_memory_id == "python-new"
 
 
+def test_authority_precedes_score_rank_time_and_input_order(s15) -> None:
+    conflict_key = "preference:automation-language"
+    user_default = candidate(
+        s15,
+        "python-default",
+        "Prefer Python for automation",
+        score=0.99,
+        source_rank=1,
+        captured_at="2026-08-19T10:00:00Z",
+        conflict_key=conflict_key,
+        authority="user_default",
+    )
+    workspace = candidate(
+        s15,
+        "typescript-workspace",
+        "Use TypeScript in this workspace",
+        score=0.80,
+        source_rank=2,
+        captured_at="2026-08-18T10:00:00Z",
+        conflict_key=conflict_key,
+        authority="workspace_override",
+    )
+    current_turn = candidate(
+        s15,
+        "go-current-turn",
+        "For this turn, use Go",
+        score=0.41,
+        source_rank=3,
+        captured_at="2026-08-17T10:00:00Z",
+        conflict_key=conflict_key,
+        authority="current_turn",
+    )
+    policy = s15.MemorySelectionPolicy(min_score=0.4, top_k=3)
+
+    forward = s15.select_memory_context(
+        [user_default, workspace, current_turn],
+        user_scope="scope-a",
+        policy=policy,
+    )
+    reverse = s15.select_memory_context(
+        [current_turn, workspace, user_default],
+        user_scope="scope-a",
+        policy=policy,
+    )
+    decisions = decision_by_id(forward)
+
+    assert forward.context == reverse.context
+    assert forward.selected_memory_ids == ("go-current-turn",)
+    assert 'authority="current_turn"' in forward.context
+    assert decisions["typescript-workspace"].reason is (
+        s15.MemoryDecisionReason.AUTHORITY_LOSER
+    )
+    assert decisions["python-default"].reason is (
+        s15.MemoryDecisionReason.AUTHORITY_LOSER
+    )
+    assert decisions["python-default"].related_memory_id == "go-current-turn"
+    assert "user_default lost to current_turn" in decisions["python-default"].detail
+
+
+def test_authority_orders_independent_candidates_under_top_k(s15) -> None:
+    high_score_default = candidate(
+        s15,
+        "high-score-default",
+        "Default answer style",
+        score=0.99,
+        conflict_key="preference:style",
+    )
+    current_turn = candidate(
+        s15,
+        "current-turn-format",
+        "Use a table for this answer",
+        score=0.50,
+        conflict_key="preference:format",
+        authority="current_turn",
+    )
+
+    plan = s15.select_memory_context(
+        [high_score_default, current_turn],
+        user_scope="scope-a",
+        policy=s15.MemorySelectionPolicy(min_score=0.1, top_k=1),
+    )
+    decisions = decision_by_id(plan)
+
+    assert plan.selected_memory_ids == ("current-turn-format",)
+    assert decisions["high-score-default"].reason is (
+        s15.MemoryDecisionReason.TOP_K_REACHED
+    )
+
+
+def test_authority_never_bypasses_scope_or_confidence_gates(s15) -> None:
+    cross_scope = candidate(
+        s15,
+        "cross-scope-current",
+        "Private current-turn instruction",
+        score=1.0,
+        user_scope="scope-b",
+        authority="current_turn",
+    )
+    low_confidence = candidate(
+        s15,
+        "weak-current",
+        "Uncertain current-turn extraction",
+        score=0.2,
+        authority="current_turn",
+    )
+
+    plan = s15.select_memory_context(
+        [cross_scope, low_confidence],
+        user_scope="scope-a",
+        policy=s15.MemorySelectionPolicy(min_score=0.4),
+    )
+    decisions = decision_by_id(plan)
+
+    assert plan.selected_memory_ids == ()
+    assert decisions["cross-scope-current"].reason is (
+        s15.MemoryDecisionReason.SCOPE_MISMATCH
+    )
+    assert decisions["weak-current"].reason is s15.MemoryDecisionReason.LOW_CONFIDENCE
+
+
 def test_character_budget_skips_oversized_hit_and_backfills_until_top_k(s15) -> None:
     oversized = candidate(s15, "oversized", "X" * 1_000, score=0.99)
     second = candidate(s15, "second", "Short useful memory", score=0.90)
@@ -246,6 +368,7 @@ def test_recall_adapter_preserves_scope_score_rank_and_provenance(s15) -> None:
     converted = s15.memory_candidates_from_recall(
         result,
         conflict_keys={"memory-1": "preference:grounding"},
+        authority_by_memory_id={"memory-1": "workspace_override"},
     )
 
     assert converted == (
@@ -262,8 +385,56 @@ def test_recall_adapter_preserves_scope_score_rank_and_provenance(s15) -> None:
                 captured_at="2026-08-16T09:00:00Z",
             ),
             conflict_key="preference:grounding",
+            authority=s15.PreferenceAuthority.WORKSPACE_OVERRIDE,
         ),
     )
+    defaulted = s15.memory_candidates_from_recall(
+        result,
+        conflict_keys={"memory-1": "preference:grounding"},
+    )
+    assert defaulted[0].authority is s15.PreferenceAuthority.USER_DEFAULT
+
+
+def test_unknown_authority_fails_closed(s15) -> None:
+    with pytest.raises(ValueError, match="memory authority must be one of"):
+        candidate(
+            s15,
+            "invented-authority",
+            "An untrusted caller cannot invent a higher tier",
+            authority="system_override",
+        )
+
+
+def test_required_harness_rules_are_not_part_of_preference_precedence(s15) -> None:
+    current_turn = candidate(
+        s15,
+        "current-turn",
+        "Use a concise response for this turn",
+        score=1.0,
+        authority="current_turn",
+    )
+    memory_plan = s15.select_memory_context(
+        [current_turn],
+        user_scope="scope-a",
+        policy=s15.MemorySelectionPolicy(min_score=0.1),
+    )
+    safety = s15.PromptSegment(
+        "safety", lambda: "HARNESS SAFETY", required=True, priority=10
+    )
+    preferences = s15.PromptSegment(
+        "preferences",
+        lambda: memory_plan.context,
+        budget_priority=100,
+        priority=20,
+    )
+
+    prompt_plan = s15.plan_prompt(
+        [preferences, safety], budget_chars=len("HARNESS SAFETY")
+    )
+
+    assert prompt_plan.prompt == "HARNESS SAFETY"
+    assert prompt_plan.included_names == ("safety",)
+    assert prompt_plan.dropped_names == ("preferences",)
 
 
 def test_selected_memory_evidence_survives_lossy_compaction(

@@ -70,7 +70,7 @@ def test_fixture_benchmark_passes_all_metrics(routing_eval) -> None:
 
     report = routing_eval.evaluate(routing_eval.OfflineRouter(candidates), cases)
 
-    assert len(candidates) == 10
+    assert len(candidates) == 14
     assert len(cases) == 6
     assert report.passed is True
     assert report.metrics.recall_at_k == 1
@@ -80,6 +80,37 @@ def test_fixture_benchmark_passes_all_metrics(routing_eval) -> None:
     assert report.metrics.scope_leak_rate == 0
     assert report.metrics.permission_leak_rate == 0
     assert report.metrics.budget_violation_rate == 0
+
+
+def test_golden_set_exercises_memory_rag_negative_matrix(routing_eval) -> None:
+    """A perfect aggregate score is meaningful only when hard negatives ran."""
+
+    candidates, cases = routing_eval.load_fixtures(FIXTURES)
+    router = routing_eval.OfflineRouter(candidates)
+    documentation = next(
+        case for case in cases if case.query.query_id == "documentation-multi-route"
+    )
+
+    result = router.route(documentation.query)
+
+    assert result.selected_ids == ("memory-api-convention", "skill-code-review")
+    assert result.rejected["memory-other-user"] == "user scope mismatch"
+    assert result.rejected["memory-other-workspace"] == "workspace scope mismatch"
+    assert result.rejected["memory-expired"] == "status is revoked, not active"
+    assert result.rejected["memory-conflict-superseded"] == (
+        "status is resolved, not active"
+    )
+    assert result.rejected["memory-low-relevance"] == (
+        "score below abstention threshold"
+    )
+    assert result.rejected["memory-prompt-override"] == (
+        "candidate contains a prompt override pattern"
+    )
+
+    no_result = next(
+        case for case in cases if case.query.query_id == "negative-abstention"
+    )
+    assert router.route(no_result.query).selected_ids == ()
 
 
 @pytest.mark.parametrize(
@@ -215,6 +246,40 @@ def test_report_fails_when_expected_candidate_is_not_retrieved(routing_eval) -> 
     assert report.passed is False
     assert report.metrics.recall_at_k == 0
     assert report.metrics.mrr == 0
+
+
+def test_recall_and_mrr_expose_partial_and_late_retrieval(routing_eval) -> None:
+    """Recall counts all gold IDs; MRR measures the first gold ID's rank."""
+
+    decoy = _candidate(routing_eval, "decoy")
+    first_gold = _candidate(
+        routing_eval,
+        "first-gold",
+        title="API documentation",
+        summary="Review guidance.",
+        keywords=(),
+    )
+    omitted_gold = _candidate(
+        routing_eval,
+        "omitted-gold",
+        title="Documentation examples",
+        summary="A reference.",
+        keywords=(),
+    )
+    case = routing_eval.EvalCase(
+        query=_query(routing_eval, top_k=2),
+        expected_ids=("first-gold", "omitted-gold"),
+        forbidden_ids=("decoy",),
+    )
+
+    report = routing_eval.evaluate(
+        routing_eval.OfflineRouter([decoy, first_gold, omitted_gold]), [case]
+    )
+
+    assert report.case_results[0]["selected_ids"] == ["decoy", "first-gold"]
+    assert report.metrics.recall_at_k == 0.5
+    assert report.metrics.mrr == 0.5
+    assert report.passed is False
 
 
 def test_report_fails_when_forbidden_candidate_is_selected(routing_eval) -> None:

@@ -136,6 +136,66 @@
       "provenance": "bob-private-memory-2"
     },
     {
+      "candidate_id": "memory-other-workspace",
+      "kind": "memory",
+      "title": "API documentation convention from another workspace",
+      "summary": "Review API examples and keep an offline fallback for a different project.",
+      "content": "A relevant-looking project fact that belongs to another workspace.",
+      "keywords": ["API example", "documentation", "review", "offline fallback"],
+      "status": "active",
+      "approved": true,
+      "user_scope": "alice",
+      "workspace_scope": "billing-service",
+      "task_family": "documentation-review",
+      "permissions": {"tools": [], "network": false},
+      "provenance": "billing-workspace-log-2026-08-18"
+    },
+    {
+      "candidate_id": "memory-expired",
+      "kind": "memory",
+      "title": "Expired API documentation convention",
+      "summary": "Review API examples using an offline fallback that is no longer valid.",
+      "content": "The lifecycle owner marked this time-bounded memory revoked after expiry.",
+      "keywords": ["API example", "documentation", "review", "offline fallback"],
+      "status": "revoked",
+      "approved": true,
+      "user_scope": "alice",
+      "workspace_scope": "learn-workbuddy",
+      "task_family": "documentation-review",
+      "permissions": {"tools": [], "network": false},
+      "provenance": "expired-workspace-policy-v1"
+    },
+    {
+      "candidate_id": "memory-conflict-superseded",
+      "kind": "memory",
+      "title": "Superseded API documentation convention",
+      "summary": "Review API examples without retaining source provenance or an offline fallback.",
+      "content": "A conflicting older fact resolved by memory-api-convention.",
+      "keywords": ["API example", "documentation", "review", "offline fallback"],
+      "status": "resolved",
+      "approved": true,
+      "user_scope": "alice",
+      "workspace_scope": "learn-workbuddy",
+      "task_family": "documentation-review",
+      "permissions": {"tools": [], "network": false},
+      "provenance": "conflict-resolved-by-memory-api-convention"
+    },
+    {
+      "candidate_id": "memory-low-relevance",
+      "kind": "memory",
+      "title": "Documentation typography note",
+      "summary": "Compact sans-serif headings improve dashboard charts and visual hierarchy.",
+      "content": "An active record in the right scopes that shares too little query evidence.",
+      "keywords": ["font", "heading", "layout", "dashboard"],
+      "status": "active",
+      "approved": true,
+      "user_scope": "alice",
+      "workspace_scope": "learn-workbuddy",
+      "task_family": "documentation-review",
+      "permissions": {"tools": [], "network": false},
+      "provenance": "workspace-design-note-2026-08-18"
+    },
+    {
       "candidate_id": "memory-prompt-override",
       "kind": "memory",
       "title": "API documentation override",
@@ -176,7 +236,15 @@
       "top_k": 3,
       "prompt_budget_chars": 500,
       "expected_ids": ["skill-code-review", "memory-api-convention"],
-      "forbidden_ids": ["skill-unapproved-review", "memory-other-user", "memory-prompt-override"]
+      "forbidden_ids": [
+        "skill-unapproved-review",
+        "memory-other-user",
+        "memory-other-workspace",
+        "memory-expired",
+        "memory-conflict-superseded",
+        "memory-low-relevance",
+        "memory-prompt-override"
+      ]
     },
     {
       "case_id": "reflection-task-scope",

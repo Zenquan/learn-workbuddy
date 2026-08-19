@@ -90,17 +90,21 @@ score = 0.8 * query coverage + 0.2 * candidate precision
 
 这些指标不合成一个总分。安全泄漏不能被高 Recall 抵消；任何安全或预算指标失败，报告的 `passed` 都是 `false`。
 
-## Fixture 覆盖
+## 无 key Golden Set
 
-[`fixtures/cases.json`](./fixtures/cases.json) 包含 10 个异构候选和 6 个用例：
+[`fixtures/cases.json`](./fixtures/cases.json) 是可离线重复的 golden set，包含 14 个异构候选和 6 个用例。它不仅标注“应该召回谁”，还显式列出不得进入 Prompt 的 hard negatives：
 
 - `commit` 的同义表达路由；
 - 同一查询同时召回 Skill 与项目 Memory；
 - Reflection 的任务族隔离；
-- 最新但无关的 Memory 不能压过旧的相关决策；
+- 关键词高度匹配但属于其他 user/workspace 的 Memory 必须先被作用域门禁拒绝；
+- 已过期记录由生命周期层标为 `revoked`，已被新事实取代的冲突记录标为 `resolved`，两者都不能参加排名；
+- 同作用域但低相关的 Memory 不能靠“较新”或少量重合词进入 Prompt；
 - 没有候选时正确拒答；
 - 相关 Skill 因网络/工具未授权而拒答；
-- 未批准、resolved、跨用户和 prompt override 候选作为 hard negatives。
+- 未批准和 prompt override 候选作为额外 hard negatives。
+
+路由器不从两段自然语言里猜测冲突，也不自行计算业务有效期。事实所有者先把记录推进到 `resolved` / `revoked`，检索门禁只消费显式生命周期状态。这样评测能稳定复现，生产环境也可以替换上游存储，而不改变 Recall@K/MRR 的含义。
 
 ## 运行
 
@@ -130,7 +134,7 @@ python3 examples/retrieval_routing_eval/code.py \
 python3 -m pytest -q tests/test_retrieval_routing_eval.py
 ```
 
-测试额外覆盖严格 fixture schema、生命周期和作用域拒绝、权限交集、prompt override、预算截断、稳定同分排序、低质量拒答、失败报告与 CLI JSON 产物。
+测试额外覆盖严格 fixture schema、跨 user/workspace、过期与冲突淘汰、低相关和无结果负例、权限交集、prompt override、预算截断、稳定同分排序、失败报告与 CLI JSON 产物。
 
 ## 与前两个示例的关系
 

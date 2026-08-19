@@ -282,7 +282,7 @@ python s11_user_memory/code.py
 
 1. 把单个 `source_event_id` 扩展为有界 evidence set，同时保持同一证据重试幂等。
 2. 为即将过期的偏好增加显式续期确认流程，比较“自动续期”和“用户确认”的权限边界。
-3. 在 s15 Prompt assembly 中实现明确的优先级：本轮用户指令 > workspace override > user default。
+3. 对照 s15 的显式优先级，设计可信 adapter 把 User Default 投影为候选，并证明模型不能自行声明 `current_turn` 或 `workspace_override`。
 
 ## 下一课
 

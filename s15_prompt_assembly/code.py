@@ -9,8 +9,8 @@ Memory needs one extra boundary before it becomes a prompt segment. S12 returns
 ranked, query-scoped recall hits; S15 decides which of those hits are safe and
 useful enough to enter the current context:
 
-    RecallHit -> scope -> confidence -> dedupe -> conflict -> top-k/budget
-              -> <recalled_memory> -> total prompt segment planner
+    RecallHit -> scope -> confidence -> authority -> dedupe/conflict
+              -> top-k/budget -> <recalled_memory> -> total prompt planner
 
 The selector never writes back to durable memory and never guesses semantic
 conflicts from prose. Callers attach an explicit ``conflict_key`` when several
@@ -38,6 +38,7 @@ PROGRESSION = {
     "builds_on": ["s14_context_compact"],
     "adds": [
         "scope- and confidence-gated memory selection",
+        "explicit current-turn, workspace, and user-default precedence",
         "stable deduplication and explicit conflict resolution",
         "top-k character/token context packing",
         "per-candidate selection and rejection decisions",
@@ -147,10 +148,43 @@ class MemoryDecisionReason(str, Enum):
     SCOPE_MISMATCH = "scope_mismatch"
     LOW_CONFIDENCE = "low_confidence"
     DUPLICATE_CONTENT = "duplicate_content"
+    AUTHORITY_LOSER = "authority_loser"
     CONFLICT_LOSER = "conflict_loser"
     TOP_K_REACHED = "top_k_reached"
     CHAR_BUDGET_EXCEEDED = "char_budget_exceeded"
     TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
+
+
+class PreferenceAuthority(str, Enum):
+    """Who supplied a preference, ordered by authority at the current turn.
+
+    Harness-required safety rules deliberately do not appear here. They remain
+    required ``PromptSegment`` objects and cannot be overridden by any memory
+    or user-preference candidate.
+    """
+
+    CURRENT_TURN = "current_turn"
+    WORKSPACE_OVERRIDE = "workspace_override"
+    USER_DEFAULT = "user_default"
+
+
+_PREFERENCE_AUTHORITY_PRIORITY = {
+    PreferenceAuthority.CURRENT_TURN: 3,
+    PreferenceAuthority.WORKSPACE_OVERRIDE: 2,
+    PreferenceAuthority.USER_DEFAULT: 1,
+}
+
+
+def _preference_authority(value: object) -> PreferenceAuthority:
+    """Normalize a boundary value and reject invented authority levels."""
+
+    if isinstance(value, PreferenceAuthority):
+        return value
+    try:
+        return PreferenceAuthority(str(value).strip())
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in PreferenceAuthority)
+        raise ValueError(f"memory authority must be one of: {allowed}") from exc
 
 
 def _required_text(value: object, *, field_name: str) -> str:
@@ -211,6 +245,7 @@ class MemoryContextCandidate:
     source_rank: int
     provenance: MemoryContextProvenance
     conflict_key: str | None = None
+    authority: PreferenceAuthority = PreferenceAuthority.USER_DEFAULT
 
     def __post_init__(self) -> None:
         _required_text(self.memory_id, field_name="memory_id")
@@ -222,6 +257,7 @@ class MemoryContextCandidate:
             raise ValueError("memory source_rank must be positive")
         if self.conflict_key is not None:
             _required_text(self.conflict_key, field_name="memory conflict_key")
+        object.__setattr__(self, "authority", _preference_authority(self.authority))
 
 
 @dataclass(frozen=True)
@@ -253,6 +289,7 @@ class MemorySelectionDecision:
     reason: MemoryDecisionReason
     score: float
     source_rank: int
+    authority: PreferenceAuthority
     candidate_chars: int
     candidate_tokens: int
     related_memory_id: str | None = None
@@ -314,9 +351,10 @@ def _count_tokens(token_counter: TokenCounter, text: str) -> int:
 
 
 def _candidate_order(candidate: MemoryContextCandidate) -> tuple[object, ...]:
-    """Rank independently of provider/storage iteration order."""
+    """Rank by authority, then retrieval evidence, never input order."""
 
     return (
+        -_PREFERENCE_AUTHORITY_PRIORITY[candidate.authority],
         -candidate.score,
         candidate.source_rank,
         -_parse_utc_timestamp(candidate.provenance.captured_at).timestamp(),
@@ -336,6 +374,7 @@ def render_memory_hit(candidate: MemoryContextCandidate) -> str:
     return (
         f'<memory_hit memory_id="{html.escape(candidate.memory_id, quote=True)}" '
         f'score="{candidate.score:.6f}" source_rank="{candidate.source_rank}" '
+        f'authority="{candidate.authority.value}" '
         f'user_scope="{html.escape(candidate.user_scope, quote=True)}" '
         f'source_id="{html.escape(provenance.source_id, quote=True)}" '
         f'source_type="{html.escape(provenance.source_type, quote=True)}" '
@@ -389,6 +428,7 @@ def _decision(
         reason=reason,
         score=candidate.score,
         source_rank=candidate.source_rank,
+        authority=candidate.authority,
         candidate_chars=len(rendered),
         candidate_tokens=_count_tokens(token_counter, rendered),
         related_memory_id=related_memory_id,
@@ -406,11 +446,14 @@ def select_memory_context(
     """Select and atomically pack recalled memory under explicit constraints.
 
     The order is intentional: security scope and confidence are gates; exact
-    duplicates and typed conflicts are resolved before scarce budget is spent;
-    top-k and budgets then pack the strongest surviving records. An oversized
-    record does not stop packing, so a smaller lower-ranked record can still use
-    the remaining budget. Conflict losers never backfill because they represent
-    facts superseded by the chosen winner, not merely expensive context.
+    duplicates and typed conflicts are resolved before scarce budget is spent.
+    Authority orders eligible candidates as ``current_turn`` >
+    ``workspace_override`` > ``user_default``; score, source rank, capture time,
+    and ID only break ties inside one authority. Top-k and budgets then pack the
+    surviving records in that same order. An oversized record does not stop
+    packing, so a smaller lower-ranked record can still use the remaining
+    budget. Conflict losers never backfill because they represent facts
+    superseded by the chosen winner, not merely expensive context.
     """
 
     scope = _required_text(user_scope, field_name="user_scope")
@@ -479,13 +522,30 @@ def select_memory_context(
         normalized_key = _normalized_memory_text(conflict_key)
         winner = conflict_winners.get(normalized_key)
         if winner is not None:
+            authority_lost = (
+                _PREFERENCE_AUTHORITY_PRIORITY[candidate.authority]
+                < _PREFERENCE_AUTHORITY_PRIORITY[winner.authority]
+            )
+            reason = (
+                MemoryDecisionReason.AUTHORITY_LOSER
+                if authority_lost
+                else MemoryDecisionReason.CONFLICT_LOSER
+            )
+            if authority_lost:
+                detail = (
+                    f"conflict slot {conflict_key!r}: "
+                    f"{candidate.authority.value} lost to "
+                    f"{winner.authority.value} candidate {winner.memory_id}"
+                )
+            else:
+                detail = f"conflict slot {conflict_key!r} won by {winner.memory_id}"
             decisions[candidate.memory_id] = _decision(
                 candidate,
                 status=MemoryDecisionStatus.REJECTED,
-                reason=MemoryDecisionReason.CONFLICT_LOSER,
+                reason=reason,
                 token_counter=token_counter,
                 related_memory_id=winner.memory_id,
-                detail=f"conflict slot {conflict_key!r} won by {winner.memory_id}",
+                detail=detail,
             )
             continue
         conflict_winners[normalized_key] = candidate
@@ -562,13 +622,15 @@ def memory_candidates_from_recall(
     result: object,
     *,
     conflict_keys: Mapping[str, str] | None = None,
+    authority_by_memory_id: Mapping[str, PreferenceAuthority | str] | None = None,
 ) -> tuple[MemoryContextCandidate, ...]:
     """Adapt S12's public RecallResult shape without coupling chapter imports.
 
     The bridge uses structural attributes so S15 remains independently runnable.
-    Scope, score, provider rank, and provenance are copied rather than recomputed;
-    selection policy belongs here, while retrieval evidence continues to belong
-    to S12.
+    Scope, score, provider rank, and provenance are copied rather than recomputed.
+    S12 records default to ``user_default``; a trusted caller can explicitly
+    label a workspace override or current-turn instruction. Selection policy
+    belongs here, while retrieval evidence continues to belong to S12.
     """
 
     query = getattr(result, "query", None)
@@ -607,6 +669,9 @@ def memory_candidates_from_recall(
                     captured_at=str(getattr(provenance, "captured_at", "")),
                 ),
                 conflict_key=(conflict_keys or {}).get(memory_id),
+                authority=(authority_by_memory_id or {}).get(
+                    memory_id, PreferenceAuthority.USER_DEFAULT
+                ),
             )
         )
     return tuple(converted)
@@ -1052,12 +1117,13 @@ def assemble_system_prompt(
     if verbose:
         if LAST_MEMORY_CONTEXT_PLAN is not None:
             print(
-                f"\n\033[90m{'memory':<18} {'rank':>5} {'score':>8} "
+                f"\n\033[90m{'memory':<18} {'authority':<18} {'rank':>5} {'score':>8} "
                 f"{'status':>9} reason / detail\033[0m"
             )
             for decision in LAST_MEMORY_CONTEXT_PLAN.decisions:
                 print(
                     f"\033[90m{decision.memory_id:<18} "
+                    f"{decision.authority.value:<18} "
                     f"{decision.source_rank:>5} {decision.score:>8.3f} "
                     f"{decision.status.value:>9} {decision.reason.value} / "
                     f"{decision.detail}\033[0m"
@@ -1202,6 +1268,7 @@ def load_demo_recalled_memory() -> None:
         rank: int,
         conflict_key: str | None = None,
         user_scope: str = "demo-user-scope",
+        authority: PreferenceAuthority = PreferenceAuthority.USER_DEFAULT,
     ) -> MemoryContextCandidate:
         return MemoryContextCandidate(
             memory_id=memory_id,
@@ -1216,30 +1283,33 @@ def load_demo_recalled_memory() -> None:
                 captured_at=f"2026-08-{18-rank:02d}T09:00:00Z",
             ),
             conflict_key=conflict_key,
+            authority=authority,
         )
 
     set_recalled_memory(
         [
             demo_candidate(
-                "python-current",
-                "Prefer Python for automation tasks.",
+                "python-default",
+                "Prefer Python for automation tasks by default.",
                 score=0.93,
                 rank=1,
                 conflict_key="preference:automation-language",
             ),
             demo_candidate(
-                "python-copy",
-                " prefer PYTHON for automation tasks. ",
+                "typescript-workspace",
+                "Use TypeScript for automation in this workspace.",
                 score=0.86,
                 rank=2,
                 conflict_key="preference:automation-language",
+                authority=PreferenceAuthority.WORKSPACE_OVERRIDE,
             ),
             demo_candidate(
-                "typescript-old",
-                "Prefer TypeScript for automation tasks.",
+                "python-current-turn",
+                "For this turn, implement the automation in Python.",
                 score=0.72,
                 rank=3,
                 conflict_key="preference:automation-language",
+                authority=PreferenceAuthority.CURRENT_TURN,
             ),
             demo_candidate(
                 "source-grounding",

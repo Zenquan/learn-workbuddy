@@ -17,7 +17,12 @@ flowchart LR
     D -->|"not stable"| C
     E --> H{"one strongest newer value?"}
     H -->|"yes"| I["new active revision"]
-    H -->|"tie / stale"| C
+    H -->|"stale"| C
+    H -->|"tie"| Q["conflicts.json review queue"]
+    Q --> R["human resolve_conflict"]
+    R --> K["append-only adjudication audit"]
+    R -->|"challenger"| I
+    R -->|"incumbent"| J
     I --> J["curated.json history"]
     J --> F["active-only MEMORY.md"]
     F --> G["bounded prompt context"]
@@ -33,6 +38,8 @@ s09 的 JSONL transcript 属于某个 session，是完整执行证据；本章�
 - 只有稳定、足够旧且重要或重复出现的事实进入长期视图。
 - 可替换的项目决策使用显式 `memory_key` 形成冲突域，新值只会在重复确认且时间更新时替代旧值。
 - 被替代的修订和原始证据继续保留，prompt 只注入每个冲突域的 active 修订。
+- 同强度冲突会形成持久化 review case；只有显式的人类裁决能选择候选。
+- 裁决绑定 evidence fingerprint、case revision 和 event ID；陈旧页面或重试不会覆盖新证据。
 - 策展状态通过原子替换更新，失败时仍保留上一份完整文件。
 - 不依赖 API key 就能验证记忆策略。
 
@@ -48,6 +55,8 @@ project/
         │   ├── 2026-08-07.jsonl
         │   └── 2026-08-08.jsonl
         ├── curated.json
+        ├── conflicts.json
+        ├── conflict-adjudications.jsonl
         └── MEMORY.md
 ```
 
@@ -55,6 +64,8 @@ project/
 |---|---|---|---|
 | `daily/*.jsonl` | 原始事实日志 | `O_APPEND` 单记录追加 | 是 |
 | `curated.json` | 策展状态的机器真相 | 临时文件 + `os.replace` | 可追溯到 evidence id |
+| `conflicts.json` | 待审与历史冲突快照 | 临时文件 + `os.replace` | 是，保存候选、revision 与 fingerprint |
+| `conflict-adjudications.jsonl` | 人工裁决审计流 | `O_APPEND` 单事件追加 | 是，记录 actor、rationale 与选中证据 |
 | `MEMORY.md` | 面向人和 prompt 的派生视图 | 从策展状态原子重建 | 否，随时可重建 |
 
 教学实现使用 `.learn_workbuddy` 命名空间，避免练习代码碰到真实产品状态。`WorkspaceMemory` 会先解析项目绝对路径，再生成 `workspace_id`；日志和策展文件在读取时都校验该 id。
@@ -106,12 +117,56 @@ AND (importance >= 4 OR 规范化后重复出现 >= 2 次)
 1. 与 active 内容相同的新事实只合并 `evidence_ids`，不会产生新修订。
 2. 不同内容必须同时通过普通晋升门槛，并至少有 `supersession_repeat_threshold` 条独立事实确认；默认值为 2，即单条高重要度事实也不能直接覆盖现有决策。
 3. 候选的最新时间必须晚于 active 修订的 `last_seen`，过期证据不能回滚当前值。
-4. 多个候选按重要度、独立证据数和最新时间排序；最优分数相同时 fail closed，保留当前修订并在报告中增加 `conflicts`。
+4. 多个候选按重要度、独立证据数和最新时间排序；最优分数相同时 fail closed，保留当前修订并创建持久化 `MemoryConflictCase`。
 5. 唯一胜出者成为下一版 active 修订；旧版标记为 `superseded`，双方通过 `supersedes` / `superseded_by` 互相指向。
 
-每条修订都保留 `revision` 和 `evidence_ids`，因此重复运行 `distill` 是幂等的，完整决策历史也可审计。`DistillReport` 额外报告 `superseded`、`conflicts` 与 `stale`，让拒绝覆盖的原因可观察。
+每条修订都保留 `revision` 和 `evidence_ids`，因此重复运行 `distill` 是幂等的，完整决策历史也可审计。`DistillReport` 额外报告 `superseded`、`conflicts`、`queued_conflicts`、`conflict_case_ids` 与 `stale`，让拒绝覆盖的原因可观察。
 
-### 3. 保留原始证据
+### 3. 同分冲突进入人工裁决队列
+
+一个 case 不是一句“发生冲突”的提示，而是完整、可恢复的观察快照：
+
+- `conflict_id`：由 workspace、memory key 和 evidence fingerprint 确定性生成；
+- `revision`：同一 memory key 的案件版本；
+- `candidates`：当前 active incumbent 与同分 challenger；
+- `evidence_ids`：每个候选的不可变来源集合；
+- `observed_fact_ids`：检测时该冲突域的全部已见事实；
+- `active_entry_key`：检测时的 active curated revision；
+- `open / resolved / superseded`：案件生命周期。
+
+重复执行 `distill()` 不会重复创建相同案件。证据发生变化且仍然同分时，旧 open case 标为 `superseded`，新 fingerprint 形成下一 revision。调用方只能通过 `list_conflicts()` 获取 open case；这些候选不会进入 `MEMORY.md` 或 Agent Prompt。
+
+### 4. 显式裁决与 append-only 审计
+
+裁决必须提交刚刚看到的 case revision：
+
+```python
+case = memory.list_conflicts()[0]
+choice = next(c for c in case.candidates if c.content == "Use Postgres.")
+
+event = memory.resolve_conflict(
+    case.conflict_id,
+    choice.candidate_id,
+    expected_revision=case.revision,
+    actor="reviewer@example.com",
+    rationale="Production requires PostgreSQL extensions.",
+    event_id="review:storage-database:42",
+)
+```
+
+执行前会重新检查：
+
+1. case 仍为 open，revision 没有变化；
+2. 当前 active entry 仍是检测时的版本；
+3. 当前 workspace 的 observed fact IDs 与 fingerprint 快照一致；
+4. selected candidate 确实属于该 case；
+5. event ID 未被用于另一种裁决。
+
+任何新增证据都会触发 `StaleConflictResolutionError`，要求 reviewer 重新查看候选。选择 challenger 时创建下一版 curated revision；选择 incumbent 时只记录“保持现状”，不会制造虚假修订。成功事件追加到 `conflict-adjudications.jsonl`，包含 actor、rationale、case revision、选中 evidence IDs、原 active key 与结果 active key。
+
+同一个 event ID 携带完全相同的参数重试会返回原事件，不会重复写审计或创建修订；复用 event ID 改选另一个候选会显式拒绝。裁决 API 只属于可信 Harness/人工入口，`MemoryAwareAgent` 的模型工具列表不包含它。
+
+### 5. 保留原始证据
 
 蒸馏是建立派生视图，不是日志清理：
 
@@ -123,7 +178,7 @@ daily fact log ──select──> curated.json ──render──> MEMORY.md
 
 删除旧日志会让长期结论失去来源，也让错误蒸馏无法重新计算。真正的存储清理由单独的 retention/backup 策略负责，不和 memory distill 混在一起。
 
-### 4. 原子更新与重启恢复
+### 6. 原子更新与重启恢复
 
 直接以 `"w"` 打开 `MEMORY.md`，进程崩溃时可能只剩半个文件。本章采用同目录临时文件：
 
@@ -134,7 +189,7 @@ daily fact log ──select──> curated.json ──render──> MEMORY.md
 
 Windows 的回退仍会在替换前完整写入、刷新并同步临时文件，再执行同目录 `os.replace`，因此不会把半个新文件暴露为 canonical state。POSIX 平台额外同步目录项，以加强断电后的 rename 持久性。
 
-`curated.json` 是 canonical state，`MEMORY.md` 是可重建投影。如果进程在两次替换之间退出，下一次读取会以 canonical state 修复陈旧投影。新建一个 `WorkspaceMemory(project_dir)` 实例即可从磁盘恢复事实、策展条目和 prompt context；不会反序列化任何进程内对象。
+`curated.json` 是 memory canonical state，`conflicts.json` 是 review queue canonical state，`MEMORY.md` 是可重建投影。如果进程在策展状态和投影两次替换之间退出，下一次读取会以 canonical state 修复陈旧投影。新建一个 `WorkspaceMemory(project_dir)` 实例即可从磁盘恢复事实、策展条目、冲突 case、裁决日志和 prompt context；不会反序列化任何进程内对象。
 
 当前 schema 为 v2；读取器仍接受 v1 daily fact 和 curated state。旧条目按无 key 的 legacy 语义恢复，在下一次成功蒸馏写入时统一保存为 v2，而不会自动推断冲突域。读取 keyed 状态时还会校验每个域恰好一个 active 修订、修订号连续、前后链接互相匹配；损坏状态会显式报错，不会静默选择一个答案。
 
@@ -145,7 +200,7 @@ Windows 的回退仍会在替换前完整写入、刷新并同步临时文件，
 - 紧凑的 `MEMORY.md`；
 - 最近最多 6 条 workspace facts。
 
-它不会把所有 daily log 或 session transcript 整体塞回上下文。Keyed 原始事实在完成蒸馏前也不会作为 recent facts 绕过冲突策略；prompt 只能看到每个冲突域当前的 active 修订。Memory 的价值不在“存得越多”，而在召回时有明确预算和优先级。
+它不会把所有 daily log、冲突候选或 session transcript 整体塞回上下文。Keyed 原始事实在完成蒸馏前也不会作为 recent facts 绕过冲突策略；prompt 只能看到每个冲突域当前的 active 修订。Memory 的价值不在“存得越多”，而在召回时有明确预算和优先级。
 
 `MemoryAwareAgent` 在每个模型回合前读取这个 bounded view，并提供结构化 `write_memory` 工具。是否继续工具循环由响应中的 `tool_use` block 决定，不依赖 provider 的某个 stop-reason 字符串。
 
@@ -162,14 +217,21 @@ distill
   -> reject unstable kinds
   -> preserve legacy content groups; group keyed facts by conflict domain
   -> apply importance/repetition gate
-  -> reject stale or tied challengers
+  -> reject stale challengers; persist tied candidates as a conflict case
   -> merge evidence or append a linked revision
-  -> atomically replace curated.json and MEMORY.md
+  -> atomically replace curated.json / conflicts.json / MEMORY.md
+
+human review
+  -> list open conflict snapshot
+  -> submit expected revision + selected candidate + source event
+  -> reject changed evidence or reused event IDs
+  -> keep incumbent or append a linked curated revision
+  -> append ConflictAdjudication JSONL event
 
 restart
   -> resolve the same project scope
   -> validate workspace_id and schema
-  -> reload daily facts + curated state
+  -> reload daily facts + curated state + conflict queue + adjudication audit
   -> rebuild bounded prompt context
 ```
 
@@ -187,12 +249,18 @@ python3 s10_workspace_memory/code.py --demo
 python3 -m pytest -q tests/test_workspace_memory.py
 ```
 
-测试覆盖：项目隔离、追加顺序、蒸馏门槛、幂等、证据保留、原子替换失败、key 校验、新值确认、冲突 fail closed、过期证据防回滚、修订链校验、v1 迁移和跨实例恢复。
+测试覆盖：项目隔离、追加顺序、蒸馏门槛、幂等、证据保留、原子替换失败、key 校验、新值确认、冲突 fail closed、案件去重、选择 challenger、保留 incumbent、裁决审计幂等、新证据陈旧保护、案件 revision、跨 workspace 拒绝、修订链校验、v1 迁移和跨实例恢复。
 
 配置模型后可运行交互路径：
 
 ```bash
 python3 s10_workspace_memory/code.py
+```
+
+交互 CLI 使用 `/conflicts` 查看 open case，再用下面的格式裁决：
+
+```text
+/resolve <conflict_id> <revision> <candidate_id> <event_id> <rationale>
 ```
 
 ## 三层记忆中的位置
@@ -212,11 +280,15 @@ python3 s10_workspace_memory/code.py
 - **用答案文本充当 `memory_key`**：值改变时会变成另一个冲突域，失去替代关系；key 应描述稳定问题，例如 `runtime.python-version`。
 - **让单条新事实覆盖已有决策**：高重要度不等于已确认，替代必须满足独立重复证据门槛。
 - **把所有候选都注入 prompt 再让模型选择**：这会绕过 harness 的冲突策略；未决候选应留在证据日志中。
+- **只在内存里返回 conflicts 数量**：应用重启后 reviewer 不知道要处理什么，也无法证明当时看到了哪些证据。
+- **裁决时不校验 revision/fingerprint**：旧页面可能覆盖后来到达的新事实。
+- **让模型调用 resolve 工具**：候选内容不能给自己授予裁决权限，人工入口必须位于可信 Harness 边界。
+- **选择 incumbent 也创建新修订**：这会伪造一次事实变化；保持现状只需要审计事件。
 
 ## 练习
 
 1. 为 `DistillPolicy` 增加来源置信度，让用户确认的事实比工具推断更容易晋升。
-2. 为冲突报告增加待人工裁决队列，并设计显式选择某个候选的审计记录。
+2. 把多文件裁决流程升级为带 crash recovery 的 transaction journal，验证任意写入点中断后都能安全重放。
 3. 在不加载全部日志的前提下实现按日期倒序读取最近事实。
 
 ## 下一课

@@ -31,6 +31,7 @@ query → candidate → score → stable rank → RecallResult
 RecallResult
   → scope gate
   → confidence gate
+  → authority precedence
   → exact dedupe
   → explicit conflict resolution
   → stable top-k / budget packing
@@ -46,12 +47,13 @@ RecallResult
 flowchart LR
     A["S12 RecallHit"] --> B["S15 Candidate Adapter"]
     B --> C["Scope + Confidence"]
-    C --> D["Dedupe + Conflict"]
-    D --> E["Stable top-k"]
-    E --> F["Char / Token Pack"]
-    F --> G["Recalled Memory Segment"]
-    G --> H["Total Prompt Planner"]
-    H --> I["System Prompt + Two Decision Logs"]
+    C --> D["Authority Precedence"]
+    D --> E["Dedupe + Conflict"]
+    E --> F["Stable top-k"]
+    F --> G["Char / Token Pack"]
+    G --> H["Recalled Memory Segment"]
+    H --> I["Total Prompt Planner"]
+    I --> J["System Prompt + Two Decision Logs"]
 ```
 
 ## S12 与 S15 的职责边界
@@ -59,9 +61,9 @@ flowchart LR
 | 章节 | 负责 | 不负责 |
 |---|---|---|
 | S12 Remote Memory | query 规范化、候选生成、score breakdown、稳定排名、scope 与 provenance | 不决定最终 Prompt 使用哪些 hit |
-| S15 Prompt Assembly | scope/置信度门禁、去重、冲突、top-k、字符/token 预算、Prompt 片段组装 | 不重算检索分数，不写回长期记忆 |
+| S15 Prompt Assembly | scope/置信度门禁、权限层级、去重、冲突、top-k、字符/token 预算、Prompt 片段组装 | 不重算检索分数，不写回长期记忆 |
 
-`memory_candidates_from_recall()` 只做结构适配：复制 S12 的 `scope`、`score`、`rank` 和 `provenance`，不偷偷重排。这样 retrieval 与 selection 可以独立测试和演进。
+`memory_candidates_from_recall()` 只做结构适配：复制 S12 的 `scope`、`score`、`rank` 和 `provenance`，不偷偷重算。S12 记录默认标为 `user_default`；只有可信 Harness 调用方可以通过 `authority_by_memory_id` 显式标记 workspace override 或本轮指令。这样 retrieval 与 selection 可以独立测试和演进。
 
 ## Memory Selection 的核心契约
 
@@ -75,7 +77,8 @@ flowchart LR
 - `score`：S12 产生的召回分数；
 - `source_rank`：S12 的稳定排名；
 - `provenance`：来源 ID、类型、标题与采集时间；
-- `conflict_key`：可选的显式事实槽位。
+- `conflict_key`：可选的显式事实槽位；
+- `authority`：`current_turn`、`workspace_override` 或 `user_default`。
 
 `conflict_key` 不由 S15 从自然语言里猜。例如“自动化语言偏好”可以由结构化记忆生产者标成 `preference:automation-language`。让 Prompt Assembly 再调用一个模型判断矛盾，会把不可观察的第二次推理藏进关键路径。
 
@@ -110,7 +113,41 @@ Plan 同时返回：
 - `context`：预算内的 `<recalled_memory>`；
 - `used_chars` / `used_tokens`：包括 XML wrapper 与 provenance 属性的真实装箱成本；
 - `selected_memory_ids` / `rejected_memory_ids`；
-- `decisions`：每条候选的状态、原因、关联 winner 和解释文本。
+- `decisions`：每条候选的权限层级、状态、原因、关联 winner 和解释文本。
+
+## 三层偏好权限，而不是三个分数权重
+
+同一个事实槽位可能同时有三种有效输入：
+
+| Authority | 含义 | 示例 |
+|---|---|---|
+| `current_turn` | 用户只对当前任务给出的明确要求 | “这次请用 Go 实现” |
+| `workspace_override` | 当前项目的局部约定 | “本仓库自动化统一使用 TypeScript” |
+| `user_default` | 跨项目复用的个人默认偏好 | “我通常偏好 Python” |
+
+仲裁规则固定为：
+
+```text
+current_turn > workspace_override > user_default
+```
+
+这不是给 score 再乘一个权重。低层候选即使 score 更高、rank 更靠前、来源更新，也不能覆盖高层候选；只有处在同一 authority 时才比较检索证据：
+
+```text
+authority desc → score desc → source_rank asc → captured_at desc → memory_id asc
+```
+
+权限字段由 Harness 边界提供，模型不能发明 `system_override` 一类更高等级。未知值会 fail-closed。默认值是 `user_default`，因此原有 S12 adapter 与手写候选保持兼容。
+
+### Authority 不等于 Harness required
+
+`current_turn` 是偏好候选中的最高层，但仍不是系统安全规则。Base instructions、工具边界和 Working mode 继续由 required `PromptSegment` 承载：
+
+- authority 只在候选之间决定谁赢、谁先使用 Memory 预算；
+- required 片段先预留总 Prompt 预算，任何 preference 都不能覆盖或挤掉它；
+- required 本身装不下时抛出 `PromptBudgetError`，不会把安全规则降级成可选偏好。
+
+本轮用户消息仍由 conversation messages 传给模型；`current_turn` 候选是它的结构化仲裁投影和审计证据，不应取代原始用户消息。
 
 ## 选择顺序为什么不能交换
 
@@ -122,25 +159,33 @@ Plan 同时返回：
 
 低于 `min_score` 的记录以 `low_confidence` 拒绝。低置信度不是“排在最后也许能用”，而是默认 abstain，避免预算宽松时把噪声重新放回 Prompt。
 
-### 3. Exact dedupe
+### 3. Authority precedence
+
+通过门禁的候选先按三层 authority 排序。这个顺序同时控制去重 winner、冲突 winner 和后续 top-k/预算装箱，避免低层高分候选抢占空间后让本轮要求消失。
+
+Authority 不能绕过前两道门：跨 scope 或低于 `min_score` 的 `current_turn` 投影仍然会被拒绝。
+
+### 4. Exact dedupe
 
 内容经过 NFKC、大小写折叠和空白归一化后做确定性精确去重。排序更强的候选保留，其他候选记录 `duplicate_content` 以及 winner ID。
 
 这里刻意不声称完成了语义去重。生产环境可以在上游增加 embedding cluster，但必须继续输出可追踪的 winner/loser 关系。
 
-### 4. Explicit conflict resolution
+### 5. Explicit conflict resolution
 
-相同 `conflict_key` 的不同内容竞争同一事实槽位。候选先按以下键稳定排序：
+相同 `conflict_key` 的不同内容竞争同一事实槽位。跨 authority 时，低层候选以 `authority_loser` 拒绝，并记录 winner ID 与双方层级；同层冲突则继续使用 `conflict_loser`。
+
+同层候选按以下键稳定排序：
 
 ```text
 score desc → source_rank asc → captured_at desc → memory_id asc
 ```
 
-第一条成为 winner，其余以 `conflict_loser` 拒绝。冲突败者不会因为 winner 太长或当前预算变化而回填，因为它表达的是已被裁决掉的事实，不只是昂贵上下文。
+第一条成为 winner。冲突败者不会因为 winner 太长或当前预算变化而回填，因为它表达的是已被裁决掉的事实，不只是昂贵上下文。
 
-### 5. Top-k 与预算装箱
+### 6. Top-k 与预算装箱
 
-存活候选按稳定顺序逐条尝试：
+存活候选按 authority 优先的稳定顺序逐条尝试：
 
 - 已经选满时：`top_k_reached`；
 - 加入后字符超限：`char_budget_exceeded`；
@@ -161,7 +206,7 @@ Memory candidates
                  └─ final system prompt
 ```
 
-第一层在 memory 内部选择事实，能解释每条 hit 为什么被拒绝；第二层在系统提示全局比较 persona、memory、project、skills 等片段的价值。如果总 Prompt 预算更紧，整个 memory 片段仍可能被原子舍弃，并由 `SegmentDecision` 记录原因。
+第一层在 memory 内部选择事实，能解释每条 hit 为什么被拒绝；第二层在系统提示全局比较 persona、memory、project、skills 等片段的价值。如果总 Prompt 预算更紧，整个 memory 片段仍可能被原子舍弃，并由 `SegmentDecision` 记录原因。即使 memory 中存在 `current_turn` 投影，它也不能把可选 Memory 片段升级成 required 系统规则。
 
 这两个决策日志不能合并：一个回答“为什么没选这条记忆”，另一个回答“为什么最终没放这个 Prompt 片段”。
 
@@ -225,7 +270,7 @@ python s15_prompt_assembly/code.py
 memory
 ```
 
-教学 fixture 会同时产生：正确候选、重复候选、同槽冲突、低置信度候选和跨用户候选。终端会展示每条记录的 rank、score、selected/rejected、原因码和解释，并展示 memory 与总 Prompt 两层预算。
+教学 fixture 会同时产生：User Default、Workspace Override、本轮指令、同槽跨层冲突、低置信度候选和跨用户候选。终端会展示每条记录的 authority、rank、score、selected/rejected、原因码和解释，并展示 memory 与总 Prompt 两层预算。
 
 继续输入：
 
@@ -248,6 +293,9 @@ PROMPT_BUDGET_CHARS=2000 python s15_prompt_assembly/code.py
 - **把 RecallHit 直接拼进 Prompt**：跳过 scope、冲突和预算决策。
 - **只保留 total score**：无法解释低置信度或冲突 winner。
 - **用输入顺序决定冲突**：JSONL 顺序变化会让事实翻转。
+- **让高 score 覆盖高 authority**：检索相关性不能改变用户指令的权限边界。
+- **让模型自行声明 authority**：模型可以提议内容，不能为自己授予更高权限。
+- **把 `current_turn` 当成 required**：用户偏好层级不能覆盖 Harness 安全规则。
 - **对长记忆直接切字符串**：可能切断 provenance、XML 和事实语义。
 - **把未命中写成空 `<memory>`**：浪费 token，且让模型误以为存在记忆证据。
 - **把字符估算叫真实 token**：不同模型 tokenizer 不同，应显式注入。
@@ -263,6 +311,8 @@ PROMPT_BUDGET_CHARS=2000 python s15_prompt_assembly/code.py
 5. 为什么需要 memory decision log 和 segment decision log 两套审计？
 6. 如何接入真实 tokenizer，而不破坏离线回归和上层 API？
 7. 如何把精确去重升级为语义去重，同时保持 deterministic replay？
+8. 为什么 authority 必须先于 score？它为什么又必须晚于 scope 和 confidence gate？
+9. `current_turn` 与 required PromptSegment 的权限边界分别是什么？
 
 ## 练习
 
@@ -270,6 +320,7 @@ PROMPT_BUDGET_CHARS=2000 python s15_prompt_assembly/code.py
 2. 在上游增加结构化 `fact_type + subject`，生成更可靠的 conflict key。
 3. 增加“必须保留”的 Memory 类型，思考它与 Harness required 安全规则有何不同，以及预算不足时是否应该 fail-closed。
 4. 把 decision reason 汇总为 offline eval 指标，例如 scope rejection rate、low-confidence abstention rate 和 budget utilization。
+5. 为 authority 来源增加签名或事件绑定，证明层级由可信 Harness 产生而不是模型伪造。
 
 ## 下一课
 

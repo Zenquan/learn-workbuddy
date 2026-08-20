@@ -58,7 +58,11 @@ if str(_WB_ROOT) not in _wb_sys.path:
 from mini_workbuddy.chapter_demo import maybe_run_chapter_demo as _wb_maybe_run_chapter_demo
 _wb_maybe_run_chapter_demo(__file__, PROGRESSION)
 from mini_workbuddy.chapter_demo import prepare_chapter_provider as _wb_prepare_chapter_provider
-_wb_prepare_chapter_provider()
+# Prompt selection is intentionally reusable by the full-tour runtime.  Do not
+# let an import parse the caller's CLI; only this chapter's executable owns its
+# ``--provider`` argument.
+if __name__ == "__main__":
+    _wb_prepare_chapter_provider()
 import html
 import math
 import os

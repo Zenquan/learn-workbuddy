@@ -11,11 +11,28 @@ Kept offline-only: no key, no network beyond loopback HTTP, deterministic.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+
+def load_full_tour(root: Path):
+    """Load the example as a module without giving it package-only behavior."""
+
+    module_name = "test_full_tour_example"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        root / "examples" / "full_tour" / "code.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load full-tour example")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_full_tour_offline_runs_green(root: Path, tmp_path: Path) -> None:
@@ -48,6 +65,10 @@ def test_full_tour_offline_runs_green(root: Path, tmp_path: Path) -> None:
     assert stages["tool_dispatch"] is True
     assert stages["provider_probe"] is True
     assert stages["provider_tool_calls"] >= 1
+    assert stages["memory_recall_hits"] >= 1
+    assert stages["memory_context_selected"] >= 1
+    assert stages["memory_context_injected"] is True
+    assert stages["memory_context_chars"] > 0
     assert stages["permission_denied"] is True
     assert stages["externalized"] is True
     assert stages["http_run"] is True
@@ -58,3 +79,50 @@ def test_full_tour_offline_runs_green(root: Path, tmp_path: Path) -> None:
     # Every artifact the manifest points to must actually exist on disk.
     for name, path in manifest["artifacts"].items():
         assert Path(path).exists(), f"missing artifact {name}: {path}"
+
+    # The exported context is the inspectable boundary between chapter recall
+    # and the provider loop.  Stable IDs preserve enough provenance to explain
+    # why a memory entered the prompt without exposing the backing store.
+    recalled_context = Path(manifest["artifacts"]["recalled_context"]).read_text(encoding="utf-8")
+    assert "<recalled_memory" in recalled_context
+    assert "memory_id=" in recalled_context
+    assert "source_id=" in recalled_context
+
+
+def test_provider_probe_sends_selected_memory_in_system_request(root: Path, tmp_path: Path) -> None:
+    full_tour = load_full_tour(root)
+
+    class RecordingProvider(full_tour.P.OfflineMockProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.system_requests: list[str] = []
+
+        def create(self, request):
+            self.system_requests.append(request.system)
+            return super().create(request)
+
+    config = full_tour.HarnessConfig(root_dir=tmp_path / "probe-home")
+    config.ensure_dirs()
+    storage = full_tour.Storage(config)
+    session = storage.create_session(cwd=str(root), title="memory injection probe")
+    provider = RecordingProvider()
+    selected_context = (
+        '<recalled_memory user_scope="scope" selected="1">\n'
+        '<memory_hit memory_id="memory-1" source_id="source-1">fact</memory_hit>\n'
+        "</recalled_memory>"
+    )
+
+    result = full_tour.provider_probe(
+        provider,
+        session,
+        storage,
+        full_tour.ToolRegistry(config, storage),
+        full_tour.AuditLog(config),
+        full_tour.EventBus(),
+        memory_context=selected_context,
+    )
+
+    assert result["ok"] is True
+    assert result["memory_context_injected"] is True
+    assert provider.system_requests
+    assert all(selected_context in system for system in provider.system_requests)

@@ -65,7 +65,11 @@ from mini_workbuddy.chapter_demo import maybe_run_chapter_demo
 from mini_workbuddy.chapter_demo import prepare_chapter_provider
 
 maybe_run_chapter_demo(__file__, PROGRESSION)
-prepare_chapter_provider()
+# The chapter is also a library boundary for later integration examples.  Only
+# the direct teaching entrypoint owns CLI provider parsing; an importing
+# runtime may have a different provider vocabulary (for example ``offline``).
+if __name__ == "__main__":
+    prepare_chapter_provider()
 
 from anthropic import Anthropic
 from dotenv import load_dotenv

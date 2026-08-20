@@ -127,7 +127,17 @@ def build_chapter_memory_context(home: Path, session, source_path: Path) -> dict
         query_id=f"full-tour-recall:{session.id}",
         as_of=now,
     )
-    candidates = s15.memory_candidates_from_recall(recall)
+    # S15's authority belongs to the trusted caller, not the recalled prose.
+    # This evidence originated from workspace-scoped storage, so it outranks a
+    # user default but remains below an explicit current-turn instruction.
+    workspace_authority = {
+        hit.memory_id: s15.PreferenceAuthority.WORKSPACE_OVERRIDE
+        for hit in recall.hits
+    }
+    candidates = s15.memory_candidates_from_recall(
+        recall,
+        authority_by_memory_id=workspace_authority,
+    )
     plan = s15.select_memory_context(
         candidates,
         user_scope=recall.query.user_scope,
@@ -152,6 +162,7 @@ def build_chapter_memory_context(home: Path, session, source_path: Path) -> dict
                 "memory_id": decision.memory_id,
                 "status": decision.status.value,
                 "reason": decision.reason.value,
+                "authority": decision.authority.value,
                 "score": decision.score,
             }
             for decision in plan.decisions

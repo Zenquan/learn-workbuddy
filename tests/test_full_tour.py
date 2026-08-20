@@ -87,6 +87,7 @@ def test_full_tour_offline_runs_green(root: Path, tmp_path: Path) -> None:
     assert "<recalled_memory" in recalled_context
     assert "memory_id=" in recalled_context
     assert "source_id=" in recalled_context
+    assert 'authority="workspace_override"' in recalled_context
 
 
 def test_provider_probe_sends_selected_memory_in_system_request(root: Path, tmp_path: Path) -> None:

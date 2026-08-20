@@ -2,7 +2,7 @@
 
 章节 demo 每次只隔离一个机制。`full_tour` 反过来：它把 provider、session、记忆、召回、上下文选择、工具、权限、外部化、JSONL、HTTP 和审计串成一条完整链路，让你看到这些层怎么接在一起。运行后还会留下可检查的 artifacts。
 
-tour 会先把 workspace note 作为来源证据交给 S12：持久化用户作用域记录并针对当前问题召回；再把 `RecallResult` 交给 S15 做置信度、top-k 和字符/token 预算选择。只有入选的 `<recalled_memory>` 才进入 provider probe 的 system request。选择真实 provider 时，模型随后必须通过统一 adapter 调用 `tool_search`，工具结果会写入 transcript 和 audit。也就是说，`--provider deepseek|anthropic|openai|openai-chat` 不只是初始化 SDK，而是真的跑过一次 memory -> context -> model -> tool -> result 循环。
+tour 会先把 workspace note 作为来源证据交给 S12：持久化用户作用域记录并针对当前问题召回；再由可信调用方标记 `workspace_override` 权威级别，把 `RecallResult` 交给 S15 做置信度、权威优先级、top-k 和字符/token 预算选择。只有入选的 `<recalled_memory>` 才进入 provider probe 的 system request。选择真实 provider 时，模型随后必须通过统一 adapter 调用 `tool_search`，工具结果会写入 transcript 和 audit。也就是说，`--provider deepseek|anthropic|openai|openai-chat` 不只是初始化 SDK，而是真的跑过一次 memory -> context -> model -> tool -> result 循环。
 
 ## 代码架构图
 

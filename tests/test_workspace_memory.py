@@ -68,6 +68,31 @@ def _append_pair(
         )
 
 
+def _database_conflict(s10, root: Path):
+    memory = s10.WorkspaceMemory(root)
+    memory.append_daily_log(
+        "Use SQLite.",
+        kind="decision",
+        importance=5,
+        memory_key="storage.database",
+        recorded_at=_old(1),
+        fact_id="database-current",
+    )
+    as_of = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    memory.distill(as_of=as_of)
+    for content, prefix in (("Use Postgres.", "pg"), ("Use MySQL.", "mysql")):
+        _append_pair(
+            memory,
+            content,
+            memory_key="storage.database",
+            first_day=10,
+            prefix=prefix,
+        )
+    report = memory.distill(as_of=as_of)
+    case = memory.list_conflicts()[0]
+    return memory, as_of, report, case
+
+
 def test_workspace_scope_isolated_and_log_is_append_only(s10, tmp_path: Path) -> None:
     first = s10.WorkspaceMemory(tmp_path / "project-a")
     second = s10.WorkspaceMemory(tmp_path / "project-b")
@@ -334,35 +359,291 @@ def test_stale_evidence_cannot_roll_back_active_revision(s10, tmp_path: Path) ->
 def test_equal_strength_conflict_fails_closed_and_is_observable(
     s10, tmp_path: Path
 ) -> None:
-    memory = s10.WorkspaceMemory(tmp_path / "project")
-    memory.append_daily_log(
-        "Use SQLite.",
-        kind="decision",
-        importance=5,
-        memory_key="storage.database",
-        recorded_at=_old(1),
-        fact_id="database-current",
+    memory, as_of, report, case = _database_conflict(
+        s10, tmp_path / "project"
     )
-    as_of = datetime(2026, 3, 1, tzinfo=timezone.utc)
-    memory.distill(as_of=as_of)
-    for content, prefix in (("Use Postgres.", "pg"), ("Use MySQL.", "mysql")):
-        _append_pair(
-            memory,
-            content,
-            memory_key="storage.database",
-            first_day=10,
-            prefix=prefix,
-        )
-
-    report = memory.distill(as_of=as_of)
 
     assert report.conflicts == 1
+    assert report.queued_conflicts == 1
+    assert report.conflict_case_ids == (case.conflict_id,)
     assert report.superseded == 0
     assert report.created == 0
     assert "Use SQLite." in memory.read_memory_md()
     assert "Use Postgres." not in memory.get_context_for_agent()
     assert "Use MySQL." not in memory.get_context_for_agent()
     assert len(memory._load_curated()) == 1
+    assert case.status == "open"
+    assert case.revision == 1
+    assert case.active_entry_key == memory._load_curated()[0].key
+    assert [candidate.candidate_id for candidate in case.candidates] == sorted(
+        candidate.candidate_id for candidate in case.candidates
+    )
+    assert {candidate.content for candidate in case.candidates} == {
+        "Use SQLite.",
+        "Use Postgres.",
+        "Use MySQL.",
+    }
+    assert sum(candidate.incumbent for candidate in case.candidates) == 1
+    assert set(case.observed_fact_ids) == {
+        "database-current",
+        "pg1",
+        "pg2",
+        "mysql1",
+        "mysql2",
+    }
+
+    before = memory.conflict_file.read_text(encoding="utf-8")
+    rerun = memory.distill(as_of=as_of)
+    assert rerun.conflicts == 1
+    assert rerun.queued_conflicts == 0
+    assert rerun.conflict_case_ids == (case.conflict_id,)
+    assert memory.conflict_file.read_text(encoding="utf-8") == before
+
+
+def test_human_resolution_creates_revision_and_append_only_audit(
+    s10, tmp_path: Path
+) -> None:
+    root = tmp_path / "project"
+    memory, as_of, _, case = _database_conflict(s10, root)
+    selected = next(
+        candidate for candidate in case.candidates if candidate.content == "Use Postgres."
+    )
+
+    event = memory.resolve_conflict(
+        case.conflict_id,
+        selected.candidate_id,
+        expected_revision=case.revision,
+        actor="KEDADA",
+        rationale="The deployment target requires PostgreSQL features.",
+        event_id="review:storage-database:1",
+        resolved_at=as_of,
+    )
+
+    assert event.actor == "KEDADA"
+    assert event.evidence_ids == ("pg1", "pg2")
+    assert len(memory.list_adjudications()) == 1
+    assert memory.adjudication_file.read_text(encoding="utf-8").count("\n") == 1
+    resolved = memory.list_conflicts(status=s10.ConflictStatus.RESOLVED)[0]
+    assert resolved.selected_candidate_id == selected.candidate_id
+    assert resolved.resulting_active_entry_key == event.resulting_active_entry_key
+
+    entries = sorted(memory._load_curated(), key=lambda item: item.revision)
+    assert len(entries) == 2
+    assert entries[0].status == "superseded"
+    assert entries[1].status == "active"
+    assert entries[1].content == "Use Postgres."
+    assert entries[1].supersedes == entries[0].key
+    assert entries[0].superseded_by == entries[1].key
+    assert "Use Postgres." in memory.get_context_for_agent()
+    assert "Use MySQL." not in memory.get_context_for_agent()
+    assert len(memory.read_all_facts()) == 5
+
+    # Replaying distillation cannot promote a rejected candidate from the same
+    # reviewed evidence snapshot.
+    rerun = memory.distill(as_of=as_of)
+    assert rerun.created == 0
+    assert rerun.superseded == 0
+    assert next(
+        entry for entry in memory._load_curated() if entry.status == "active"
+    ).content == "Use Postgres."
+
+    recovered = s10.WorkspaceMemory(root)
+    assert recovered.list_conflicts() == []
+    assert recovered.list_conflicts(status=None)[0].status == "resolved"
+    assert recovered.list_adjudications() == [event]
+
+
+def test_resolution_retry_is_idempotent_and_event_reuse_is_rejected(
+    s10, tmp_path: Path
+) -> None:
+    memory, as_of, _, case = _database_conflict(s10, tmp_path / "project")
+    postgres = next(
+        candidate for candidate in case.candidates if candidate.content == "Use Postgres."
+    )
+    mysql = next(
+        candidate for candidate in case.candidates if candidate.content == "Use MySQL."
+    )
+    kwargs = {
+        "expected_revision": case.revision,
+        "actor": "KEDADA",
+        "rationale": "Use the reviewed deployment standard.",
+        "event_id": "review-retry-1",
+        "resolved_at": as_of,
+    }
+
+    first = memory.resolve_conflict(
+        case.conflict_id, postgres.candidate_id, **kwargs
+    )
+    second = memory.resolve_conflict(
+        case.conflict_id, postgres.candidate_id, **kwargs
+    )
+
+    assert second == first
+    assert len(memory.list_adjudications()) == 1
+    assert len(memory._load_curated()) == 2
+    with pytest.raises(s10.ConflictResolutionError, match="already used differently"):
+        memory.resolve_conflict(case.conflict_id, mysql.candidate_id, **kwargs)
+
+
+def test_reviewer_can_keep_incumbent_without_creating_fake_revision(
+    s10, tmp_path: Path
+) -> None:
+    memory, as_of, _, case = _database_conflict(s10, tmp_path / "project")
+    incumbent = next(candidate for candidate in case.candidates if candidate.incumbent)
+
+    event = memory.resolve_conflict(
+        case.conflict_id,
+        incumbent.candidate_id,
+        expected_revision=case.revision,
+        actor="KEDADA",
+        rationale="The alternatives do not justify changing the current database.",
+        event_id="review-keep-current-1",
+        resolved_at=as_of,
+    )
+
+    assert event.prior_active_entry_key == event.resulting_active_entry_key
+    assert len(memory._load_curated()) == 1
+    memory.distill(as_of=as_of)
+    active = memory._load_curated()[0]
+    assert active.content == "Use SQLite."
+    assert active.revision == 1
+    assert "Use Postgres." not in memory.get_context_for_agent()
+
+
+def test_new_evidence_invalidates_observed_conflict_snapshot(
+    s10, tmp_path: Path
+) -> None:
+    memory, as_of, _, case = _database_conflict(s10, tmp_path / "project")
+    postgres = next(
+        candidate for candidate in case.candidates if candidate.content == "Use Postgres."
+    )
+    memory.append_daily_log(
+        "Use Postgres.",
+        kind="decision",
+        importance=4,
+        memory_key="storage.database",
+        recorded_at=_old(20),
+        fact_id="pg3",
+    )
+
+    with pytest.raises(
+        s10.StaleConflictResolutionError, match="evidence changed"
+    ):
+        memory.resolve_conflict(
+            case.conflict_id,
+            postgres.candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="This review is now stale.",
+            event_id="stale-review-1",
+            resolved_at=as_of,
+        )
+
+    assert memory.list_adjudications() == []
+    assert memory.list_conflicts()[0].conflict_id == case.conflict_id
+    assert memory._load_curated()[0].content == "Use SQLite."
+
+
+def test_refreshed_equal_conflict_supersedes_old_revision(
+    s10, tmp_path: Path
+) -> None:
+    memory, as_of, _, original = _database_conflict(s10, tmp_path / "project")
+    for content, fact_id in (("Use Postgres.", "pg3"), ("Use MySQL.", "mysql3")):
+        memory.append_daily_log(
+            content,
+            kind="decision",
+            importance=4,
+            memory_key="storage.database",
+            recorded_at=_old(20),
+            fact_id=fact_id,
+        )
+
+    report = memory.distill(as_of=as_of)
+    refreshed = memory.list_conflicts()[0]
+
+    assert report.queued_conflicts == 1
+    assert refreshed.revision == 2
+    assert refreshed.conflict_id != original.conflict_id
+    old = next(
+        case
+        for case in memory.list_conflicts(status=None)
+        if case.conflict_id == original.conflict_id
+    )
+    assert old.status == "superseded"
+    with pytest.raises(s10.StaleConflictResolutionError, match="not open"):
+        memory.resolve_conflict(
+            original.conflict_id,
+            original.candidates[0].candidate_id,
+            expected_revision=original.revision,
+            actor="KEDADA",
+            rationale="Old browser tab.",
+            event_id="stale-revision-1",
+            resolved_at=as_of,
+        )
+
+
+def test_conflict_queue_scope_validation_and_partial_audit_tail(
+    s10, tmp_path: Path
+) -> None:
+    first, as_of, _, case = _database_conflict(s10, tmp_path / "project-a")
+    selected = next(candidate for candidate in case.candidates if not candidate.incumbent)
+    first.resolve_conflict(
+        case.conflict_id,
+        selected.candidate_id,
+        expected_revision=case.revision,
+        actor="KEDADA",
+        rationale="Reviewed candidate.",
+        event_id="audit-tail-1",
+        resolved_at=as_of,
+    )
+    with first.adjudication_file.open("ab") as handle:
+        handle.write(b'{"event_id":')
+    assert [event.event_id for event in first.list_adjudications()] == ["audit-tail-1"]
+
+    second = s10.WorkspaceMemory(tmp_path / "project-b")
+    second.conflict_file.write_text(
+        first.conflict_file.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    with pytest.raises(s10.MemoryScopeError, match="another workspace"):
+        second.list_conflicts()
+
+
+def test_unknown_candidate_and_invalid_boundary_values_fail_closed(
+    s10, tmp_path: Path
+) -> None:
+    memory, as_of, _, case = _database_conflict(s10, tmp_path / "project")
+    with pytest.raises(s10.ConflictResolutionError, match="is not part"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            "candidate-0000000000000000",
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="Unknown candidate must fail.",
+            event_id="unknown-candidate-1",
+            resolved_at=as_of,
+        )
+    with pytest.raises(ValueError, match="event_id"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            case.candidates[0].candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="Invalid event identifier.",
+            event_id="bad event id",
+            resolved_at=as_of,
+        )
+    with pytest.raises(TypeError, match="expected_revision must be an integer"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            case.candidates[0].candidate_id,
+            expected_revision=True,
+            actor="KEDADA",
+            rationale="Boolean revisions must not pass as integers.",
+            event_id="boolean-revision-1",
+            resolved_at=as_of,
+        )
+    with pytest.raises(ValueError, match="unsupported conflict status"):
+        memory.list_conflicts(status="pending")
 
 
 def test_supersession_is_idempotent_and_recovers_in_a_new_instance(

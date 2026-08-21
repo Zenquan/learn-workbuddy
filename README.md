@@ -240,7 +240,7 @@ flowchart LR
 | [s21 SQLite Database](./s21_sqlite_database/) | 会话、用量、任务要可查询 | WAL / schema / usage |
 | [s22 Automation Scheduler](./s22_automation_scheduler/) | 到点自动跑 | recurring / once / queue |
 | [s23 Audit Sandbox](./s23_audit_sandbox/) | 每步留痕，不可篡改 | hash chain / command policy |
-| [s24 Comprehensive](./s24_comprehensive/) | 机制很多，循环一个 | integrated harness |
+| [s24 Comprehensive](./s24_comprehensive/) | 机制很多，循环一个 | RAG-memory harness 端到端与重启回放 |
 
 ---
 

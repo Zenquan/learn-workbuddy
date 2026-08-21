@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -71,6 +72,45 @@ def test_workspace_memory_scopes_jsonl_by_project(s24, tmp_path: Path) -> None:
     assert "second fact" not in first.get_workspace()
 
 
+def test_rag_memory_harness_replays_selected_context_after_restart(
+    s24,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "project-note.txt").write_text("offline harness fixture", encoding="utf-8")
+
+    result = s24.run_rag_memory_harness(tmp_path)
+
+    assert result["ok"] is True
+    assert all(result["checks"].values()), result["checks"]
+    assert result["recalled_ids"] == result["selected_ids"]
+    assert '<recalled_memory user_scope="' in result["context"]
+    assert f'memory_id="{result["memory_id"]}"' in result["context"]
+    assert 'authority="workspace_override"' in result["context"]
+    assert "source_id=" in result["context"]
+    assert result["context"] in result["system_prompt"]
+    assert "project-note.txt" in result["tool_output"]
+
+    # These reads happen through fresh persistence objects inside the harness,
+    # not through the in-memory instances that wrote the records.
+    assert result["replayed_event_types"] == [
+        "message",
+        "recall_result",
+        "memory_context_selected",
+        "function_call_result",
+        "message",
+    ]
+    assert "scripts/verify.py" in result["restarted_workspace_memory"]
+    assert result["memory_id"] in result["restarted_remote_memory_ids"]
+
+    manifest_path = Path(result["manifest_path"])
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["checks"] == result["checks"]
+    assert Path(manifest["artifacts"]["context"]).read_text(encoding="utf-8") == result["context"]
+
+
 def test_keyless_multiturn_walkthrough_uses_tool_blocks(root: Path, tmp_path: Path) -> None:
     env = os.environ.copy()
     env.pop("MODEL_ID", None)
@@ -84,3 +124,6 @@ def test_keyless_multiturn_walkthrough_uses_tool_blocks(root: Path, tmp_path: Pa
     assert "turn 1: blocks=['tool_use']" in result.stdout
     assert "tool_result call_1" in result.stdout
     assert "walkthrough complete" in result.stdout
+    assert "query -> recall -> select -> context -> tool -> transcript/memory -> restart" in result.stdout
+    assert "rag memory harness: OK" in result.stdout
+    assert "restart: transcript=5 events" in result.stdout

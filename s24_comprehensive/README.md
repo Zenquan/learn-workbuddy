@@ -12,25 +12,47 @@
 
 ```mermaid
 flowchart LR
-    A["User Request"] --> B["Session Runtime"]
-    B --> C["Prompt + Model Turn"]
-    C --> D{"tool_use blocks?"}
-    D -->|"yes"| E["Registry → Permission → Execute"]
-    E --> F["tool_result + Transcript + Audit"]
-    F --> C
-    D -->|"no"| G["Present Result"]
-    B -. "logical state" .-> H["SQLite + scoped Memory"]
+    Q["Query"]
+
+    subgraph M["Memory line · durable facts"]
+        M1["Workspace Memory"] --> M2["S12 RemoteMemoryStore"]
+        M2 --> M3["Fresh store after restart"]
+    end
+
+    subgraph R["RAG / Context line · query-scoped evidence"]
+        R1["S12 RecallEngine"] --> R2["RecallResult + provenance"]
+        R2 --> R3["S15 candidate + policy selection"]
+        R3 --> R4["recalled_memory context"]
+    end
+
+    subgraph H["Harness line · one existing runtime"]
+        H1["PromptAssembler"] --> H2["Tool registry + permission"]
+        H2 --> H3["Transcript + Workspace Memory"]
+        H3 --> H4["Fresh adapters replay"]
+    end
+
+    Q --> R1
+    M2 --> R1
+    Q --> H1
+    R4 --> H1
+    H3 --> M1
+    M3 --> H4
 ```
+
+这不是第二个 Agent：S24 只负责把已有运行时接到 S12、S15 的公开契约上。召回算法仍归 S12，候选准入与预算仍归 S15，工具权限、transcript 和工作区作用域仍由 S24 原有 harness 管理。
 
 ## 学习前置知识
 
 - 完整 harness 是多个小机制组合, 不是一个大框架魔法。
+- `RecallResult` 是带分数、作用域和 provenance 的检索证据，不应未经选择直接塞入 prompt。
+- 重启回归必须用新建的 store、memory 和 transcript adapter 读取磁盘，不能拿旧对象冒充恢复成功。
 - Python 教学实现复刻的是架构机制, 不是 Electron/Node 源码。
 - 最终 demo 应该能展示端到端数据流、安全边界，以及各章契约没有在集成时退化。
 
 ## 本章抓住的 WorkBuddy-style 机制
 
 - 串起 block-driven loop、单一工具注册表、显式权限、作用域记忆、JSONL transcript、SQLite 和审计。
+- 复用 S12 `RecallEngine` 与 S15 `select_memory_context`，把 `query → recall → select → context → tool → transcript/memory → restart` 变成一个可回归契约。
 - 用 clean-room Python 证明 WorkBuddy-style harness 的核心可以从零搭建。
 - 把前 23 章收束成一个可运行 mini WorkBuddy。
 
@@ -38,6 +60,7 @@ flowchart LR
 
 - 只做聊天界面没有 sidecar/session/memory/audit, 不算 harness。
 - 单章里是 `ASK`，综合章却自动批准，属于集成语义漂移。
+- 把“写入过记忆”当成“重启后可恢复”，却没有通过新对象回读 transcript、workspace memory 与 remote memory。
 - 公开表达混淆源码提取和教学实现, 会带来信任和合规风险。
 ## 问题
 
@@ -395,21 +418,54 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 21. **Database**（s21）— SQLite 会话持久化 + 用量追踪
 22. **Automation**（s22）— RRULE 定时调度
 23. **Audit & Sandbox**（s23）— 命令安全分级 + 哈希链审计
-24. **Comprehensive**（s24）— 全部机制集成到一个循环
+24. **Comprehensive**（s24）— 全部机制集成到一个循环，并以离线 RAG-memory 重启契约证明没有语义漂移
 
 这不是生产代码, 而是教学集成——每个机制用最简形式展示其在循环中的位置。
+
+### RAG-memory 集成主流程
+
+`run_rag_memory_harness()` 不重新实现 retrieval 或 prompt policy，而是编排三章已经定义好的边界：
+
+1. 工作区事实同时写入 S24 作用域日志和 S12 append-only store，并保留 `source_id`、来源类型和采集时间。
+2. 查询交给 S12 `RecallEngine`，得到带 rank、score、scope、provenance 的 `RecallResult`。
+3. S15 把 hit 投影成 candidate，再按 scope、最低分、authority、top-k 和字符/token 预算选择。
+4. 只有选中的 `<recalled_memory>` 才进入 `PromptAssembler`，并被声明为“数据而非指令”。
+5. 原有 `ToolRegistry → permission → execute_tool` 执行只读 `list_files`，结果与选择证据按顺序追加到 transcript。
+6. 新建 `Memory`、`Transcript`、`RemoteMemoryStore` 重新读盘；全部检查写进 manifest，context artifact 的 SHA-256 同时记录，便于发现陈旧或被替换的演示材料。
 
 ---
 
 ## 运行
 
-先运行不需要 API key 的两轮 tool-loop walkthrough。第一轮故意让 provider stop reason 与 content block 矛盾，用来证明循环由规范化 block 驱动：
+### 三分钟离线 demo
+
+不需要 API key。第一段仍保留两轮 tool-loop walkthrough：第一轮故意让 provider stop reason 与 content block 矛盾，用来证明循环由规范化 block 驱动；随后同一命令完成 RAG-memory 端到端与重启回放。
 
 ```bash
 python3 s24_comprehensive/code.py --walkthrough
 ```
 
-输出应包含 `tool_use → tool_result → final text`。写工具仍然是 `ASK`，walkthrough 不会自动批准写入。
+讲解时沿输出依次指出：
+
+1. `tool_use → tool_result → final text`：content block 才是循环控制事实。
+2. `query → recall → select → context`：检索与 prompt 准入是两个不同的策略边界。
+3. `tool → transcript/memory → restart`：工具仍走原注册表，重启通过 fresh adapter 回读 5 个事件和两类记忆。
+4. `rag memory harness: OK` 与 manifest 路径：成功不是一句打印，而是七项离线检查与可校验 artifact。
+
+写工具仍然是 `ASK`，walkthrough 不会自动批准写入。相关契约测试可单独运行：
+
+```bash
+python3 -m pytest -q tests/test_comprehensive_contracts.py
+```
+
+提交前仍需运行仓库统一校验：
+
+```bash
+python3 -m pytest -q
+python3 scripts/verify.py
+```
+
+在线交互需要 provider 配置：
 
 ```bash
 python s24_comprehensive/code.py

@@ -23,6 +23,8 @@ flowchart LR
         R1["S12 RecallEngine"] --> R2["RecallResult + provenance"]
         R2 --> R3["S15 candidate + policy selection"]
         R3 --> R4["recalled_memory context"]
+        R3 --> R5["S14 capture selected evidence"]
+        R5 --> R6["DurableContextState"]
     end
 
     subgraph H["Harness line · one existing runtime"]
@@ -35,16 +37,18 @@ flowchart LR
     M2 --> R1
     Q --> H1
     R4 --> H1
+    R6 --> H1
     H3 --> M1
     M3 --> H4
 ```
 
-这不是第二个 Agent：S24 只负责把已有运行时接到 S12、S15 的公开契约上。召回算法仍归 S12，候选准入与预算仍归 S15，工具权限、transcript 和工作区作用域仍由 S24 原有 harness 管理。
+这不是第二个 Agent：S24 只负责把已有运行时接到 S12、S14、S15 的公开契约上。召回算法仍归 S12，候选准入与预算仍归 S15，S14 只冻结已选证据并压缩 disposable messages；工具权限、transcript 和工作区作用域仍由 S24 原有 harness 管理。
 
 ## 学习前置知识
 
 - 完整 harness 是多个小机制组合, 不是一个大框架魔法。
 - `RecallResult` 是带分数、作用域和 provenance 的检索证据，不应未经选择直接塞入 prompt。
+- recalled text 可以被压缩或摘要，但 S15 的 winner、来源、分数、排名和 conflict key 必须沿 S14 durable bypass 保留。
 - 重启回归必须用新建的 store、memory 和 transcript adapter 读取磁盘，不能拿旧对象冒充恢复成功。
 - Python 教学实现复刻的是架构机制, 不是 Electron/Node 源码。
 - 最终 demo 应该能展示端到端数据流、安全边界，以及各章契约没有在集成时退化。
@@ -53,6 +57,7 @@ flowchart LR
 
 - 串起 block-driven loop、单一工具注册表、显式权限、作用域记忆、JSONL transcript、SQLite 和审计。
 - 复用 S12 `RecallEngine` 与 S15 `select_memory_context`，把 `query → recall → select → context → tool → transcript/memory → restart` 变成一个可回归契约。
+- 复用 S14 `capture_retrieval_evidence()` 与 `compact_context()`，不在综合章维护第二套压缩语义。
 - 用 clean-room Python 证明 WorkBuddy-style harness 的核心可以从零搭建。
 - 把前 23 章收束成一个可运行 mini WorkBuddy。
 
@@ -61,6 +66,8 @@ flowchart LR
 - 只做聊天界面没有 sidecar/session/memory/audit, 不算 harness。
 - 单章里是 `ASK`，综合章却自动批准，属于集成语义漂移。
 - 把“写入过记忆”当成“重启后可恢复”，却没有通过新对象回读 transcript、workspace memory 与 remote memory。
+- 只把 recalled text 交给摘要模型：摘要可以改写 winner，且压缩后无法解释来源和排名。
+- 在 S24 复制一套简化压缩器：阈值、裁剪层级和 durable bypass 会与 S14 漂移。
 - 公开表达混淆源码提取和教学实现, 会带来信任和合规风险。
 ## 问题
 
@@ -408,7 +415,7 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 11. **User Memory**（s11）— 跨项目偏好和长期约束
 12. **Cloud Memory**（s12）— 远端 profile / recall 抽象
 13. **Output Externalization**（s13）— 大输出写磁盘留指针
-14. **Context Compaction**（s14）— 简化版上下文压缩
+14. **Context Compaction**（s14）— 复用四层压缩与 durable retrieval bypass
 15. **Prompt Assembly**（s15）— 运行时分段组装 system prompt
 16. **Skills**（s16）— 技能目录列表
 17. **MCP Connectors**（s17）— 外部工具协议
@@ -424,14 +431,28 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 
 ### RAG-memory 集成主流程
 
-`run_rag_memory_harness()` 不重新实现 retrieval 或 prompt policy，而是编排三章已经定义好的边界：
+`run_rag_memory_harness()` 不重新实现 retrieval、compaction 或 prompt policy，而是编排四章已经定义好的边界：
 
 1. 工作区事实同时写入 S24 作用域日志和 S12 append-only store，并保留 `source_id`、来源类型和采集时间。
 2. 查询交给 S12 `RecallEngine`，得到带 rank、score、scope、provenance 的 `RecallResult`。
 3. S15 把 hit 投影成 candidate，再按 scope、最低分、authority、top-k 和字符/token 预算选择。
-4. 只有选中的 `<recalled_memory>` 才进入 `PromptAssembler`，并被声明为“数据而非指令”。
-5. 原有 `ToolRegistry → permission → execute_tool` 执行只读 `list_files`，结果与选择证据按顺序追加到 transcript。
-6. 新建 `Memory`、`Transcript`、`RemoteMemoryStore` 重新读盘；全部检查写进 manifest，context artifact 的 SHA-256 同时记录，便于发现陈旧或被替换的演示材料。
+4. S14 只接收 S15 已选 candidate，冻结 source、score、rank 与 conflict winner；rejected candidate 永远不进入 durable state。
+5. S24 调用 S14 公共 `compact_context()`。recalled text 属于可压缩消息，`DurableContextState` 绕过 L1–L4。
+6. recalled text 与 durable proof 分成两个 Prompt 片段：前者提供回答内容，后者只证明选择依据，二者都不能充当指令。
+7. 原有 `ToolRegistry → permission → execute_tool` 执行只读 `list_files`，结果与选择证据按顺序追加到 transcript。
+8. 新建 `Memory`、`Transcript`、`RemoteMemoryStore` 重新读盘；从选择事件重建 evidence，并与同 query 的 `recall_result` 交叉校验。context、durable proof 及其 SHA-256 一并写入 manifest。
+
+### 压缩与重启不变量
+
+`memory_context_selected` 事件保存 `evidence_schema_version`、`query_id`、selected/rejected IDs，以及 selected candidate 的结构化 retrieval evidence。恢复函数不会重新运行召回或选择，也不会信任一段自然语言摘要：
+
+- evidence IDs 必须与 selected IDs 顺序完全一致；
+- rejected ID 不能出现在 durable evidence；
+- source、captured time、score 和 rank 必须与同一 `query_id` 的 `recall_result` 相符；
+- 未包含 evidence schema 的旧事件按“没有持久化 proof”恢复为空状态，不伪造来源；
+- adversarial summary 即使声称应采用 conflict loser，也只能污染 disposable summary，不能改写 `DurableContextState`。
+
+S24 的 `compact_context()` 现在是 S14 的薄 adapter，返回 `CompactionResult`。在线循环和 `/compact` 命令都显式接回 `messages` 与 `durable_state`，并将 applied layers 展示给用户；因此综合章不会再和 S14 各自维护阈值或裁剪策略。
 
 ---
 
@@ -449,14 +470,17 @@ python3 s24_comprehensive/code.py --walkthrough
 
 1. `tool_use → tool_result → final text`：content block 才是循环控制事实。
 2. `query → recall → select → context`：检索与 prompt 准入是两个不同的策略边界。
-3. `tool → transcript/memory → restart`：工具仍走原注册表，重启通过 fresh adapter 回读 5 个事件和两类记忆。
-4. `rag memory harness: OK` 与 manifest 路径：成功不是一句打印，而是七项离线检查与可校验 artifact。
+3. `select → S14 durable proof → compact`：只有 winner 的来源、分数、排名和 conflict key 绕过有损层。
+4. `tool → transcript/memory → restart`：工具仍走原注册表，重启通过 fresh adapter 回读 5 个事件、两类记忆与 retrieval proof。
+5. `rag memory harness: OK` 与 manifest 路径：成功不是一句打印，而是多项离线检查与可校验 artifact。
 
 写工具仍然是 `ASK`，walkthrough 不会自动批准写入。相关契约测试可单独运行：
 
 ```bash
 python3 -m pytest -q tests/test_comprehensive_contracts.py
 ```
+
+契约测试会强制触发 S14 L3/L4，并注入一段要求恢复 conflict loser 的对抗摘要；断言 recalled text 可以消失，但 winner proof 原样保留。测试还会篡改 transcript 中的 selected ID 与 source ID，验证重启恢复失败关闭。
 
 提交前仍需运行仓库统一校验：
 

@@ -392,6 +392,12 @@ selected hits ──capture_retrieval_evidence()──> immutable RetrievalEvide
 
 这些是可验证的设计方向，不代表任何特定闭源产品的内部实现。
 
+### 作为 Harness 公共边界
+
+S24 综合章直接复用本章的 `capture_retrieval_evidence()`、`DurableContextState`、`compact_context()` 和 `render_durable_context()`。因此导入 S14 时不会解析调用方的 CLI provider 参数；只有直接执行 `s14_context_compact/code.py` 才拥有这段命令行配置。综合 Harness 可以离线加载压缩契约，同时继续把真正的 provider client 延迟到生成式摘要路径。
+
+跨章节集成仍遵守所有权边界：S12 负责 recall，S15 负责 winner/loser，S14 只冻结已选证据并携带它穿过有损压缩。S14 不会因为窗口变化重新召回、重新排序或让 conflict loser 回填。
+
 ---
 
 ## 代码 walkthrough

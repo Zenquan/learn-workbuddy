@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -42,6 +43,7 @@ PROGRESSION = {
         "policy-driven memory distillation",
         "keyed memory supersession",
         "human conflict adjudication with append-only audit",
+        "crash-recoverable adjudication transaction journal",
         "atomic curated memory view",
     ],
     "preserves": ["append-only evidence and restart recovery"],
@@ -91,6 +93,7 @@ MEMORY_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 EVENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 CONFLICT_SCHEMA_VERSION = 1
 ADJUDICATION_SCHEMA_VERSION = 1
+RESOLUTION_TRANSACTION_SCHEMA_VERSION = 1
 WORKDIR = Path.cwd()
 _DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 
@@ -111,6 +114,29 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _discard_incomplete_jsonl_tail(path: Path) -> None:
+    """Remove bytes that never formed a newline-terminated durable record.
+
+    Readers deliberately ignore an unterminated final line after a crash.  A
+    later append must first discard that ignored fragment, otherwise the next
+    valid JSON object would be concatenated onto it and corrupt the log.
+    """
+
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("rb+") as handle:
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return
+        handle.seek(0)
+        content = handle.read()
+        last_newline = content.rfind(b"\n")
+        handle.seek(0)
+        handle.truncate(last_newline + 1)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 class MemoryErrorBase(RuntimeError):
@@ -160,6 +186,16 @@ class ConflictStatus(str, Enum):
     OPEN = "open"
     RESOLVED = "resolved"
     SUPERSEDED = "superseded"
+
+
+class ResolutionPhase(str, Enum):
+    """Durable milestones for one multi-file human adjudication."""
+
+    PREPARED = "prepared"
+    CURATED_APPLIED = "curated_applied"
+    CONFLICT_CLOSED = "conflict_closed"
+    AUDIT_APPENDED = "audit_appended"
+    COMMITTED = "committed"
 
 
 @dataclass(frozen=True)
@@ -453,6 +489,72 @@ class ConflictAdjudication:
         return event
 
 
+@dataclass(frozen=True)
+class ConflictResolutionTransaction:
+    """Prepared before any adjudication side effect reaches canonical state.
+
+    Both before and after snapshots are intentional.  Recovery can therefore
+    distinguish "the write did not happen", "the write happened but its phase
+    marker did not", and "some unrelated state replaced the expected data".
+    The last case fails closed instead of overwriting newer or corrupt state.
+    """
+
+    transaction_id: str
+    workspace_id: str
+    conflict_id: str
+    event_id: str
+    prepared_at: str
+    curated_before: tuple[CuratedMemoryEntry, ...]
+    curated_after: tuple[CuratedMemoryEntry, ...]
+    conflicts_before: tuple[MemoryConflictCase, ...]
+    conflicts_after: tuple[MemoryConflictCase, ...]
+    adjudication: ConflictAdjudication
+    schema_version: int = RESOLUTION_TRANSACTION_SCHEMA_VERSION
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, object]
+    ) -> "ConflictResolutionTransaction":
+        try:
+            transaction = cls(
+                transaction_id=_clean_event_id(
+                    payload["transaction_id"], field_name="transaction_id"
+                ),
+                workspace_id=str(payload["workspace_id"]),
+                conflict_id=_clean_event_id(
+                    payload["conflict_id"], field_name="conflict_id"
+                ),
+                event_id=_clean_event_id(payload["event_id"], field_name="event_id"),
+                prepared_at=str(payload["prepared_at"]),
+                curated_before=tuple(
+                    CuratedMemoryEntry.from_dict(item)
+                    for item in payload["curated_before"]
+                ),
+                curated_after=tuple(
+                    CuratedMemoryEntry.from_dict(item)
+                    for item in payload["curated_after"]
+                ),
+                conflicts_before=tuple(
+                    MemoryConflictCase.from_dict(dict(item))
+                    for item in payload["conflicts_before"]
+                ),
+                conflicts_after=tuple(
+                    MemoryConflictCase.from_dict(dict(item))
+                    for item in payload["conflicts_after"]
+                ),
+                adjudication=ConflictAdjudication.from_dict(
+                    dict(payload["adjudication"])
+                ),
+                schema_version=int(payload.get("schema_version", 0)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MemoryCorruptionError(
+                f"invalid conflict resolution transaction: {exc}"
+            ) from exc
+        _validate_resolution_transaction(transaction)
+        return transaction
+
+
 def _as_utc(value: datetime | None) -> datetime:
     current = value or datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -651,6 +753,57 @@ def _validate_adjudication(event: ConflictAdjudication) -> None:
     _parse_timestamp(event.resolved_at)
 
 
+def _resolution_transaction_id(workspace_id: str, event_id: str) -> str:
+    material = f"{workspace_id}\0{event_id}"
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    return f"resolution-{digest}"
+
+
+def _transaction_intent_hash(transaction: ConflictResolutionTransaction) -> str:
+    canonical = json.dumps(
+        asdict(transaction),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_resolution_transaction(
+    transaction: ConflictResolutionTransaction,
+) -> None:
+    if transaction.schema_version != RESOLUTION_TRANSACTION_SCHEMA_VERSION:
+        raise MemoryCorruptionError("unsupported resolution transaction schema")
+    expected_id = _resolution_transaction_id(
+        transaction.workspace_id, transaction.event_id
+    )
+    if transaction.transaction_id != expected_id:
+        raise MemoryCorruptionError(
+            "resolution transaction ID does not match workspace and event"
+        )
+    if transaction.conflict_id != transaction.adjudication.conflict_id:
+        raise MemoryCorruptionError(
+            "resolution transaction and adjudication conflict IDs differ"
+        )
+    if transaction.event_id != transaction.adjudication.event_id:
+        raise MemoryCorruptionError(
+            "resolution transaction and adjudication event IDs differ"
+        )
+    if transaction.workspace_id != transaction.adjudication.workspace_id:
+        raise MemoryScopeError(
+            "resolution transaction and adjudication workspaces differ"
+        )
+    _parse_timestamp(transaction.prepared_at)
+    for case in (*transaction.conflicts_before, *transaction.conflicts_after):
+        if case.workspace_id != transaction.workspace_id:
+            raise MemoryScopeError(
+                f"transaction conflict {case.conflict_id} belongs to another workspace"
+            )
+
+
+_RESOLUTION_PHASE_ORDER = tuple(phase.value for phase in ResolutionPhase)
+
+
 def _conflict_candidate_id(memory_key: str, kind: str, content: str) -> str:
     material = f"{memory_key}\0{kind}\0{_normal_form(content)}"
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
@@ -771,6 +924,7 @@ class WorkspaceMemory:
         ├── curated.json             # canonical compact state
         ├── conflicts.json           # reviewable conflict snapshots
         ├── conflict-adjudications.jsonl  # append-only human decisions
+        ├── conflict-resolution-transactions.jsonl  # crash recovery journal
         └── MEMORY.md                # human/prompt-facing derived view
 
     The teaching namespace deliberately avoids writing into a real product's
@@ -790,7 +944,11 @@ class WorkspaceMemory:
         self.curated_file = self.memory_dir / "curated.json"
         self.conflict_file = self.memory_dir / "conflicts.json"
         self.adjudication_file = self.memory_dir / "conflict-adjudications.jsonl"
+        self.resolution_transaction_file = (
+            self.memory_dir / "conflict-resolution-transactions.jsonl"
+        )
         self.daily_dir.mkdir(parents=True, exist_ok=True)
+        self._recover_resolution_transactions()
 
     def daily_log_path(self, day: date) -> Path:
         """Return the scoped path for one UTC day's append-only fact log."""
@@ -1057,6 +1215,7 @@ class WorkspaceMemory:
         encoded = (
             json.dumps(asdict(event), ensure_ascii=False, sort_keys=True) + "\n"
         ).encode("utf-8")
+        _discard_incomplete_jsonl_tail(self.adjudication_file)
         descriptor = os.open(
             self.adjudication_file,
             os.O_APPEND | os.O_CREAT | os.O_WRONLY,
@@ -1071,6 +1230,274 @@ class WorkspaceMemory:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+    def _resolution_checkpoint(self, _name: str) -> None:
+        """Fault-injection seam used to prove recovery at durable boundaries."""
+
+    @staticmethod
+    def _curated_snapshot(entries: Iterable[CuratedMemoryEntry]) -> str:
+        ordered = sorted(
+            entries,
+            key=lambda item: (
+                item.kind,
+                item.memory_key or "",
+                item.revision,
+                item.key,
+            ),
+        )
+        return json.dumps(
+            [asdict(item) for item in ordered],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _conflict_snapshot(cases: Iterable[MemoryConflictCase]) -> str:
+        ordered = sorted(cases, key=lambda item: (item.memory_key, item.revision))
+        return json.dumps(
+            [asdict(item) for item in ordered],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def _append_resolution_phase(
+        self,
+        transaction: ConflictResolutionTransaction,
+        phase: ResolutionPhase,
+    ) -> None:
+        _validate_resolution_transaction(transaction)
+        if transaction.workspace_id != self.workspace_id:
+            raise MemoryScopeError(
+                "cannot append a resolution transaction for another workspace"
+            )
+        intent_hash = _transaction_intent_hash(transaction)
+        payload: dict[str, object] = {
+            "schema_version": RESOLUTION_TRANSACTION_SCHEMA_VERSION,
+            "workspace_id": self.workspace_id,
+            "transaction_id": transaction.transaction_id,
+            "phase": phase.value,
+            "recorded_at": _iso(),
+            "intent_sha256": intent_hash,
+        }
+        if phase is ResolutionPhase.PREPARED:
+            payload["intent"] = asdict(transaction)
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        _discard_incomplete_jsonl_tail(self.resolution_transaction_file)
+        descriptor = os.open(
+            self.resolution_transaction_file,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            written = os.write(descriptor, encoded)
+            if written != len(encoded):
+                raise OSError(
+                    f"short resolution journal write: {written}/{len(encoded)} bytes"
+                )
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self._resolution_checkpoint(f"after_{phase.value}")
+
+    def _read_resolution_transactions(
+        self,
+    ) -> list[tuple[ConflictResolutionTransaction, tuple[str, ...]]]:
+        if not self.resolution_transaction_file.exists():
+            return []
+        lines = self.resolution_transaction_file.read_text(
+            encoding="utf-8"
+        ).splitlines(keepends=True)
+        states: dict[str, dict[str, object]] = {}
+        for index, line in enumerate(lines, start=1):
+            if not line.endswith("\n") and index == len(lines):
+                break
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise MemoryCorruptionError(
+                    f"invalid resolution journal JSON at line {index}"
+                ) from exc
+            if payload.get("schema_version") != RESOLUTION_TRANSACTION_SCHEMA_VERSION:
+                raise MemoryCorruptionError(
+                    f"unsupported resolution journal schema at line {index}"
+                )
+            if payload.get("workspace_id") != self.workspace_id:
+                raise MemoryScopeError(
+                    f"resolution journal line {index} belongs to another workspace"
+                )
+            if not isinstance(payload.get("transaction_id"), str):
+                raise MemoryCorruptionError(
+                    f"invalid resolution transaction ID at line {index}"
+                )
+            transaction_id = _clean_event_id(
+                payload["transaction_id"], field_name="transaction_id"
+            )
+            try:
+                phase = ResolutionPhase(payload.get("phase"))
+            except (TypeError, ValueError) as exc:
+                raise MemoryCorruptionError(
+                    f"unsupported resolution phase at line {index}"
+                ) from exc
+            try:
+                _parse_timestamp(str(payload["recorded_at"]))
+            except KeyError as exc:
+                raise MemoryCorruptionError(
+                    f"resolution journal line {index} has no timestamp"
+                ) from exc
+            intent_hash = str(payload.get("intent_sha256", ""))
+            if not re.fullmatch(r"[0-9a-f]{64}", intent_hash):
+                raise MemoryCorruptionError(
+                    f"invalid resolution intent hash at line {index}"
+                )
+
+            state = states.get(transaction_id)
+            if phase is ResolutionPhase.PREPARED:
+                if state is not None:
+                    raise MemoryCorruptionError(
+                        f"resolution transaction {transaction_id} was prepared twice"
+                    )
+                intent = payload.get("intent")
+                if not isinstance(intent, dict):
+                    raise MemoryCorruptionError(
+                        f"prepared transaction {transaction_id} has no intent"
+                    )
+                transaction = ConflictResolutionTransaction.from_dict(intent)
+                if transaction.transaction_id != transaction_id:
+                    raise MemoryCorruptionError(
+                        "resolution journal transaction ID differs from its intent"
+                    )
+                if _transaction_intent_hash(transaction) != intent_hash:
+                    raise MemoryCorruptionError(
+                        f"resolution transaction {transaction_id} intent was modified"
+                    )
+                state = {
+                    "transaction": transaction,
+                    "intent_hash": intent_hash,
+                    "phases": [],
+                }
+                states[transaction_id] = state
+            elif state is None:
+                raise MemoryCorruptionError(
+                    f"resolution transaction {transaction_id} has no prepared intent"
+                )
+            elif state["intent_hash"] != intent_hash:
+                raise MemoryCorruptionError(
+                    f"resolution transaction {transaction_id} changed intent"
+                )
+
+            phases = state["phases"]
+            assert isinstance(phases, list)
+            phases.append(phase.value)
+
+        result: list[tuple[ConflictResolutionTransaction, tuple[str, ...]]] = []
+        for transaction_id, state in states.items():
+            phases = tuple(state["phases"])
+            expected = _RESOLUTION_PHASE_ORDER[: len(phases)]
+            if phases != expected:
+                raise MemoryCorruptionError(
+                    f"resolution transaction {transaction_id} has invalid phase order"
+                )
+            transaction = state["transaction"]
+            assert isinstance(transaction, ConflictResolutionTransaction)
+            result.append((transaction, phases))
+        return result
+
+    def _ensure_curated_transaction_state(
+        self, transaction: ConflictResolutionTransaction
+    ) -> None:
+        before = list(transaction.curated_before)
+        target = list(transaction.curated_after)
+        current = self._load_curated()
+        current_snapshot = self._curated_snapshot(current)
+        before_snapshot = self._curated_snapshot(before)
+        target_snapshot = self._curated_snapshot(target)
+        if current_snapshot == target_snapshot:
+            if self.curated_file.exists():
+                rendered = self._render_memory(target)
+                existing = (
+                    self.memory_file.read_text(encoding="utf-8")
+                    if self.memory_file.exists()
+                    else None
+                )
+                if existing != rendered:
+                    self._atomic_write_text(self.memory_file, rendered)
+                    self._resolution_checkpoint("after_memory_projection_write")
+            return
+        if current_snapshot != before_snapshot:
+            raise MemoryCorruptionError(
+                f"resolution transaction {transaction.transaction_id} found "
+                "unexpected curated state"
+            )
+        self._save_curated(target)
+        self._resolution_checkpoint("after_curated_write")
+
+    def _ensure_conflict_transaction_state(
+        self, transaction: ConflictResolutionTransaction
+    ) -> None:
+        before = list(transaction.conflicts_before)
+        target = list(transaction.conflicts_after)
+        current = self._load_conflicts()
+        current_snapshot = self._conflict_snapshot(current)
+        if current_snapshot == self._conflict_snapshot(target):
+            return
+        if current_snapshot != self._conflict_snapshot(before):
+            raise MemoryCorruptionError(
+                f"resolution transaction {transaction.transaction_id} found "
+                "unexpected conflict state"
+            )
+        self._save_conflicts(target)
+        self._resolution_checkpoint("after_conflict_write")
+
+    def _ensure_adjudication_transaction_state(
+        self, transaction: ConflictResolutionTransaction
+    ) -> None:
+        existing = next(
+            (
+                event
+                for event in self._read_adjudications()
+                if event.event_id == transaction.event_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing != transaction.adjudication:
+                raise MemoryCorruptionError(
+                    f"resolution transaction {transaction.transaction_id} found "
+                    "a different adjudication for its event ID"
+                )
+            return
+        self._append_adjudication(transaction.adjudication)
+        self._resolution_checkpoint("after_audit_write")
+
+    def _complete_resolution_transaction(
+        self,
+        transaction: ConflictResolutionTransaction,
+        completed_phases: Iterable[str],
+    ) -> None:
+        completed = set(completed_phases)
+        self._ensure_curated_transaction_state(transaction)
+        if ResolutionPhase.CURATED_APPLIED.value not in completed:
+            self._append_resolution_phase(
+                transaction, ResolutionPhase.CURATED_APPLIED
+            )
+        self._ensure_conflict_transaction_state(transaction)
+        if ResolutionPhase.CONFLICT_CLOSED.value not in completed:
+            self._append_resolution_phase(transaction, ResolutionPhase.CONFLICT_CLOSED)
+        self._ensure_adjudication_transaction_state(transaction)
+        if ResolutionPhase.AUDIT_APPENDED.value not in completed:
+            self._append_resolution_phase(transaction, ResolutionPhase.AUDIT_APPENDED)
+        if ResolutionPhase.COMMITTED.value not in completed:
+            self._append_resolution_phase(transaction, ResolutionPhase.COMMITTED)
+
+    def _recover_resolution_transactions(self) -> None:
+        for transaction, phases in self._read_resolution_transactions():
+            if phases[-1] == ResolutionPhase.COMMITTED.value:
+                continue
+            self._complete_resolution_transaction(transaction, phases)
 
     def _queue_conflict(
         self,
@@ -1184,6 +1611,7 @@ class WorkspaceMemory:
         if expected_revision < 1:
             raise ValueError("expected_revision must be >= 1")
 
+        self._recover_resolution_transactions()
         existing_events = self._read_adjudications()
         duplicate = next(
             (event for event in existing_events if event.event_id == clean_event_id),
@@ -1261,6 +1689,8 @@ class WorkspaceMemory:
                 "workspace evidence changed after this conflict was detected"
             )
 
+        curated_before = tuple(deepcopy(entries))
+        conflicts_before = tuple(deepcopy(cases))
         if selected.incumbent:
             if current is None:
                 raise MemoryCorruptionError("conflict incumbent is no longer active")
@@ -1294,7 +1724,6 @@ class WorkspaceMemory:
                 current.status = CuratedStatus.SUPERSEDED.value
                 current.superseded_by = new_entry.key
             entries.append(new_entry)
-            self._save_curated(entries)
 
         timestamp = _iso(resolved_at)
         case.status = ConflictStatus.RESOLVED.value
@@ -1304,7 +1733,6 @@ class WorkspaceMemory:
         case.resolution_actor = clean_actor
         case.resolution_rationale = clean_rationale
         case.resulting_active_entry_key = resulting_key
-        self._save_conflicts(cases)
 
         event = ConflictAdjudication(
             event_id=clean_event_id,
@@ -1319,7 +1747,25 @@ class WorkspaceMemory:
             resulting_active_entry_key=resulting_key,
             evidence_ids=selected.evidence_ids,
         )
-        self._append_adjudication(event)
+        transaction = ConflictResolutionTransaction(
+            transaction_id=_resolution_transaction_id(
+                self.workspace_id, clean_event_id
+            ),
+            workspace_id=self.workspace_id,
+            conflict_id=case.conflict_id,
+            event_id=clean_event_id,
+            prepared_at=timestamp,
+            curated_before=curated_before,
+            curated_after=tuple(deepcopy(entries)),
+            conflicts_before=conflicts_before,
+            conflicts_after=tuple(deepcopy(cases)),
+            adjudication=event,
+        )
+        _validate_resolution_transaction(transaction)
+        self._append_resolution_phase(transaction, ResolutionPhase.PREPARED)
+        self._complete_resolution_transaction(
+            transaction, (ResolutionPhase.PREPARED.value,)
+        )
         return event
 
     def _load_curated(self) -> list[CuratedMemoryEntry]:

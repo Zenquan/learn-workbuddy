@@ -20,9 +20,10 @@ flowchart LR
     H -->|"stale"| C
     H -->|"tie"| Q["conflicts.json review queue"]
     Q --> R["human resolve_conflict"]
-    R --> K["append-only adjudication audit"]
-    R -->|"challenger"| I
-    R -->|"incumbent"| J
+    R --> T["append-only transaction journal"]
+    T --> K["append-only adjudication audit"]
+    T -->|"challenger"| I
+    T -->|"incumbent"| J
     I --> J["curated.json history"]
     J --> F["active-only MEMORY.md"]
     F --> G["bounded prompt context"]
@@ -40,6 +41,7 @@ s09 的 JSONL transcript 属于某个 session，是完整执行证据；本章�
 - 被替代的修订和原始证据继续保留，prompt 只注入每个冲突域的 active 修订。
 - 同强度冲突会形成持久化 review case；只有显式的人类裁决能选择候选。
 - 裁决绑定 evidence fingerprint、case revision 和 event ID；陈旧页面或重试不会覆盖新证据。
+- 多文件裁决先写 append-only transaction intent；任意写入边界退出后都能在重启时幂等前滚。
 - 策展状态通过原子替换更新，失败时仍保留上一份完整文件。
 - 不依赖 API key 就能验证记忆策略。
 
@@ -57,6 +59,7 @@ project/
         ├── curated.json
         ├── conflicts.json
         ├── conflict-adjudications.jsonl
+        ├── conflict-resolution-transactions.jsonl
         └── MEMORY.md
 ```
 
@@ -66,6 +69,7 @@ project/
 | `curated.json` | 策展状态的机器真相 | 临时文件 + `os.replace` | 可追溯到 evidence id |
 | `conflicts.json` | 待审与历史冲突快照 | 临时文件 + `os.replace` | 是，保存候选、revision 与 fingerprint |
 | `conflict-adjudications.jsonl` | 人工裁决审计流 | `O_APPEND` 单事件追加 | 是，记录 actor、rationale 与选中证据 |
+| `conflict-resolution-transactions.jsonl` | 多文件裁决恢复日志 | `O_APPEND` 阶段事件 | 是，保存 intent hash、前后快照与提交阶段 |
 | `MEMORY.md` | 面向人和 prompt 的派生视图 | 从策展状态原子重建 | 否，随时可重建 |
 
 教学实现使用 `.learn_workbuddy` 命名空间，避免练习代码碰到真实产品状态。`WorkspaceMemory` 会先解析项目绝对路径，再生成 `workspace_id`；日志和策展文件在读取时都校验该 id。
@@ -162,7 +166,7 @@ event = memory.resolve_conflict(
 4. selected candidate 确实属于该 case；
 5. event ID 未被用于另一种裁决。
 
-任何新增证据都会触发 `StaleConflictResolutionError`，要求 reviewer 重新查看候选。选择 challenger 时创建下一版 curated revision；选择 incumbent 时只记录“保持现状”，不会制造虚假修订。成功事件追加到 `conflict-adjudications.jsonl`，包含 actor、rationale、case revision、选中 evidence IDs、原 active key 与结果 active key。
+任何新增证据都会触发 `StaleConflictResolutionError`，要求 reviewer 重新查看候选。选择 challenger 时创建下一版 curated revision；选择 incumbent 时只记录“保持现状”，不会制造虚假修订。通过校验后，Harness 会先把完整裁决 intent 写入 `conflict-resolution-transactions.jsonl`，再更新 canonical state。成功事件追加到 `conflict-adjudications.jsonl`，包含 actor、rationale、case revision、选中 evidence IDs、原 active key 与结果 active key。
 
 同一个 event ID 携带完全相同的参数重试会返回原事件，不会重复写审计或创建修订；复用 event ID 改选另一个候选会显式拒绝。裁决 API 只属于可信 Harness/人工入口，`MemoryAwareAgent` 的模型工具列表不包含它。
 
@@ -178,7 +182,7 @@ daily fact log ──select──> curated.json ──render──> MEMORY.md
 
 删除旧日志会让长期结论失去来源，也让错误蒸馏无法重新计算。真正的存储清理由单独的 retention/backup 策略负责，不和 memory distill 混在一起。
 
-### 6. 原子更新与重启恢复
+### 6. 原子更新、事务日志与重启恢复
 
 直接以 `"w"` 打开 `MEMORY.md`，进程崩溃时可能只剩半个文件。本章采用同目录临时文件：
 
@@ -189,7 +193,21 @@ daily fact log ──select──> curated.json ──render──> MEMORY.md
 
 Windows 的回退仍会在替换前完整写入、刷新并同步临时文件，再执行同目录 `os.replace`，因此不会把半个新文件暴露为 canonical state。POSIX 平台额外同步目录项，以加强断电后的 rename 持久性。
 
-`curated.json` 是 memory canonical state，`conflicts.json` 是 review queue canonical state，`MEMORY.md` 是可重建投影。如果进程在策展状态和投影两次替换之间退出，下一次读取会以 canonical state 修复陈旧投影。新建一个 `WorkspaceMemory(project_dir)` 实例即可从磁盘恢复事实、策展条目、冲突 case、裁决日志和 prompt context；不会反序列化任何进程内对象。
+单个文件的原子替换不能让三个文件共同成为原子事务。一次人工裁决需要更新 `curated.json`、关闭 `conflicts.json` case，并向 `conflict-adjudications.jsonl` 追加审计；只完成其中一部分会让项目记忆与 review/audit 状态互相矛盾。
+
+因此 `resolve_conflict()` 在产生任何业务副作用前，先把带完整 before/after 快照的 intent 追加到 transaction journal。之后依次推进：
+
+```text
+prepared
+  -> curated_applied
+  -> conflict_closed
+  -> audit_appended
+  -> committed
+```
+
+每个阶段先完成目标写入，再追加带相同 `transaction_id` 和 `intent_sha256` 的阶段事件。若进程恰好在目标写入完成、阶段事件尚未追加时退出，新的 `WorkspaceMemory(project_dir)` 会比较磁盘状态：仍等于 before 就重做，已经等于 after 就继续，既不是 before 也不是 after 则按损坏状态 fail closed。审计事件按原 event ID 去重，所以多次恢复不会创建重复修订或审计行。journal intent 被修改、阶段跳跃或 workspace 不匹配同样会显式拒绝。
+
+`curated.json` 是 memory canonical state，`conflicts.json` 是 review queue canonical state，`MEMORY.md` 是可重建投影。如果进程在策展状态和投影两次替换之间退出，恢复事务会以 canonical state 修复陈旧投影，然后继续关闭 case 和追加审计。新建一个 `WorkspaceMemory(project_dir)` 实例即可恢复未完成裁决，再加载事实、策展条目、冲突 case、裁决日志和 prompt context；不会依赖任何旧进程内对象。
 
 当前 schema 为 v2；读取器仍接受 v1 daily fact 和 curated state。旧条目按无 key 的 legacy 语义恢复，在下一次成功蒸馏写入时统一保存为 v2，而不会自动推断冲突域。读取 keyed 状态时还会校验每个域恰好一个 active 修订、修订号连续、前后链接互相匹配；损坏状态会显式报错，不会静默选择一个答案。
 
@@ -225,12 +243,14 @@ human review
   -> list open conflict snapshot
   -> submit expected revision + selected candidate + source event
   -> reject changed evidence or reused event IDs
-  -> keep incumbent or append a linked curated revision
-  -> append ConflictAdjudication JSONL event
+  -> append prepared intent with before/after snapshots
+  -> apply curated state -> close conflict -> append audit
+  -> append committed phase; retry each boundary idempotently
 
 restart
   -> resolve the same project scope
   -> validate workspace_id and schema
+  -> replay every non-committed resolution transaction
   -> reload daily facts + curated state + conflict queue + adjudication audit
   -> rebuild bounded prompt context
 ```
@@ -249,7 +269,7 @@ python3 s10_workspace_memory/code.py --demo
 python3 -m pytest -q tests/test_workspace_memory.py
 ```
 
-测试覆盖：项目隔离、追加顺序、蒸馏门槛、幂等、证据保留、原子替换失败、key 校验、新值确认、冲突 fail closed、案件去重、选择 challenger、保留 incumbent、裁决审计幂等、新证据陈旧保护、案件 revision、跨 workspace 拒绝、修订链校验、v1 迁移和跨实例恢复。
+测试覆盖：项目隔离、追加顺序、蒸馏门槛、幂等、证据保留、原子替换失败、key 校验、新值确认、冲突 fail closed、案件去重、选择 challenger、保留 incumbent、裁决审计幂等、新证据陈旧保护、案件 revision、跨 workspace 拒绝、修订链校验、v1 迁移、五阶段 transaction journal、八个持久化写入边界故障注入、投影中断修复、incumbent 恢复、intent 防篡改和重复恢复。
 
 配置模型后可运行交互路径：
 
@@ -284,11 +304,13 @@ python3 s10_workspace_memory/code.py
 - **裁决时不校验 revision/fingerprint**：旧页面可能覆盖后来到达的新事实。
 - **让模型调用 resolve 工具**：候选内容不能给自己授予裁决权限，人工入口必须位于可信 Harness 边界。
 - **选择 incumbent 也创建新修订**：这会伪造一次事实变化；保持现状只需要审计事件。
+- **把三次原子写当成一个原子事务**：每个文件都完整不代表文件之间一致；必须先持久化可重放 intent。
+- **恢复时无条件覆盖当前文件**：磁盘状态若既不等于 before 也不等于 after，可能已有更新或损坏，应 fail closed 而不是回滚证据。
 
 ## 练习
 
 1. 为 `DistillPolicy` 增加来源置信度，让用户确认的事实比工具推断更容易晋升。
-2. 把多文件裁决流程升级为带 crash recovery 的 transaction journal，验证任意写入点中断后都能安全重放。
+2. 为多进程 reviewer 增加 workspace-scoped lease，证明两个同时 prepare 的裁决不会交错写入同一个冲突域。
 3. 在不加载全部日志的前提下实现按日期倒序读取最近事实。
 
 ## 下一课

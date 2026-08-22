@@ -441,6 +441,7 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 6. recalled text 与 durable proof 分成两个 Prompt 片段：前者提供回答内容，后者只证明选择依据，二者都不能充当指令。
 7. 原有 `ToolRegistry → permission → execute_tool` 执行只读 `list_files`，结果与选择证据按顺序追加到 transcript。
 8. 新建 `Memory`、`Transcript`、`RemoteMemoryStore` 重新读盘；从选择事件重建 evidence，并与同 query 的 `recall_result` 交叉校验。context、durable proof 及其 SHA-256 一并写入 manifest。
+9. 同一工作区重试时，workspace winner 与 user-default conflict loser 都由 scope + fact SHA-256 导出稳定 ID；已有不可变记录通过校验后复用，每次尝试仍保留独立 session、transcript 与 manifest。
 
 ### 压缩与重启不变量
 
@@ -453,6 +454,16 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 - adversarial summary 即使声称应采用 conflict loser，也只能污染 disposable summary，不能改写 `DurableContextState`。
 
 S24 的 `compact_context()` 现在是 S14 的薄 adapter，返回 `CompactionResult`。在线循环和 `/compact` 命令都显式接回 `messages` 与 `durable_state`，并将 applied layers 展示给用户；因此综合章不会再和 S14 各自维护阈值或裁剪策略。
+
+### 为什么重试不应该再写一份记忆
+
+append-only 约束意味着历史记录不能被覆盖，但不意味着同一个逻辑事实可以无限重复追加。S24 把两种语义拆开：
+
+- **语义状态幂等**：workspace winner 与 user-default conflict loser 分别按自身 scope 和精确内容得到稳定 `memory_id`。首次运行追加两条记录，后续运行校验 kind、content、summary 与 provenance 后复用。
+- **尝试证据追加**：每次运行仍创建新的 session，并写入独立的五事件 transcript 和 manifest，保留“这次重试确实发生过”的审计证据。
+- **冲突失败关闭**：如果稳定 ID 已存在但不可变内容不同，harness 报出 idempotency-key collision，而不是静默接受错误记录或执行 upsert。
+
+因此，idempotency 保护的是业务副作用，append-only 保护的是历史证据；两者并不冲突。
 
 ---
 
@@ -472,7 +483,8 @@ python3 s24_comprehensive/code.py --walkthrough
 2. `query → recall → select → context`：检索与 prompt 准入是两个不同的策略边界。
 3. `select → S14 durable proof → compact`：只有 winner 的来源、分数、排名和 conflict key 绕过有损层。
 4. `tool → transcript/memory → restart`：工具仍走原注册表，重启通过 fresh adapter 回读 5 个事件、两类记忆与 retrieval proof。
-5. `rag memory harness: OK` 与 manifest 路径：成功不是一句打印，而是多项离线检查与可校验 artifact。
+5. `retry: OK, memory_records=reused, remote_records=2`：重复执行复用 winner 与 loser，不制造第三条语义记录，但会留下新的尝试证据。
+6. `rag memory harness: OK` 与 manifest 路径：成功不是一句打印，而是多项离线检查与可校验 artifact。
 
 写工具仍然是 `ASK`，walkthrough 不会自动批准写入。相关契约测试可单独运行：
 

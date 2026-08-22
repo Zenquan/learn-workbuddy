@@ -37,7 +37,7 @@ Usage:
 PROGRESSION = {'chapter': 's24_comprehensive',
  'builds_on': ['s23_audit_sandbox'],
  'adds': ['integrated mini harness', 'end-to-end agent pipeline', 'all-layer wiring',
-          'offline RAG-memory restart contract'],
+          'offline RAG-memory restart contract', 'idempotent memory evidence reuse'],
  'preserves': ['all previous chapter mechanisms']}
 
 # Shared learning entrypoints: --demo is offline; --provider deepseek configures real API env.
@@ -581,6 +581,10 @@ RAG_MEMORY_CONFLICT_LOSER = (
 )
 RAG_MEMORY_CONFLICT_KEY = "workflow.precommit-verification"
 RETRIEVAL_EVIDENCE_SCHEMA_VERSION = 1
+RAG_MEMORY_SOURCE_TYPE = "workspace_memory"
+RAG_MEMORY_TITLE = "S24 project verification fact"
+RAG_MEMORY_LOSER_SOURCE_TYPE = "user_default"
+RAG_MEMORY_LOSER_TITLE = "S24 conflicting pre-commit preference"
 
 
 def build_durable_retrieval_state(
@@ -688,6 +692,78 @@ def replay_durable_retrieval_state(events: Sequence[dict]):
     return state
 
 
+def _memory_fact_identity(
+    namespace: str,
+    scope_id: str,
+    content: str,
+) -> tuple[str, str]:
+    """Derive stable evidence IDs without weakening append-only storage.
+
+    Exact content changes intentionally produce a new record. Retrying the same
+    scoped fact produces the same IDs, so the integration layer can reuse an
+    immutable record rather than asking S12 for update/upsert semantics.
+    """
+
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:24]
+    identity = f"s24-{namespace}:{scope_id}:{digest}"
+    return identity, f"{identity}:source"
+
+
+def _ensure_remote_fact(
+    s12,
+    remote_store,
+    *,
+    memory_id: str,
+    source_id: str,
+    content: str,
+    source_type: str,
+    title: str,
+):
+    """Append once, then validate and reuse the immutable S12 record on retry."""
+
+    existing = next(
+        (record for record in remote_store.read_all() if record.memory_id == memory_id),
+        None,
+    )
+    if existing is not None:
+        # A stable ID is an idempotency key, not permission to accept mismatched
+        # payloads. Fail loudly if persisted evidence no longer matches the key.
+        expected = {
+            "kind": s12.MemoryKind.CONVERSATION,
+            "content": content,
+            "summary": content,
+            "source_id": source_id,
+            "source_type": source_type,
+            "title": title,
+        }
+        actual = {
+            "kind": existing.kind,
+            "content": existing.content,
+            "summary": existing.summary,
+            "source_id": existing.source.source_id,
+            "source_type": existing.source.source_type,
+            "title": existing.source.title,
+        }
+        if actual != expected:
+            raise RuntimeError(f"idempotency key collision for memory {memory_id}")
+        return existing, True
+
+    captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    record = remote_store.append(
+        kind=s12.MemoryKind.CONVERSATION,
+        content=content,
+        summary=content,
+        source=s12.MemorySource(
+            source_id=source_id,
+            source_type=source_type,
+            title=title,
+            captured_at=captured_at,
+        ),
+        memory_id=memory_id,
+    )
+    return record, False
+
+
 def run_rag_memory_harness(
     workspace: Path,
     *,
@@ -714,35 +790,31 @@ def run_rag_memory_harness(
     transcript = Transcript(session_id)
     transcript.append({"type": "message", "role": "user", "content": query})
 
-    captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    memory_id = f"s24-workspace:{uuid.uuid4().hex}"
-    loser_memory_id = f"s24-user-default:{uuid.uuid4().hex}"
-    source_id = f"s24-workspace:{memory.workspace_id}:{memory.workspace_log.name}"
+    memory_id, source_id = _memory_fact_identity(
+        "workspace", memory.workspace_id, RAG_MEMORY_FACT
+    )
     remote_path = DB_DIR / "remote-memory" / f"{memory.workspace_id}.jsonl"
     remote_store = s12.RemoteMemoryStore(remote_path, user_id="s24-offline-user")
-    remote_store.append(
-        kind=s12.MemoryKind.CONVERSATION,
-        content=RAG_MEMORY_FACT,
-        summary=RAG_MEMORY_FACT,
-        source=s12.MemorySource(
-            source_id=source_id,
-            source_type="workspace_memory",
-            title="S24 project verification fact",
-            captured_at=captured_at,
-        ),
+    _stored_memory, memory_record_reused = _ensure_remote_fact(
+        s12,
+        remote_store,
         memory_id=memory_id,
+        source_id=source_id,
+        content=RAG_MEMORY_FACT,
+        source_type=RAG_MEMORY_SOURCE_TYPE,
+        title=RAG_MEMORY_TITLE,
     )
-    remote_store.append(
-        kind=s12.MemoryKind.CONVERSATION,
-        content=RAG_MEMORY_CONFLICT_LOSER,
-        summary=RAG_MEMORY_CONFLICT_LOSER,
-        source=s12.MemorySource(
-            source_id=f"s24-user-default:{remote_store.user_scope}",
-            source_type="user_default",
-            title="S24 conflicting pre-commit preference",
-            captured_at=captured_at,
-        ),
+    loser_memory_id, loser_source_id = _memory_fact_identity(
+        "user-default", remote_store.user_scope, RAG_MEMORY_CONFLICT_LOSER
+    )
+    _loser_memory, loser_memory_record_reused = _ensure_remote_fact(
+        s12,
+        remote_store,
         memory_id=loser_memory_id,
+        source_id=loser_source_id,
+        content=RAG_MEMORY_CONFLICT_LOSER,
+        source_type=RAG_MEMORY_LOSER_SOURCE_TYPE,
+        title=RAG_MEMORY_LOSER_TITLE,
     )
 
     recall = s12.RecallEngine(remote_store).recall(
@@ -870,6 +942,8 @@ def run_rag_memory_harness(
         ],
         "workspace_memory_restarted": RAG_MEMORY_FACT in restarted_workspace_memory,
         "remote_memory_restarted": memory_id in restarted_remote_ids,
+        "remote_memory_unique": restarted_remote_ids.count(memory_id) == 1
+        and restarted_remote_ids.count(loser_memory_id) == 1,
     }
 
     manifest_path = artifact_dir / "manifest.json"
@@ -880,6 +954,8 @@ def run_rag_memory_harness(
         "memory_id": memory_id,
         "loser_memory_id": loser_memory_id,
         "source_id": source_id,
+        "memory_record_reused": memory_record_reused,
+        "loser_memory_record_reused": loser_memory_record_reused,
         "recalled_ids": recalled_ids,
         "selected_ids": selected_ids,
         "rejected_ids": rejected_ids,
@@ -908,6 +984,8 @@ def run_rag_memory_harness(
         "memory_id": memory_id,
         "loser_memory_id": loser_memory_id,
         "source_id": source_id,
+        "memory_record_reused": memory_record_reused,
+        "loser_memory_record_reused": loser_memory_record_reused,
         "recalled_ids": recalled_ids,
         "selected_ids": selected_ids,
         "rejected_ids": rejected_ids,
@@ -1194,6 +1272,7 @@ def offline_walkthrough() -> None:
             print(f"tool_result {block.id}: {output.splitlines()[0] if output else '(empty)'}")
 
     result = run_rag_memory_harness(Path.cwd())
+    retry = run_rag_memory_harness(Path.cwd())
     print("query -> recall -> select -> context -> tool -> transcript/memory -> restart")
     print(f"rag memory harness: {'OK' if result['ok'] else 'FAILED'}")
     print(
@@ -1207,6 +1286,12 @@ def offline_walkthrough() -> None:
         "workspace_memory=yes, "
         f"remote_records={len(result['restarted_remote_memory_ids'])}, "
         "retrieval_proof=yes"
+    )
+    print(
+        f"retry: {'OK' if retry['ok'] else 'FAILED'}, "
+        "memory_records="
+        f"{'reused' if retry['memory_record_reused'] and retry['loser_memory_record_reused'] else 'created'}, "
+        f"remote_records={len(retry['restarted_remote_memory_ids'])}"
     )
     print(f"manifest: {result['manifest_path']}")
 

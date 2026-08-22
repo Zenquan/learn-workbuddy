@@ -200,6 +200,51 @@ def test_replayed_retrieval_evidence_fails_closed_on_selection_mismatch(
         s24.replay_durable_retrieval_state(corrupted)
 
 
+def test_rag_memory_harness_reuses_fact_but_keeps_retry_evidence(
+    s24,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "project-note.txt").write_text("retry fixture", encoding="utf-8")
+
+    first = s24.run_rag_memory_harness(tmp_path)
+    second = s24.run_rag_memory_harness(tmp_path)
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert first["memory_id"] == second["memory_id"]
+    assert first["source_id"] == second["source_id"]
+    assert first["memory_record_reused"] is False
+    assert second["memory_record_reused"] is True
+    assert first["loser_memory_record_reused"] is False
+    assert second["loser_memory_record_reused"] is True
+    assert set(second["recalled_ids"]) == {
+        second["memory_id"],
+        second["loser_memory_id"],
+    }
+    assert second["selected_ids"] == [second["memory_id"]]
+    assert second["rejected_ids"] == [second["loser_memory_id"]]
+    assert set(second["restarted_remote_memory_ids"]) == {
+        second["memory_id"],
+        second["loser_memory_id"],
+    }
+    assert len(second["restarted_remote_memory_ids"]) == 2
+    assert [
+        item.memory_id for item in second["restarted_durable_state"].retrieval_evidence
+    ] == [second["memory_id"]]
+
+    # Retry observability remains append-only even though the durable fact is
+    # idempotent: each attempt owns a distinct session and five-event transcript.
+    first_manifest = json.loads(Path(first["manifest_path"]).read_text(encoding="utf-8"))
+    second_manifest = json.loads(Path(second["manifest_path"]).read_text(encoding="utf-8"))
+    assert first_manifest["session_id"] != second_manifest["session_id"]
+    for manifest in (first_manifest, second_manifest):
+        transcript = Path(manifest["artifacts"]["transcript"])
+        events = [json.loads(line) for line in transcript.read_text().splitlines() if line]
+        assert len(events) == 5
+
+
 def test_keyless_multiturn_walkthrough_uses_tool_blocks(root: Path, tmp_path: Path) -> None:
     env = os.environ.copy()
     env.pop("MODEL_ID", None)
@@ -218,3 +263,4 @@ def test_keyless_multiturn_walkthrough_uses_tool_blocks(root: Path, tmp_path: Pa
     assert "selected: 1, rejected: 1, proof: 1" in result.stdout
     assert "restart: transcript=5 events" in result.stdout
     assert "retrieval_proof=yes" in result.stdout
+    assert "retry: OK, memory_records=reused, remote_records=2" in result.stdout

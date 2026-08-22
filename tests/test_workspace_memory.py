@@ -453,6 +453,284 @@ def test_human_resolution_creates_revision_and_append_only_audit(
     assert recovered.list_adjudications() == [event]
 
 
+@pytest.mark.parametrize(
+    "fault_point",
+    [
+        "after_prepared",
+        "after_curated_write",
+        "after_curated_applied",
+        "after_conflict_write",
+        "after_conflict_closed",
+        "after_audit_write",
+        "after_audit_appended",
+        "after_committed",
+    ],
+)
+def test_resolution_transaction_recovers_every_durable_write_boundary(
+    s10,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_point: str,
+) -> None:
+    root = tmp_path / fault_point
+    memory, as_of, _, case = _database_conflict(s10, root)
+    selected = next(
+        candidate for candidate in case.candidates if candidate.content == "Use Postgres."
+    )
+
+    def crash_at(name: str) -> None:
+        if name == fault_point:
+            raise OSError(f"simulated process exit at {name}")
+
+    monkeypatch.setattr(memory, "_resolution_checkpoint", crash_at)
+    with pytest.raises(OSError, match=fault_point):
+        memory.resolve_conflict(
+            case.conflict_id,
+            selected.candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="PostgreSQL is required by the reviewed deployment target.",
+            event_id=f"recovery-{fault_point}",
+            resolved_at=as_of,
+        )
+
+    recovered = s10.WorkspaceMemory(root)
+    events = recovered.list_adjudications()
+    assert len(events) == 1
+    assert events[0].event_id == f"recovery-{fault_point}"
+    assert events[0].actor == "KEDADA"
+    assert recovered.list_conflicts() == []
+    assert recovered.list_conflicts(status=None)[0].status == "resolved"
+    entries = sorted(recovered._load_curated(), key=lambda item: item.revision)
+    assert [entry.status for entry in entries] == ["superseded", "active"]
+    assert entries[-1].content == "Use Postgres."
+    assert "Use Postgres." in recovered.read_memory_md()
+
+    journal_before = recovered.resolution_transaction_file.read_text(
+        encoding="utf-8"
+    )
+    records = [json.loads(line) for line in journal_before.splitlines()]
+    assert [record["phase"] for record in records] == [
+        "prepared",
+        "curated_applied",
+        "conflict_closed",
+        "audit_appended",
+        "committed",
+    ]
+    assert len({record["transaction_id"] for record in records}) == 1
+    assert len({record["intent_sha256"] for record in records}) == 1
+
+    restarted_again = s10.WorkspaceMemory(root)
+    assert restarted_again.list_adjudications() == events
+    assert (
+        restarted_again.resolution_transaction_file.read_text(encoding="utf-8")
+        == journal_before
+    )
+
+
+def test_resolution_recovery_repairs_projection_after_curated_replace(
+    s10, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    memory, as_of, _, case = _database_conflict(s10, root)
+    selected = next(
+        candidate for candidate in case.candidates if candidate.content == "Use Postgres."
+    )
+    old_projection = memory.memory_file.read_text(encoding="utf-8")
+    real_atomic_write = memory._atomic_write_text
+
+    def crash_after_curated_replace(path: Path, content: str) -> None:
+        real_atomic_write(path, content)
+        if path == memory.curated_file:
+            raise OSError("simulated exit after curated replace")
+
+    monkeypatch.setattr(memory, "_atomic_write_text", crash_after_curated_replace)
+    with pytest.raises(OSError, match="after curated replace"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            selected.candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="Recover the human-facing projection from canonical state.",
+            event_id="recovery-projection-1",
+            resolved_at=as_of,
+        )
+
+    assert memory.memory_file.read_text(encoding="utf-8") == old_projection
+    recovered = s10.WorkspaceMemory(root)
+    assert "Use Postgres." in recovered.memory_file.read_text(encoding="utf-8")
+    assert len(recovered.list_adjudications()) == 1
+    assert recovered.list_conflicts(status=None)[0].status == "resolved"
+
+
+def test_resolution_recovery_keeps_incumbent_without_duplicate_revision(
+    s10, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    memory, as_of, _, case = _database_conflict(s10, root)
+    incumbent = next(candidate for candidate in case.candidates if candidate.incumbent)
+
+    def crash_after_conflict_write(name: str) -> None:
+        if name == "after_conflict_write":
+            raise OSError("simulated incumbent resolution exit")
+
+    monkeypatch.setattr(memory, "_resolution_checkpoint", crash_after_conflict_write)
+    with pytest.raises(OSError, match="incumbent resolution exit"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            incumbent.candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="Keep the reviewed incumbent.",
+            event_id="recovery-incumbent-1",
+            resolved_at=as_of,
+        )
+
+    recovered = s10.WorkspaceMemory(root)
+    entries = recovered._load_curated()
+    assert len(entries) == 1
+    assert entries[0].content == "Use SQLite."
+    assert entries[0].revision == 1
+    assert len(recovered.list_adjudications()) == 1
+
+
+def test_resolution_recovery_discards_partial_journal_and_audit_tails(
+    s10, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    memory, as_of, _, case = _database_conflict(s10, root)
+    selected = next(candidate for candidate in case.candidates if not candidate.incumbent)
+
+    def crash_after_conflict_phase(name: str) -> None:
+        if name == "after_conflict_closed":
+            raise OSError("simulated exit before audit")
+
+    monkeypatch.setattr(memory, "_resolution_checkpoint", crash_after_conflict_phase)
+    with pytest.raises(OSError, match="before audit"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            selected.candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="Recover after partial append-only records.",
+            event_id="recovery-partial-tail-1",
+            resolved_at=as_of,
+        )
+
+    with memory.resolution_transaction_file.open("ab") as handle:
+        handle.write(b'{"phase":')
+    with memory.adjudication_file.open("ab") as handle:
+        handle.write(b'{"event_id":')
+
+    recovered = s10.WorkspaceMemory(root)
+    transaction_records = [
+        json.loads(line)
+        for line in recovered.resolution_transaction_file.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert [record["phase"] for record in transaction_records] == [
+        "prepared",
+        "curated_applied",
+        "conflict_closed",
+        "audit_appended",
+        "committed",
+    ]
+    assert [event.event_id for event in recovered.list_adjudications()] == [
+        "recovery-partial-tail-1"
+    ]
+
+
+def test_modified_resolution_intent_fails_closed_before_recovery(
+    s10, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    memory, as_of, _, case = _database_conflict(s10, root)
+    selected = next(candidate for candidate in case.candidates if not candidate.incumbent)
+
+    def crash_after_prepare(name: str) -> None:
+        if name == "after_prepared":
+            raise OSError("simulated exit after prepare")
+
+    monkeypatch.setattr(memory, "_resolution_checkpoint", crash_after_prepare)
+    with pytest.raises(OSError, match="after prepare"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            selected.candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="Original reviewed intent.",
+            event_id="recovery-tamper-1",
+            resolved_at=as_of,
+        )
+
+    record = json.loads(
+        memory.resolution_transaction_file.read_text(encoding="utf-8")
+    )
+    record["intent"]["adjudication"]["rationale"] = "Tampered intent."
+    memory.resolution_transaction_file.write_text(
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(s10.MemoryCorruptionError, match="intent was modified"):
+        s10.WorkspaceMemory(root)
+    assert memory._load_conflicts()[0].status == "open"
+    assert memory._load_curated()[0].content == "Use SQLite."
+    assert memory._read_adjudications() == []
+
+
+def test_resolution_recovery_refuses_unexpected_third_state(
+    s10, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    memory, as_of, _, case = _database_conflict(s10, root)
+    selected = next(candidate for candidate in case.candidates if not candidate.incumbent)
+
+    def crash_after_prepare(name: str) -> None:
+        if name == "after_prepared":
+            raise OSError("simulated exit before canonical writes")
+
+    monkeypatch.setattr(memory, "_resolution_checkpoint", crash_after_prepare)
+    with pytest.raises(OSError, match="before canonical writes"):
+        memory.resolve_conflict(
+            case.conflict_id,
+            selected.candidate_id,
+            expected_revision=case.revision,
+            actor="KEDADA",
+            rationale="Do not overwrite unrelated post-prepare state.",
+            event_id="recovery-third-state-1",
+            resolved_at=as_of,
+        )
+
+    payload = json.loads(memory.curated_file.read_text(encoding="utf-8"))
+    payload["entries"].append(
+        {
+            "key": "unrelated-valid-entry",
+            "kind": "convention",
+            "content": "An unrelated writer changed curated state.",
+            "first_seen": "2026-01-01T12:00:00Z",
+            "last_seen": "2026-01-01T12:00:00Z",
+            "evidence_ids": ["unrelated-fact"],
+            "occurrences": 1,
+            "memory_key": None,
+            "revision": 1,
+            "status": "active",
+            "supersedes": None,
+            "superseded_by": None,
+        }
+    )
+    memory.curated_file.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(s10.MemoryCorruptionError, match="unexpected curated state"):
+        s10.WorkspaceMemory(root)
+    assert memory._load_conflicts()[0].status == "open"
+    assert memory._read_adjudications() == []
+
+
 def test_resolution_retry_is_idempotent_and_event_reuse_is_rejected(
     s10, tmp_path: Path
 ) -> None:

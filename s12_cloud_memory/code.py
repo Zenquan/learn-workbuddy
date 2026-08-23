@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import html
 import json
@@ -34,11 +35,12 @@ import subprocess
 import sys
 import unicodedata
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 
 # Machine-readable learning path metadata.  The chapter preserves s11's user
@@ -132,6 +134,10 @@ class RemoteMemoryError(RuntimeError):
 
 class RemoteMemoryValidationError(RemoteMemoryError):
     """Raised before malformed memory or query data crosses the boundary."""
+
+
+class RemoteMemoryDuplicateError(RemoteMemoryValidationError):
+    """Raised when an atomic append observes an existing memory identifier."""
 
 
 class RemoteMemoryScopeError(RemoteMemoryError):
@@ -593,6 +599,31 @@ def stable_rank_recall_candidates(
     )
 
 
+@contextmanager
+def _exclusive_store_lock(path: Path) -> Iterator[None]:
+    """Serialize cooperating writers across threads and local processes.
+
+    The lock lives beside the JSONL file and deliberately survives process
+    exit. ``flock`` ownership belongs to the open descriptor, so a crash
+    releases the lock without relying on stale-lock cleanup. A production
+    remote service would provide the same compare-and-insert boundary with a
+    unique index or conditional write rather than a local advisory lock.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    locked = False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 class RemoteMemoryStore:
     """Append-only local simulation of a user-scoped remote memory service.
 
@@ -617,7 +648,12 @@ class RemoteMemoryStore:
         memory_id: str | None = None,
         stored_at: datetime | None = None,
     ) -> StoredMemory:
-        """Persist one immutable record and reject duplicate identifiers."""
+        """Persist one immutable record and atomically reject duplicate IDs.
+
+        Validation happens before taking the lock. The duplicate check and
+        append stay inside one exclusive critical section, closing the classic
+        check-then-act race between concurrent harness retries.
+        """
 
         record = StoredMemory(
             memory_id=memory_id or uuid.uuid4().hex,
@@ -630,18 +666,32 @@ class RemoteMemoryStore:
             source=_validate_source(source),
             stored_at=_iso(stored_at),
         )
-        existing_ids = {item.memory_id for item in self.read_all()}
-        if record.memory_id in existing_ids:
-            raise RemoteMemoryValidationError(
-                f"duplicate memory_id: {record.memory_id}"
-            )
-
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":"))
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        encoded = (
+            json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        with _exclusive_store_lock(self.path):
+            existing_ids = {item.memory_id for item in self.read_all()}
+            if record.memory_id in existing_ids:
+                raise RemoteMemoryDuplicateError(
+                    f"duplicate memory_id: {record.memory_id}"
+                )
+
+            descriptor = os.open(
+                self.path,
+                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                written = os.write(descriptor, encoded)
+                if written != len(encoded):
+                    raise OSError(
+                        f"short remote-memory write: {written}/{len(encoded)} bytes"
+                    )
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         return record
 
     def read_all(self) -> list[StoredMemory]:

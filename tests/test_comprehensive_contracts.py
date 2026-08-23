@@ -245,6 +245,67 @@ def test_rag_memory_harness_reuses_fact_but_keeps_retry_evidence(
         assert len(events) == 5
 
 
+def test_remote_fact_recovers_only_a_matching_concurrent_winner(s24) -> None:
+    """A lost append race is reusable only when immutable evidence matches."""
+
+    s12 = s24._load_chapter_module("_s24_s12_cloud_memory")
+    memory_id = "stable-memory"
+    source_id = "stable-source"
+
+    def stored(content: str):
+        return s12.StoredMemory(
+            memory_id=memory_id,
+            user_scope="scope-alice",
+            kind=s12.MemoryKind.CONVERSATION,
+            content=content,
+            summary="Expected fact.",
+            source=s12.MemorySource(
+                source_id=source_id,
+                source_type="workspace_memory",
+                title="Expected source",
+                captured_at="2026-08-23T00:00:00Z",
+            ),
+            stored_at="2026-08-23T00:00:01Z",
+        )
+
+    class LosingRaceStore:
+        def __init__(self, winner):
+            self.winner = winner
+            self.read_count = 0
+
+        def read_all(self):
+            self.read_count += 1
+            return [] if self.read_count == 1 else [self.winner]
+
+        def append(self, **_kwargs):
+            raise s12.RemoteMemoryDuplicateError(f"duplicate memory_id: {memory_id}")
+
+    matching = LosingRaceStore(stored("Expected fact."))
+    winner, reused = s24._ensure_remote_fact(
+        s12,
+        matching,
+        memory_id=memory_id,
+        source_id=source_id,
+        content="Expected fact.",
+        source_type="workspace_memory",
+        title="Expected source",
+    )
+    assert winner is matching.winner
+    assert reused is True
+
+    conflicting = LosingRaceStore(stored("Conflicting fact."))
+    with pytest.raises(RuntimeError, match="idempotency key collision"):
+        s24._ensure_remote_fact(
+            s12,
+            conflicting,
+            memory_id=memory_id,
+            source_id=source_id,
+            content="Expected fact.",
+            source_type="workspace_memory",
+            title="Expected source",
+        )
+
+
 def test_keyless_multiturn_walkthrough_uses_tool_blocks(root: Path, tmp_path: Path) -> None:
     env = os.environ.copy()
     env.pop("MODEL_ID", None)

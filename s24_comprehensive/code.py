@@ -719,13 +719,19 @@ def _ensure_remote_fact(
     source_type: str,
     title: str,
 ):
-    """Append once, then validate and reuse the immutable S12 record on retry."""
+    """Append once and recover the winning immutable record after a race."""
 
-    existing = next(
-        (record for record in remote_store.read_all() if record.memory_id == memory_id),
-        None,
-    )
-    if existing is not None:
+    def existing_record():
+        return next(
+            (
+                record
+                for record in remote_store.read_all()
+                if record.memory_id == memory_id
+            ),
+            None,
+        )
+
+    def validate(record):
         # A stable ID is an idempotency key, not permission to accept mismatched
         # payloads. Fail loudly if persisted evidence no longer matches the key.
         expected = {
@@ -737,30 +743,44 @@ def _ensure_remote_fact(
             "title": title,
         }
         actual = {
-            "kind": existing.kind,
-            "content": existing.content,
-            "summary": existing.summary,
-            "source_id": existing.source.source_id,
-            "source_type": existing.source.source_type,
-            "title": existing.source.title,
+            "kind": record.kind,
+            "content": record.content,
+            "summary": record.summary,
+            "source_id": record.source.source_id,
+            "source_type": record.source.source_type,
+            "title": record.source.title,
         }
         if actual != expected:
             raise RuntimeError(f"idempotency key collision for memory {memory_id}")
-        return existing, True
+        return record
+
+    existing = existing_record()
+    if existing is not None:
+        return validate(existing), True
 
     captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    record = remote_store.append(
-        kind=s12.MemoryKind.CONVERSATION,
-        content=content,
-        summary=content,
-        source=s12.MemorySource(
-            source_id=source_id,
-            source_type=source_type,
-            title=title,
-            captured_at=captured_at,
-        ),
-        memory_id=memory_id,
-    )
+    try:
+        record = remote_store.append(
+            kind=s12.MemoryKind.CONVERSATION,
+            content=content,
+            summary=content,
+            source=s12.MemorySource(
+                source_id=source_id,
+                source_type=source_type,
+                title=title,
+                captured_at=captured_at,
+            ),
+            memory_id=memory_id,
+        )
+    except s12.RemoteMemoryDuplicateError as exc:
+        # Another retry won between our optimistic read and atomic append. Only
+        # treat that as success after reading and validating the winning record.
+        winner = existing_record()
+        if winner is None:
+            raise RuntimeError(
+                f"duplicate memory {memory_id} disappeared after append rejection"
+            ) from exc
+        return validate(winner), True
     return record, False
 
 

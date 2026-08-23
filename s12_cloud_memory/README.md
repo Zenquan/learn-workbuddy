@@ -180,7 +180,9 @@ store.append(
 )
 ```
 
-写入前会验证内容和重复 `memory_id`，并把 `user_scope` 写进每条 JSONL 记录。读取时 scope 不一致会失败，避免远端历史跨用户泄漏。
+写入前会验证内容，并把 `user_scope` 写进每条 JSONL 记录。`RemoteMemoryStore.append()` 使用与 JSONL 同目录的 advisory lock，把“读取现有 ID、拒绝重复 ID、一次 `O_APPEND` 写入、`fsync`”放进同一个独占临界区。两个协作进程即使同时提交相同 `memory_id`，也只能有一个成功，另一个得到明确的 `RemoteMemoryDuplicateError`；读取时 scope 不一致仍会失败，避免远端历史跨用户泄漏。
+
+这里的文件锁是本地教学实现对服务端原子 compare-and-insert 的模拟。它解决同一存储路径上协作 writer 的 check-then-act 竞态；真实远端 Memory 服务应使用数据库唯一索引、条件写或事务，而不是依赖客户端文件锁。
 
 ### 2. Normalize：构造唯一的规范化 Query
 
@@ -384,6 +386,7 @@ s09 transcript 可以成为 s12 StoredMemory 的 source，但“有 transcript�
 - 只有标点、没有 searchable term：明确拒绝，而不是退化成全量召回；
 - `limit` 不在 1 到 10：拒绝调用；
 - 重复 `memory_id`：拒绝写入；
+- 并发提交相同 `memory_id`：查重与追加在同一临界区内完成，只保留一条可重启读取的记录；
 - JSONL 中的 `user_scope` 不匹配：拒绝读取；
 - 没有匹配：返回带 query、searched/candidate count 和
   `empty_reason="no_matching_terms"` 的空 `hits`，renderer 不注入空上下文；

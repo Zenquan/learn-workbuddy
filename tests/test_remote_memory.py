@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -100,6 +101,84 @@ def test_stored_memory_keeps_source_and_survives_restart(s12, tmp_path: Path) ->
     assert recovered == created
     assert recovered.source.source_id == "transcript-42"
     assert recovered.source.captured_at == "2026-08-01T12:00:00Z"
+
+
+def test_duplicate_check_and_append_are_atomic_for_concurrent_writers(
+    s12,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second writer must not pass a stale duplicate check."""
+
+    path = tmp_path / "concurrent-records.jsonl"
+    first = s12.RemoteMemoryStore(path, user_id="alice")
+    second = s12.RemoteMemoryStore(path, user_id="alice")
+    source = _source(s12, "stable-source", 1)
+
+    real_write = s12.os.write
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    second_started = threading.Event()
+    second_finished = threading.Event()
+    write_gate = threading.Lock()
+    should_block_first_write = True
+
+    def controlled_write(descriptor: int, payload: bytes) -> int:
+        nonlocal should_block_first_write
+        with write_gate:
+            block_this_write = should_block_first_write
+            should_block_first_write = False
+        if block_this_write:
+            first_write_started.set()
+            if not release_first_write.wait(timeout=2):
+                raise TimeoutError("test did not release the first memory writer")
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(s12.os, "write", controlled_write)
+    outcomes: dict[str, str] = {}
+
+    def append(store, label: str) -> None:
+        if label == "second":
+            second_started.set()
+        try:
+            store.append(
+                kind=s12.MemoryKind.CONVERSATION,
+                memory_id="stable-id",
+                content="One immutable concurrent fact.",
+                summary="One immutable concurrent fact.",
+                source=source,
+                stored_at=_time(2),
+            )
+            outcomes[label] = "created"
+        except Exception as exc:  # captured so thread failures stay assertable
+            outcomes[label] = type(exc).__name__
+        finally:
+            if label == "second":
+                second_finished.set()
+
+    first_thread = threading.Thread(target=append, args=(first, "first"))
+    second_thread = threading.Thread(target=append, args=(second, "second"))
+    first_thread.start()
+    assert first_write_started.wait(timeout=1)
+    second_thread.start()
+    assert second_started.wait(timeout=1)
+    try:
+        # The first writer is paused after acquiring the file lock. The second
+        # writer must still be waiting, not reading an empty store and appending.
+        assert not second_finished.wait(timeout=0.05)
+    finally:
+        release_first_write.set()
+        first_thread.join(timeout=2)
+        second_thread.join(timeout=2)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert outcomes == {
+        "first": "created",
+        "second": "RemoteMemoryDuplicateError",
+    }
+    assert [record.memory_id for record in first.read_all()] == ["stable-id"]
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_store_rejects_anonymous_or_invalid_source(s12, tmp_path: Path) -> None:

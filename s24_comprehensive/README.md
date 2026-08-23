@@ -460,10 +460,13 @@ S24 的 `compact_context()` 现在是 S14 的薄 adapter，返回 `CompactionRes
 append-only 约束意味着历史记录不能被覆盖，但不意味着同一个逻辑事实可以无限重复追加。S24 把两种语义拆开：
 
 - **语义状态幂等**：workspace winner 与 user-default conflict loser 分别按自身 scope 和精确内容得到稳定 `memory_id`。首次运行追加两条记录，后续运行校验 kind、content、summary 与 provenance 后复用。
+- **并发重试收敛**：S12 在 advisory lock 内原子执行查重与追加。两个 Harness 同时越过乐观读取时，胜方写入，败方收到明确的 duplicate 异常；S24 重新读取并严格校验胜方的不可变字段，一致才按复用成功处理。
 - **尝试证据追加**：每次运行仍创建新的 session，并写入独立的五事件 transcript 和 manifest，保留“这次重试确实发生过”的审计证据。
 - **冲突失败关闭**：如果稳定 ID 已存在但不可变内容不同，harness 报出 idempotency-key collision，而不是静默接受错误记录或执行 upsert。
 
 因此，idempotency 保护的是业务副作用，append-only 保护的是历史证据；两者并不冲突。
+
+这个锁只模拟单机 JSONL 服务边界，不把本地文件锁包装成分布式一致性方案。生产远端存储需要由服务端唯一约束或事务提供相同的线性化点。
 
 ---
 

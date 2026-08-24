@@ -238,6 +238,15 @@ def run_offline_demos() -> None:
             ],
             timeout=30,
         )
+        run(
+            [
+                sys.executable,
+                "examples/memory_resilience_eval/code.py",
+                "--output-dir",
+                str(Path(tmp) / "memory-resilience-eval"),
+            ],
+            timeout=30,
+        )
         layered_output = run_capture(
             [
                 sys.executable,

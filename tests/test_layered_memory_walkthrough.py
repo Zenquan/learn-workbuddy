@@ -47,6 +47,7 @@ def test_layered_memory_walkthrough_is_keyless_and_restart_safe(
     assert "RESULT: OK" in result.stdout
     assert "created -> unchanged; bob empty=True" in result.stdout
     assert "durable preserved=True" in result.stdout
+    assert "sources verified=2" in result.stdout
 
     manifest_path = home / "layered_memory_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -81,7 +82,20 @@ def test_layered_memory_walkthrough_is_keyless_and_restart_safe(
     ]
     assert "workspace-decision-1" in compaction["durable_context"]
     assert "artifact:artifact-session:" in compaction["durable_context"]
+    assert compaction["durable_context"].count("source_status=available") == 2
+    assert "evidence_unavailable" not in compaction["durable_context"]
     assert "migration is complete" not in compaction["durable_context"].lower()
+    source_resolutions = compaction["source_resolutions"]
+    assert [item["status"] for item in source_resolutions] == [
+        "available",
+        "available",
+    ]
+    assert {item["source_type"] for item in source_resolutions} == {
+        "transcript",
+        "artifact",
+    }
+    assert all(len(item["evidence_sha256"]) == 64 for item in source_resolutions)
+    assert all("excerpt" not in item for item in source_resolutions)
 
     # Every advertised durable owner must remain inspectable after the fresh
     # instances used by the walkthrough have reconstructed their views.

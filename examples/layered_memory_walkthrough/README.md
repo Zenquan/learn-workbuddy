@@ -20,8 +20,13 @@ flowchart LR
   I --> F
   P --> F
   F --> DS["S14 DurableContextState"]
+  T --> V["S14 trusted source resolver"]
+  A --> V
+  DS --> V
+  V --> X["five-state source resolutions"]
   M["Transcript-derived messages"] --> C["lossy compaction"]
   DS --> Q["next Prompt"]
+  X --> Q
   C --> Q
 ```
 
@@ -35,6 +40,7 @@ flowchart LR
 | Recall hit | S12 查询结果 | 单 query | 是；它只是带 source 和 score 的候选视图 |
 | Artifact | S13 大结果证据 | session artifact | 原文件不允许；Prompt 只留摘要和指针 |
 | Compacted messages | S14 Prompt 视图 | 单次或少数几次模型调用 | 允许；durable state 必须走无损旁路 |
+| Source resolution | S14 本轮核验视图 | 单次 Prompt 组装 | 不复用旧状态；每轮从 owner 重新核验 |
 
 这种拆分的价值不在于目录更多，而在于每层都有明确的写入者、恢复方式和失败边界。一个召回结果不能因为“被模型看见了”就自动写回长期 Memory；一个 conversation summary 也不能因为“读起来合理”就关闭 pending task。
 
@@ -58,7 +64,7 @@ python3 examples/layered_memory_walkthrough/code.py --home /tmp/layered-memory
 [3] Workspace log and distill
 [4] User preference dedup and isolation
 [5] Query-scoped recall
-[6] Compaction boundary
+[6] Compaction boundary — sources verified=2
 RESULT: OK — layered memory boundaries survived compaction and restart.
 ```
 
@@ -71,6 +77,7 @@ RESULT: OK — layered memory boundaries survived compaction and restart.
 5. S12 把 S09 candidate 写成 source-bearing conversation record，再为一个自包含 query 生成带 rank、score 和 provenance 的 RecallHit。Recall 不修改 Workspace 或 User Memory。
 6. walkthrough 丢弃所有对象并用相同路径创建新实例，分别恢复 Transcript、Workspace、User、Remote Store 和 Artifact。随后根据恢复结果重建 S14 `DurableContextState`。
 7. 为了在小 fixture 中确定性触发 S14，代码临时降低当前模块实例的压缩阈值，并在 `finally` 中恢复。对抗性 summarizer 会谎称“任务已完成”，测试要求错误只能进入 conversation summary，不能进入 durable context。
+8. 压缩完成后创建新的 `SourcePointerResolver`，从可信 Transcript / Artifact 根重新核验两个 pointer。只有结构、owner 和 SHA-256 全部通过才得到 `available`；Prompt 只接收 status 与 evidence hash，bounded excerpt 不进入 durable context，manifest 也不复制正文。
 
 ## 为什么 S12 改成延迟初始化
 
@@ -95,8 +102,8 @@ online agent_loop 真正调用模型
 
 运行目录里的 `layered_memory_manifest.json` 分三部分：
 
-- `checks`：九个布尔不变量，包括去重、隔离、来源恢复、Artifact digest 和 compaction 边界。
-- `layers`：每一层的可观察结果，例如 distill report、RecallHit、ArtifactMemoryReference、压缩前后 token 和触发层。
+- `checks`：十个布尔不变量，包括去重、隔离、来源恢复、Artifact digest、source pointer 核验和 compaction 边界。
+- `layers`：每一层的可观察结果，例如 distill report、RecallHit、ArtifactMemoryReference、压缩前后 token、触发层和不含 excerpt 的 source resolutions。
 - `artifacts`：Transcript JSONL、Workspace log/curated view、User preferences、Remote store 和 tool result 的真实路径。
 
 Manifest 只是一份验收报告，不是新的 Memory 真源。需要核验时仍应打开对应 owner 的文件。
@@ -109,6 +116,7 @@ Manifest 只是一份验收报告，不是新的 Memory 真源。需要核验时
 - **引用不等于复制。** Memory-facing Artifact reference 没有 `content` 字段，大结果仍归 Artifact 文件所有。
 - **恢复不等于复用旧对象。** walkthrough 明确创建 fresh store instances，再从磁盘重建视图。
 - **摘要不拥有事实。** S14 只压缩 messages 副本，source-bearing facts 和 pending items 单独渲染。
+- **Pointer 不等于已验证证据。** fresh resolver 必须从 owner 重新得到 `available`；清理、拒绝、损坏或未知 scheme 都会显式渲染 `evidence_unavailable=true`，不能由摘要补齐。
 
 ## 测试入口
 

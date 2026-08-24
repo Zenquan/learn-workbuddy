@@ -17,7 +17,11 @@ flowchart LR
     C --> D["Compacted messages"]
     H["Selected MemoryHit"] --> P["capture source / score / rank / conflict"]
     P --> S["DurableContextState"]
-    S --> R["Lossless renderer"]
+    T["Trusted Transcript / Artifact roots"] --> V["SourcePointerResolver"]
+    S --> V
+    V --> X["available / missing / denied / corrupt / unsupported"]
+    X --> R["Lossless renderer"]
+    S --> R
     R --> E["Next API call"]
     D --> E
     S -. "bypasses lossy layers" .-> C
@@ -36,6 +40,8 @@ flowchart LR
 - 四层策略只处理可丢弃、可重建的 messages 副本，不修改 Transcript 派生输入。
 - 用不可变 `DurableContextState` 单独携带已确认事实、未决事项和已选检索证据。
 - 每条 durable item 强制保留 source pointer 与 `last_confirmed_at`，并在下一轮 system context 中结构化渲染。
+- 用 `SourcePointerResolver` 在可信根目录和授权策略内重新核验 Transcript / Artifact，而不是把 pointer 字符串当成证据。
+- 来源核验明确区分 `available`、`missing`、`denied`、`corrupt` 与 `unsupported`；只有 `available` 才能携带证据哈希。
 - `capture_retrieval_evidence()` 只冻结上游已经选中的 hit，不在压缩阶段重做 scope、score、冲突或预算裁决。
 
 ## 常见误区
@@ -43,6 +49,9 @@ flowchart LR
 - 简单删除早期消息, 会丢掉用户原始意图。
 - 让生成式摘要负责保存 durable fact，模型可能改写事实或遗漏 pending task。
 - 压缩后不标注来源, 后续很难验证。
+- 直接把 pointer 拼成文件路径，会把不可信标识符变成路径遍历或跨 session 读取入口。
+- 来源已清理、无权限或校验失败时仍渲染成“已验证”，会伪造证据可用性。
+- 把核验时读取的 excerpt 自动注入 Prompt，会让外部证据正文绕过既有预算与选择边界。
 - 原地修改 messages 会连带污染 Transcript 回放或调用方保存的证据视图。
 - 摘要生成失败后仍用错误字符串替换旧历史，会静默丢失最后一份可用上下文。
 ## 问题
@@ -151,6 +160,42 @@ class DurableContextState:
 ```
 
 生成式摘要即使遗漏任务，甚至错误地把“SQLite WAL”写成“JSON 文件”，也只能污染一次 conversation summary，不能修改 `DurableContextState`。下一轮 Prompt 由 `render_durable_context()` 重新注入原始结构化事实。
+
+### Source pointer 不是证据本身
+
+本章支持两类无路径标识符：
+
+```text
+transcript:<session_id>:<positive_sequence>
+artifact:<session_id>:<filename>:<12-or-64-char-sha256>
+```
+
+pointer 只携带经过严格校验的 session、sequence、filename 和 digest；Transcript / Artifact 的物理根目录由 harness 可信配置提供。授权回调在任何文件查找之前执行，解析器还会拒绝 `.`、`..`、斜杠、反斜杠、冒号和符号链接逃逸。
+
+| 状态 | 含义 | Prompt 中的呈现 |
+|---|---|---|
+| `available` | owner 文件存在且结构、归属、摘要均通过核验 | `source_status=available` + 完整 evidence SHA-256 |
+| `missing` | 文件或指定 Transcript event 不存在，也包括读取竞态中被清理 | `evidence_unavailable=true` |
+| `denied` | 授权策略、文件权限或 owner 边界拒绝访问 | `evidence_unavailable=true` |
+| `corrupt` | pointer 格式、Transcript envelope、UTF-8 或 Artifact digest 无效 | `evidence_unavailable=true` |
+| `unsupported` | scheme 不属于本章支持的 owner | `evidence_unavailable=true` |
+
+Transcript 核验会检查 session、连续 sequence 与 event ID；Artifact 核验以流式读取计算 SHA-256，不会为了验签把整个大文件载入内存。解析结果可以返回有界 excerpt 给审计 UI，但 `render_durable_context()` **绝不注入 excerpt 或来源正文**：pointer 可用时只注入状态和哈希，不可用时显式降级，绝不根据 durable fact 的文本反推或伪造证据。
+
+```python
+resolver = SourcePointerResolver(
+    transcript_root=state_home / "transcripts",
+    artifact_root=state_home,
+    authorize=source_policy,
+)
+resolutions = resolve_durable_sources(result.durable_state, resolver)
+durable_context = render_durable_context(
+    result.durable_state,
+    source_resolutions=resolutions,
+)
+```
+
+`source_resolutions` 必须与 durable state 中去重后的 pointer 精确一一绑定；缺项、多项或拿另一轮的结果替换都会被拒绝。这样清理、权限变化与 Artifact 损坏只能改变下一轮的核验状态，不能被旧摘要掩盖。
 
 ---
 
@@ -315,11 +360,15 @@ def generate_summary(messages: list, summarizer) -> tuple[list, int]:
 ### 在循环中的位置
 
 ```python
-def agent_loop(messages: list, durable_state: DurableContextState):
+def agent_loop(messages: list, durable_state: DurableContextState, resolver):
     while True:
         result = compact_context(messages, durable_state)
         messages = result.messages
-        durable_context = render_durable_context(result.durable_state)
+        source_resolutions = resolve_durable_sources(result.durable_state, resolver)
+        durable_context = render_durable_context(
+            result.durable_state,
+            source_resolutions=source_resolutions,
+        )
 
         response = client.messages.create(
             system=SYSTEM + "\n\n" + durable_context,
@@ -388,13 +437,14 @@ selected hits ──capture_retrieval_evidence()──> immutable RetrievalEvide
 | 协议完整性 | 避免以孤立 tool result 开头 | 按 tool-use ID 成对裁剪完整调用组 |
 | 摘要失败 | 原消息原样保留 | 加超时、重试预算和可观测失败原因 |
 | 长期事实 | durable state 旁路 | 接入带版本、冲突处理和来源校验的 Memory store |
-| 检索证据 | 已选 hit 的不可变元数据 | 持久化 query/decision trace，并校验 source 可访问性 |
+| source 核验 | 本地可信根、前置授权、结构与 digest 校验 | 对象存储 adapter、签名 manifest、细粒度租户策略与审计 trace |
+| 检索证据 | 已选 hit 的不可变元数据 | 持久化 query/decision trace，并把来源核验结果关联到选择记录 |
 
 这些是可验证的设计方向，不代表任何特定闭源产品的内部实现。
 
 ### 作为 Harness 公共边界
 
-S24 综合章直接复用本章的 `capture_retrieval_evidence()`、`DurableContextState`、`compact_context()` 和 `render_durable_context()`。因此导入 S14 时不会解析调用方的 CLI provider 参数；只有直接执行 `s14_context_compact/code.py` 才拥有这段命令行配置。综合 Harness 可以离线加载压缩契约，同时继续把真正的 provider client 延迟到生成式摘要路径。
+S24 综合章直接复用本章的 `capture_retrieval_evidence()`、`DurableContextState`、`SourcePointerResolver`、`compact_context()` 和 `render_durable_context()`。因此导入 S14 时不会解析调用方的 CLI provider 参数；只有直接执行 `s14_context_compact/code.py` 才拥有这段命令行配置。综合 Harness 可以离线加载压缩与来源核验契约，同时继续把真正的 provider client 延迟到生成式摘要路径。
 
 跨章节集成仍遵守所有权边界：S12 负责 recall，S15 负责 winner/loser，S14 只冻结已选证据并携带它穿过有损压缩。S14 不会因为窗口变化重新召回、重新排序或让 conflict loser 回填。
 
@@ -407,14 +457,16 @@ S24 综合章直接复用本章的 `capture_retrieval_evidence()`、`DurableCont
 1. **`DurableFact` / `PendingItem`** — 不可变的事实与未决事项，强制携带 source pointer 和带时区的最近确认时间
 2. **`RetrievalEvidence` / `capture_retrieval_evidence()`** — 从已选 hit 冻结来源、分数、排名与冲突标记，不复制召回正文
 3. **`DurableContextState`** — 在有损管线旁路传递的 Memory 输入，并按各自 ID 域拒绝重复条目
-4. **`render_durable_context()`** — 把 durable state 独立渲染进 system context，不混入生成式摘要
-5. **`estimate_tokens()`** — 粗略估算 messages 的 token 数（4 字符 ≈ 1 token）
-6. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
-7. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新
-8. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，删除旧消息
-9. **`generate_summary()`** — Layer 4: 用模型生成摘要替换历史；失败或空摘要时保留原历史
-10. **`compact_context()`** — 深拷贝 messages，依次尝试四层，并返回 `CompactionResult`
-11. **Agent 循环** — 每次 API 调用前压缩 disposable messages，再把 durable state 独立注入
+4. **`parse_source_pointer()` / `SourcePointerResolver`** — 解析无路径来源 ID，在可信 owner 根目录内授权、定位并核验证据
+5. **`SourceResolution` / `resolve_durable_sources()`** — 用不可变五态结果冻结本轮观察，并按首次出现顺序去重
+6. **`render_durable_context()`** — 把 durable state 与核验状态独立渲染进 system context，不混入摘要或 excerpt
+7. **`estimate_tokens()`** — 粗略估算 messages 的 token 数（4 字符 ≈ 1 token）
+8. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
+9. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新
+10. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，删除旧消息
+11. **`generate_summary()`** — Layer 4: 用模型生成摘要替换历史；失败或空摘要时保留原历史
+12. **`compact_context()`** — 深拷贝 messages，依次尝试四层，并返回 `CompactionResult`
+13. **Agent 循环** — 每次 API 调用前压缩 disposable messages、重新核验来源，再独立注入 durable state
 
 运行后会看到压缩日志——每层触发时打印 `[compact]` 消息，可以看到哪些层在什么时候被触发。
 
@@ -434,7 +486,7 @@ python s14_context_compact/code.py
 
 1. 给 pending item 增加状态机（open / blocked / done）。思考：完成状态由谁确认，如何避免摘要中的一句“已完成”越权修改 durable state？
 2. 当前 Layer 4 的摘要是一次性生成。实现增量摘要：每次只摘要新增的 messages，与之前的摘要合并；然后设计测试证明 durable state 不参与摘要合并。
-3. 为 source pointer 增加解析器，分别定位 `transcript:` 与 `artifact:` 来源。思考：来源已被清理或权限不足时，Prompt 应怎样呈现而不是伪造证据？
+3. 为远端 object store 实现 resolver adapter，保持同一五态输出和前置授权契约。设计测试证明重定向、过期签名与跨租户 key 不能越过 owner 边界。
 4. `estimate_tokens` 用 4 字符 ≈ 1 token 估算。安装 tokenizer 做精确计数，对比中英文和结构化 tool result 的偏差。
 
 ---

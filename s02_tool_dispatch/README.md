@@ -39,6 +39,7 @@ flowchart LR
 - 未知工具、错误参数和 handler 异常都转换成显式错误结果，不让 Agent Loop 崩溃。
 - 只有标记为 `concurrent_safe` 的只读工具批次才能并发；写入和未知调用保守串行。
 - 文件工具继续使用 `safe_path()` 限制工作区边界。
+- bash handler 为子进程重新构造最小环境，避免把 provider 凭据随工具调用直接传出 Harness。
 
 ## 常见误区
 
@@ -47,6 +48,7 @@ flowchart LR
 - 直接执行 `handler(**block.input)`：协议错误和 Python 异常会穿透到循环层。
 - 把所有同轮工具都并发：`write_file` 后紧跟 `read_file` 时会产生竞态。
 - 把安全策略塞进 Agent Loop：循环会逐渐知道每种工具的细节，新增工具就必须改循环。
+- 认为设置 `cwd` 就完成了隔离：工作目录不会自动移除父进程的 API key、SSH agent socket 或其他环境变量。
 
 ## 问题
 
@@ -56,7 +58,7 @@ s01 只有一个 bash 工具，所以循环可以直接写：
 output = run_bash(call.arguments["command"])
 ```
 
-当工具扩展到 read、write、edit 和 glob 后，硬编码分支会同时承担六件事：
+当工具扩展到 read、write、edit 和 glob 后，硬编码分支会同时承担七件事：
 
 1. 告诉模型有哪些工具；
 2. 根据名字找到 Python 函数；
@@ -64,6 +66,7 @@ output = run_bash(call.arguments["command"])
 4. 把参数传给 handler；
 5. 决定能否并发；
 6. 把成功或失败编码回 provider 协议。
+7. 决定工具子进程可以继承哪些宿主环境变量。
 
 如果这些信息散落在 schema 列表、dispatch 字典和循环分支中，它们迟早会不一致。真正需要新增的不是更多 `if/elif`，而是一条明确的 **dispatch boundary**。
 
@@ -214,6 +217,24 @@ def safe_path(path_text: str) -> Path:
 
 注册表负责通用协议边界，handler 仍负责自己的领域约束。路径越界异常会被 dispatch 捕获并转换成 `execution_error`。s04 会把更完整的 allow / ask / deny 决策提升到权限层；s23 再讲系统沙盒。
 
+### 8. bash 子进程不继承 provider 凭据
+
+真实模型客户端通常需要从宿主环境读取 API key，但执行工具的 shell 不应自动得到同一批凭据。`run_bash()` 因此显式传入重新构造的环境：
+
+```python
+completed = subprocess.run(
+    command,
+    cwd=WORKDIR,
+    env=build_subprocess_env(WORKDIR),
+    shell=True,
+    # ...
+)
+```
+
+`build_subprocess_env()` 只保留命令查找、语言区域和临时文件所需的变量；`HOME` 与 `PWD` 都指向 `WORKDIR`。未列入允许列表的 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`SSH_AUTH_SOCK` 和任意宿主变量不会进入子进程。
+
+这是对子进程直接继承环境的默认拒绝，不是完整沙盒。bash 仍可能读取工作区中的 `.env`、访问当前系统用户有权读取的其他文件或连接网络；这些能力需要 s04 的权限判断、s23 讨论的系统隔离和生产环境的网络策略共同限制。
+
 ---
 
 ## Agent Loop 为什么几乎不变
@@ -249,6 +270,7 @@ messages.append({
 | 错误处理 | bash 文本错误 | 稳定错误码 + `is_error` |
 | 并发 | 串行 | 仅全只读安全批次并发 |
 | 路径安全 | bash 自身语义 | 文件 handler 使用 `safe_path()` |
+| 子进程环境 | 继承 provider 进程环境 | 允许列表 + 工作区 `HOME` / `PWD` |
 | 循环契约 | 显式 turn 与 stop reason | 保持不变，只委托 dispatch |
 
 ---
@@ -299,6 +321,7 @@ assemble_tool_pool() = BUILTIN_TOOLS + MCP_TOOLS + SKILL_TOOLS
 - 根据资源锁或读写集合判断能否并发，而不只使用布尔值；
 - 对流式工具参数先组装完整 JSON，再进入同一个 dispatch boundary；
 - 记录调用耗时、错误码和重试次数，供 trace 与 eval 使用。
+- 将默认拒绝的环境过滤覆盖到 sidecar、MCP server 和其他外部进程，并与 OS 沙盒及网络出口控制组合使用。
 
 这些机制都可以扩展 `ToolSpec` 或包裹 `dispatch()`，不需要把工具细节重新塞回 Agent Loop。
 

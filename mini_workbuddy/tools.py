@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import shlex
 import subprocess
 import threading
@@ -24,6 +25,46 @@ class ToolResult:
 
 class PermissionError(RuntimeError):
     pass
+
+
+_TOOL_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+)
+
+
+def build_subprocess_env(workspace: str | Path) -> dict[str, str]:
+    """Return the small ambient environment exposed to a tool subprocess.
+
+    Provider credentials and unrelated parent-process variables are omitted by
+    construction.  HOME and PWD point at the session workspace so shell tools
+    do not discover user-level configuration through the real home directory.
+    This is credential hygiene, not an OS sandbox: readable workspace files and
+    network access remain governed by their own boundaries.
+    """
+
+    workspace_path = Path(workspace).expanduser().resolve()
+    env = {
+        name: os.environ[name]
+        for name in _TOOL_ENV_ALLOWLIST
+        if os.environ.get(name)
+    }
+    # A usable PATH is required even when the parent process did not define one.
+    env.setdefault("PATH", os.defpath)
+    env["HOME"] = str(workspace_path)
+    env["PWD"] = str(workspace_path)
+    return env
 
 
 class ToolRegistry:
@@ -52,6 +93,7 @@ class ToolRegistry:
             completed = subprocess.run(
                 command,
                 cwd=session.cwd,
+                env=build_subprocess_env(session.cwd),
                 shell=True,
                 text=True,
                 capture_output=True,

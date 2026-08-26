@@ -140,6 +140,32 @@ def test_bash_denies_dangerous_commands(tmp_path: Path) -> None:
         tools.run("bash", "rm -rf .", session)
 
 
+def test_bash_uses_workspace_scoped_environment(monkeypatch, tmp_path: Path) -> None:
+    """Tool commands must not inherit ambient credentials from the harness."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/private-agent.sock")
+    monkeypatch.setenv("WORKBUDDY_TEST_SECRET", "parent-only")
+    _, _, _, tools, _, session = build_runtime(tmp_path / "home", tmp_path)
+    command = (
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n' "
+        '"${OPENAI_API_KEY-unset}" "${ANTHROPIC_API_KEY-unset}" '
+        '"${SSH_AUTH_SOCK-unset}" "${WORKBUDDY_TEST_SECRET-unset}" '
+        '"$HOME|$PWD|${PATH:+set}"'
+    )
+
+    result = tools.run("bash", command, session)
+
+    assert result.content.splitlines() == [
+        "unset",
+        "unset",
+        "unset",
+        "unset",
+        f"{tmp_path.resolve()}|{tmp_path.resolve()}|set",
+    ]
+
+
 def test_large_tool_output_externalizes_to_disk(tmp_path: Path) -> None:
     _, storage, _, tools, _, session = build_runtime(tmp_path / "home", tmp_path, threshold_kb=1)
     command = "python3 -c \"print('x' * 5000)\""

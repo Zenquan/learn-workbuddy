@@ -161,6 +161,33 @@ def test_workspace_path_guard_is_preserved(monkeypatch, tmp_path: Path) -> None:
         s02.safe_path("../outside.txt")
 
 
+def test_bash_uses_workspace_scoped_environment(monkeypatch, tmp_path: Path) -> None:
+    """The standalone lesson teaches the same subprocess boundary as the mini harness."""
+
+    s02 = load_s02(monkeypatch)
+    monkeypatch.setattr(s02, "WORKDIR", tmp_path.resolve())
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/private-agent.sock")
+    monkeypatch.setenv("WORKBUDDY_TEST_SECRET", "parent-only")
+    command = (
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n' "
+        '"${OPENAI_API_KEY-unset}" "${ANTHROPIC_API_KEY-unset}" '
+        '"${SSH_AUTH_SOCK-unset}" "${WORKBUDDY_TEST_SECRET-unset}" '
+        '"$HOME|$PWD|${PATH:+set}"'
+    )
+
+    result = s02.run_bash(command)
+
+    assert result.splitlines() == [
+        "unset",
+        "unset",
+        "unset",
+        "unset",
+        f"{tmp_path.resolve()}|{tmp_path.resolve()}|set",
+    ]
+
+
 def test_agent_loop_advertises_and_executes_the_same_registry(monkeypatch) -> None:
     s02 = load_s02(monkeypatch)
     registry = s02.ToolRegistry()

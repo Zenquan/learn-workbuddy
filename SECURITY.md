@@ -42,9 +42,10 @@ general-purpose secret scanner such as gitleaks or trufflehog.
 
 ## Production Warning
 
-The mini harness intentionally uses simple teaching policies. A real desktop
-agent needs stronger boundaries: OS-level sandboxing, filtered subprocess
-environments, network egress controls, signed extension distribution, and
-human approval for high-risk actions.
+The S02 and mini-harness bash paths filter their ambient subprocess
+environments. A real desktop agent must apply that rule to every external
+process and still needs stronger boundaries: OS-level sandboxing, network
+egress controls, signed extension distribution, and human approval for
+high-risk actions.
 
 See `docs/security-boundaries.md` for the detailed safety model.

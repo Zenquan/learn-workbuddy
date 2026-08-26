@@ -44,6 +44,7 @@ PROGRESSION = {
         "schema-based argument validation",
         "structured dispatch results",
         "read-safe concurrent execution",
+        "filtered tool subprocess environment",
     ],
     "preserves": ["bounded agent loop", "interactive CLI"],
 }
@@ -321,6 +322,43 @@ def safe_path(path_text: str) -> Path:
     return path
 
 
+_TOOL_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+)
+
+
+def build_subprocess_env(workspace: Path) -> dict[str, str]:
+    """Expose only shell basics, never the provider process's credentials.
+
+    HOME and PWD are workspace-scoped so the shell does not inherit access to
+    user-level configuration by convention.  This closes direct environment
+    inheritance; it does not replace filesystem, network, or OS isolation.
+    """
+
+    workspace_path = workspace.expanduser().resolve()
+    env = {
+        name: os.environ[name]
+        for name in _TOOL_ENV_ALLOWLIST
+        if os.environ.get(name)
+    }
+    env.setdefault("PATH", os.defpath)
+    env["HOME"] = str(workspace_path)
+    env["PWD"] = str(workspace_path)
+    return env
+
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
@@ -330,6 +368,7 @@ def run_bash(command: str) -> str:
             command,
             shell=True,
             cwd=WORKDIR,
+            env=build_subprocess_env(WORKDIR),
             capture_output=True,
             text=True,
             timeout=120,

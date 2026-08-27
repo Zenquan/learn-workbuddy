@@ -46,6 +46,7 @@ def test_layered_memory_walkthrough_is_keyless_and_restart_safe(
     assert result.returncode == 0, result.stdout[-4_000:]
     assert "RESULT: OK" in result.stdout
     assert "created -> unchanged; bob empty=True" in result.stdout
+    assert "referenced retained=1; expired orphan deleted=1" in result.stdout
     assert "durable preserved=True" in result.stdout
     assert "sources verified=2" in result.stdout
 
@@ -69,10 +70,20 @@ def test_layered_memory_walkthrough_is_keyless_and_restart_safe(
     )
 
     # Memory receives bounded artifact metadata, never the externalized body.
-    artifact_reference = manifest["layers"]["artifact"]
+    artifact_layer = manifest["layers"]["artifact"]
+    artifact_reference = artifact_layer["reference"]
     assert "content" not in artifact_reference
     assert len(artifact_reference["content_sha256"]) == 64
     assert Path(artifact_reference["artifact_path"]).stat().st_size > 30_000
+    assert artifact_layer["cleanup"]["counts"] == {
+        "deleted": 1,
+        "retained_referenced": 1,
+    }
+    assert artifact_layer["orphan_resolution"]["status"] == "missing"
+    assert all(
+        "artifact_path" not in decision
+        for decision in artifact_layer["cleanup"]["decisions"]
+    )
 
     compaction = manifest["layers"]["compaction"]
     assert compaction["applied_layers"] == [

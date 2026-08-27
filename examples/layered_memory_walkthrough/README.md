@@ -15,6 +15,9 @@ flowchart LR
   W["S10 Workspace log"] --> D["distill / curated view"]
   U["S11 keyed user preference"] --> I["scope isolation"]
   A["S13 Artifact"] --> P["bounded pointer + digest"]
+  P --> L["retention claim"]
+  L --> G["plan/apply cleanup"]
+  G --> K["referenced retained / orphan deleted"]
   R --> F["fresh-process recovery"]
   D --> F
   I --> F
@@ -39,6 +42,7 @@ flowchart LR
 | User preference | S11 用户记忆 | 用户级、跨项目 | 显式按 key 更新，不做模糊追加 |
 | Recall hit | S12 查询结果 | 单 query | 是；它只是带 source 和 score 的候选视图 |
 | Artifact | S13 大结果证据 | session artifact | 原文件不允许；Prompt 只留摘要和指针 |
+| Retention claim | S13 清理租约 | Memory 引用期 | 无正文、无路径；只保护匹配 source/digest 的 Artifact |
 | Compacted messages | S14 Prompt 视图 | 单次或少数几次模型调用 | 允许；durable state 必须走无损旁路 |
 | Source resolution | S14 本轮核验视图 | 单次 Prompt 组装 | 不复用旧状态；每轮从 owner 重新核验 |
 
@@ -56,7 +60,7 @@ python3 examples/layered_memory_walkthrough/code.py --home /tmp/layered-memory
 
 `--home` 必须指向一个尚未生成 walkthrough manifest 的目录。这样重复实验不会静默覆盖上一轮证据。
 
-正常输出包含六个阶段：
+正常输出包含七个阶段：
 
 ```text
 [1] Transcript evidence
@@ -64,7 +68,8 @@ python3 examples/layered_memory_walkthrough/code.py --home /tmp/layered-memory
 [3] Workspace log and distill
 [4] User preference dedup and isolation
 [5] Query-scoped recall
-[6] Compaction boundary — sources verified=2
+[6] Reference-aware artifact cleanup
+[7] Compaction boundary — sources verified=2
 RESULT: OK — layered memory boundaries survived compaction and restart.
 ```
 
@@ -76,8 +81,9 @@ RESULT: OK — layered memory boundaries survived compaction and restart.
 4. S11 为 Alice 写入 keyed preference。相同 key/value 的第二次写入返回 `unchanged`，不增加 revision；Bob 使用同一 state root 仍得到空偏好，证明 user scope 隔离。
 5. S12 把 S09 candidate 写成 source-bearing conversation record，再为一个自包含 query 生成带 rank、score 和 provenance 的 RecallHit。Recall 不修改 Workspace 或 User Memory。
 6. walkthrough 丢弃所有对象并用相同路径创建新实例，分别恢复 Transcript、Workspace、User、Remote Store 和 Artifact。随后根据恢复结果重建 S14 `DurableContextState`。
-7. 为了在小 fixture 中确定性触发 S14，代码临时降低当前模块实例的压缩阈值，并在 `finally` 中恢复。对抗性 summarizer 会谎称“任务已完成”，测试要求错误只能进入 conversation summary，不能进入 durable context。
-8. 压缩完成后创建新的 `SourcePointerResolver`，从可信 Transcript / Artifact 根重新核验两个 pointer。只有结构、owner 和 SHA-256 全部通过才得到 `available`；Prompt 只接收 status 与 evidence hash，bounded excerpt 不进入 durable context，manifest 也不复制正文。
+7. fresh S13 externalizer 从 Memory reference 生成无路径 retention claim，再用两阶段 cleanup 保留被引用的旧 Artifact、删除同龄但无 owner 的孤儿；report 不复制正文或物理路径。
+8. 为了在小 fixture 中确定性触发 S14，代码临时降低当前模块实例的压缩阈值，并在 `finally` 中恢复。对抗性 summarizer 会谎称“任务已完成”，测试要求错误只能进入 conversation summary，不能进入 durable context。
+9. 压缩完成后创建新的 `SourcePointerResolver`，从可信 Transcript / Artifact 根重新核验两个 durable pointer，并确认已清理孤儿得到 `missing`。Prompt 只接收 status 与 evidence hash，bounded excerpt 不进入 durable context，manifest 也不复制正文。
 
 ## 为什么 S12 改成延迟初始化
 
@@ -102,8 +108,8 @@ online agent_loop 真正调用模型
 
 运行目录里的 `layered_memory_manifest.json` 分三部分：
 
-- `checks`：十个布尔不变量，包括去重、隔离、来源恢复、Artifact digest、source pointer 核验和 compaction 边界。
-- `layers`：每一层的可观察结果，例如 distill report、RecallHit、ArtifactMemoryReference、压缩前后 token、触发层和不含 excerpt 的 source resolutions。
+- `checks`：十一个布尔不变量，包括去重、隔离、来源恢复、引用感知 cleanup、Artifact digest、source pointer 核验和 compaction 边界。
+- `layers`：每一层的可观察结果，例如 distill report、RecallHit、ArtifactMemoryReference、不含路径的 cleanup report、压缩前后 token、触发层和不含 excerpt 的 source resolutions。
 - `artifacts`：Transcript JSONL、Workspace log/curated view、User preferences、Remote store 和 tool result 的真实路径。
 
 Manifest 只是一份验收报告，不是新的 Memory 真源。需要核验时仍应打开对应 owner 的文件。
@@ -114,6 +120,7 @@ Manifest 只是一份验收报告，不是新的 Memory 真源。需要核验时
 - **重复不等于多存一份。** Workspace 用 evidence IDs 合并重复事实；User preference 用稳定 key 返回 `unchanged`。
 - **同一 state root 不等于同一用户。** Alice 和 Bob 的 scope digest 不同，不能互读 canonical state。
 - **引用不等于复制。** Memory-facing Artifact reference 没有 `content` 字段，大结果仍归 Artifact 文件所有。
+- **清理不等于删除整个 session。** active claim 只按 source ID + 完整 digest 保护对应证据；达到 TTL 的无引用孤儿才能在重验后删除。
 - **恢复不等于复用旧对象。** walkthrough 明确创建 fresh store instances，再从磁盘重建视图。
 - **摘要不拥有事实。** S14 只压缩 messages 副本，source-bearing facts 和 pending items 单独渲染。
 - **Pointer 不等于已验证证据。** fresh resolver 必须从 owner 重新得到 `available`；清理、拒绝、损坏或未知 scheme 都会显式渲染 `evidence_unavailable=true`，不能由摘要补齐。

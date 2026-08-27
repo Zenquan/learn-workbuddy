@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
+import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -125,3 +128,260 @@ def test_invalid_summary_fails_before_creating_artifact(s13, tmp_path: Path) -> 
         externalizer.externalize("large output", "search", summary="  ")
 
     assert list(externalizer.tool_results_dir.iterdir()) == []
+
+
+def _set_artifact_age(path: Path, *, now: datetime, age_seconds: int) -> None:
+    observed = now.timestamp() - age_seconds
+    os.utime(path, (observed, observed))
+
+
+def test_cleanup_retains_memory_reference_and_deletes_expired_orphan(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    externalizer = s13.ToolResultExternalizer(tmp_path / "retention-session")
+    referenced = externalizer.externalize(
+        "durable build evidence",
+        "search",
+        summary="Referenced build evidence.",
+    ).artifact
+    orphan = externalizer.externalize(
+        "temporary diagnostic output",
+        "search",
+        summary="Temporary diagnostic output.",
+    ).artifact
+    _set_artifact_age(referenced.path, now=now, age_seconds=7_200)
+    _set_artifact_age(orphan.path, now=now, age_seconds=7_200)
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(
+        referenced.for_memory(),
+        reference_count=2,
+    )
+    policy = s13.ArtifactCleanupPolicy(
+        orphan_ttl_seconds=3_600,
+        dry_run=False,
+    )
+
+    plan = externalizer.plan_cleanup((claim,), policy=policy, now=now)
+    planned = {decision.filename: decision for decision in plan.decisions}
+    assert planned[referenced.path.name].status is (
+        s13.ArtifactCleanupStatus.RETAINED_REFERENCED
+    )
+    assert planned[referenced.path.name].reference_count == 2
+    assert planned[orphan.path.name].status is (
+        s13.ArtifactCleanupStatus.PLANNED_DELETE
+    )
+    assert str(tmp_path) not in json.dumps(plan.to_dict(), sort_keys=True)
+
+    report = externalizer.apply_cleanup(plan, claims=(claim,), now=now)
+    assert report.counts == {
+        "retained_referenced": 1,
+        "deleted": 1,
+    }
+    assert referenced.path.read_text(encoding="utf-8") == "durable build evidence"
+    assert not orphan.path.exists()
+
+
+def test_cleanup_dry_run_ttl_and_deletion_limit_are_deterministic(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    externalizer = s13.ToolResultExternalizer(tmp_path / "policy-session")
+    old_first = externalizer.externalize(
+        "old first",
+        "search",
+        summary="Old first artifact.",
+    ).artifact
+    old_second = externalizer.externalize(
+        "old second",
+        "search",
+        summary="Old second artifact.",
+    ).artifact
+    recent = externalizer.externalize(
+        "recent",
+        "search",
+        summary="Recent artifact.",
+    ).artifact
+    for artifact in (old_first, old_second):
+        _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    _set_artifact_age(recent.path, now=now, age_seconds=30)
+
+    policy = s13.ArtifactCleanupPolicy(
+        orphan_ttl_seconds=60,
+        max_deletions=1,
+        dry_run=True,
+    )
+    report = externalizer.cleanup_artifacts(policy=policy, now=now)
+    statuses = {
+        decision.filename: decision.status
+        for decision in report.decisions
+    }
+
+    assert statuses[old_first.path.name] is s13.ArtifactCleanupStatus.PLANNED_DELETE
+    assert statuses[old_second.path.name] is s13.ArtifactCleanupStatus.RETAINED_LIMIT
+    assert statuses[recent.path.name] is s13.ArtifactCleanupStatus.RETAINED_RECENT
+    assert all(artifact.path.exists() for artifact in (old_first, old_second, recent))
+
+
+def test_expired_claim_can_be_collected_but_missing_active_claim_is_reported(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    externalizer = s13.ToolResultExternalizer(tmp_path / "lease-session")
+    artifact = externalizer.externalize(
+        "expired lease body",
+        "search",
+        summary="Expired lease artifact.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    expired = s13.ArtifactRetentionClaim.from_memory_reference(
+        artifact.for_memory(),
+        retain_until=(now - timedelta(seconds=1)).isoformat(),
+    )
+    missing_digest = hashlib.sha256(b"missing artifact").hexdigest()
+    missing = s13.ArtifactRetentionClaim(
+        source_id=(
+            "artifact:lease-session:tool_result_999.txt:"
+            f"{missing_digest[:12]}"
+        ),
+        content_sha256=missing_digest,
+    )
+
+    plan = externalizer.plan_cleanup(
+        (expired, missing),
+        policy=s13.ArtifactCleanupPolicy(
+            orphan_ttl_seconds=60,
+            dry_run=False,
+        ),
+        now=now,
+    )
+    statuses = {decision.filename: decision.status for decision in plan.decisions}
+    assert statuses[artifact.path.name] is s13.ArtifactCleanupStatus.PLANNED_DELETE
+    assert statuses["tool_result_999.txt"] is (
+        s13.ArtifactCleanupStatus.MISSING_REFERENCED
+    )
+
+    report = externalizer.apply_cleanup(plan, claims=(expired, missing), now=now)
+    assert report.counts == {"deleted": 1, "missing_referenced": 1}
+    assert not artifact.path.exists()
+
+
+def test_cleanup_retains_artifact_when_claim_digest_disagrees(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    externalizer = s13.ToolResultExternalizer(tmp_path / "corrupt-session")
+    artifact = externalizer.externalize(
+        "original evidence",
+        "search",
+        summary="Evidence protected by a retention claim.",
+    ).artifact
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    artifact.path.write_text("tampered evidence", encoding="utf-8")
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+
+    report = externalizer.cleanup_artifacts(
+        (claim,),
+        policy=s13.ArtifactCleanupPolicy(
+            orphan_ttl_seconds=60,
+            dry_run=False,
+        ),
+        now=now,
+    )
+
+    assert report.counts == {"retained_corrupt": 1}
+    assert artifact.path.read_text(encoding="utf-8") == "tampered evidence"
+
+
+def test_cleanup_rechecks_claims_added_after_planning(s13, tmp_path: Path) -> None:
+    now = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    externalizer = s13.ToolResultExternalizer(tmp_path / "late-claim-session")
+    artifact = externalizer.externalize(
+        "evidence claimed after planning",
+        "search",
+        summary="Evidence that gains an owner before apply.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    policy = s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False)
+    plan = externalizer.plan_cleanup(policy=policy, now=now)
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+
+    with pytest.raises(s13.ArtifactRetentionError, match="current retention claims"):
+        externalizer.apply_cleanup(plan, now=now)
+
+    report = externalizer.apply_cleanup(plan, claims=(claim,), now=now)
+    assert report.counts == {"retained_referenced": 1}
+    assert artifact.path.exists()
+
+
+def test_cleanup_rechecks_digest_and_is_idempotent(s13, tmp_path: Path) -> None:
+    now = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    externalizer = s13.ToolResultExternalizer(tmp_path / "race-session")
+    raced = externalizer.externalize(
+        "original-bytes",
+        "search",
+        summary="Race detection artifact.",
+    ).artifact
+    _set_artifact_age(raced.path, now=now, age_seconds=7_200)
+    policy = s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False)
+    plan = externalizer.plan_cleanup(policy=policy, now=now)
+    deletion = next(
+        decision
+        for decision in plan.decisions
+        if decision.status is s13.ArtifactCleanupStatus.PLANNED_DELETE
+    )
+    raced.path.write_text("replaced-bytes", encoding="utf-8")
+    snapshot = raced.path.stat()
+    os.utime(
+        raced.path,
+        ns=(snapshot.st_atime_ns, deletion.snapshot_mtime_ns),
+    )
+
+    raced_report = externalizer.apply_cleanup(plan, claims=(), now=now)
+    assert raced_report.counts == {"race_detected": 1}
+    assert raced.path.exists()
+
+    idempotent_externalizer = s13.ToolResultExternalizer(
+        tmp_path / "idempotent-session"
+    )
+    safe = idempotent_externalizer.externalize(
+        "safe orphan",
+        "search",
+        summary="Safe orphan artifact.",
+    ).artifact
+    _set_artifact_age(safe.path, now=now, age_seconds=7_200)
+    safe_plan = idempotent_externalizer.plan_cleanup(policy=policy, now=now)
+    first = idempotent_externalizer.apply_cleanup(safe_plan, claims=(), now=now)
+    second = idempotent_externalizer.apply_cleanup(safe_plan, claims=(), now=now)
+    assert first.counts["deleted"] == 1
+    assert second.counts["already_missing"] == 1
+
+
+def test_cleanup_rejects_cross_session_claims_and_symlink_escape(
+    s13, tmp_path: Path
+) -> None:
+    externalizer = s13.ToolResultExternalizer(tmp_path / "owned-session")
+    digest = hashlib.sha256(b"other session").hexdigest()
+    cross_session = s13.ArtifactRetentionClaim(
+        source_id=f"artifact:other-session:tool_result_001.txt:{digest[:12]}",
+        content_sha256=digest,
+    )
+    with pytest.raises(s13.ArtifactRetentionError, match="different artifact session"):
+        externalizer.plan_cleanup((cross_session,))
+    with pytest.raises(s13.ArtifactRetentionError, match="path-free"):
+        s13.parse_artifact_source_id(
+            f"artifact:../outside:tool_result_001.txt:{digest[:12]}"
+        )
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside owner", encoding="utf-8")
+    link = externalizer.tool_results_dir / "tool_result_001.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this platform")
+    plan = externalizer.plan_cleanup(
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=0, dry_run=False)
+    )
+    assert plan.decisions[0].status is s13.ArtifactCleanupStatus.DENIED
+    externalizer.apply_cleanup(plan)
+    assert outside.read_text(encoding="utf-8") == "outside owner"

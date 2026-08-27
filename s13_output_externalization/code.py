@@ -31,9 +31,12 @@ Usage:
 import argparse
 import hashlib
 import os
+import re
 import tempfile
-from dataclasses import asdict, dataclass
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 # Machine-readable learning path metadata. Tests enforce that every
@@ -45,6 +48,7 @@ PROGRESSION = {
         "large output threshold",
         "source-bearing artifact references",
         "page-fault reads",
+        "reference-aware artifact retention",
     ],
     "preserves": ["context budget mindset", "memory as a selective derived view"],
 }
@@ -69,6 +73,11 @@ HEAD_BYTES = 6 * 1024                    # 6KB head in pointer
 TAIL_BYTES = 24 * 1024                   # 24KB tail in pointer
 SUMMARY_MAX_CHARS = 240                  # bounded text suitable for later retrieval
 ARTIFACT_SOURCE_TYPE = "artifact"
+DEFAULT_ORPHAN_TTL_SECONDS = 24 * 60 * 60
+_SOURCE_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_ARTIFACT_DIGEST_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{12}|[0-9a-fA-F]{64})$")
+_FULL_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+_ARTIFACT_FILENAME_PATTERN = re.compile(r"^tool_result_[0-9]{3,}\.txt$")
 
 
 class ArtifactAccessError(ValueError):
@@ -77,6 +86,84 @@ class ArtifactAccessError(ValueError):
 
 class ArtifactIntegrityError(RuntimeError):
     """Persisted artifact bytes no longer match the reference digest."""
+
+
+class ArtifactRetentionError(ValueError):
+    """A retention claim or cleanup plan violated an ownership contract."""
+
+
+class ArtifactCleanupStatus(str, Enum):
+    """Terminal or planned state for one artifact cleanup decision."""
+
+    RETAINED_REFERENCED = "retained_referenced"
+    RETAINED_RECENT = "retained_recent"
+    RETAINED_LIMIT = "retained_limit"
+    RETAINED_UNKNOWN = "retained_unknown"
+    RETAINED_CORRUPT = "retained_corrupt"
+    PLANNED_DELETE = "planned_delete"
+    DELETED = "deleted"
+    MISSING_REFERENCED = "missing_referenced"
+    ALREADY_MISSING = "already_missing"
+    RACE_DETECTED = "race_detected"
+    DENIED = "denied"
+
+
+@dataclass(frozen=True)
+class ParsedArtifactSource:
+    """Path-free parts of an S13-owned artifact source ID."""
+
+    raw: str
+    session_id: str
+    filename: str
+    digest_prefix: str
+
+
+def _source_component(value: str, *, field_name: str) -> str:
+    if value in {".", ".."} or not _SOURCE_COMPONENT_PATTERN.fullmatch(value):
+        raise ArtifactRetentionError(f"{field_name} must be one path-free component")
+    return value
+
+
+def parse_artifact_source_id(value: str) -> ParsedArtifactSource:
+    """Parse an artifact ID without accepting a caller-controlled path."""
+
+    raw = str(value)
+    if not raw or any(character.isspace() for character in raw):
+        raise ArtifactRetentionError("artifact source ID must be non-empty and path-free")
+    parts = raw.split(":")
+    if len(parts) != 4 or parts[0] != ARTIFACT_SOURCE_TYPE:
+        raise ArtifactRetentionError(
+            "artifact source ID must be artifact:<session>:<filename>:<digest>"
+        )
+    session_id = _source_component(parts[1], field_name="artifact session")
+    filename = _source_component(parts[2], field_name="artifact filename")
+    if not _ARTIFACT_FILENAME_PATTERN.fullmatch(filename):
+        raise ArtifactRetentionError("artifact filename is not owned by S13")
+    if not _ARTIFACT_DIGEST_PATTERN.fullmatch(parts[3]):
+        raise ArtifactRetentionError("artifact digest must contain 12 or 64 hex characters")
+    return ParsedArtifactSource(
+        raw=raw,
+        session_id=session_id,
+        filename=filename,
+        digest_prefix=parts[3].lower(),
+    )
+
+
+def _aware_utc(value: datetime | None = None) -> datetime:
+    observed = value or datetime.now(timezone.utc)
+    if observed.tzinfo is None:
+        raise ValueError("cleanup time must include a timezone")
+    return observed.astimezone(timezone.utc)
+
+
+def _parse_aware_utc(value: str, *, field_name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ArtifactRetentionError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ArtifactRetentionError(f"{field_name} must include a timezone")
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -145,6 +232,157 @@ class ExternalizedToolResult:
     artifact: ArtifactReference
 
 
+@dataclass(frozen=True)
+class ArtifactRetentionClaim:
+    """A bounded Memory lease that protects one immutable artifact.
+
+    The physical path is deliberately absent. Cleanup resolves the typed source
+    ID beneath its own trusted session root and verifies the full digest before
+    treating the claim as authoritative.
+    """
+
+    source_id: str
+    content_sha256: str
+    reference_count: int = 1
+    retain_until: str | None = None
+
+    def __post_init__(self) -> None:
+        parsed = parse_artifact_source_id(self.source_id)
+        digest = str(self.content_sha256).lower()
+        if not _FULL_SHA256_PATTERN.fullmatch(digest):
+            raise ArtifactRetentionError("retention claim requires a full SHA-256 digest")
+        if not digest.startswith(parsed.digest_prefix):
+            raise ArtifactRetentionError("source ID digest does not match retention digest")
+        if (
+            isinstance(self.reference_count, bool)
+            or not isinstance(self.reference_count, int)
+            or self.reference_count < 1
+        ):
+            raise ArtifactRetentionError("reference_count must be a positive integer")
+        if self.retain_until is not None:
+            _parse_aware_utc(self.retain_until, field_name="retain_until")
+        object.__setattr__(self, "content_sha256", digest)
+
+    @classmethod
+    def from_memory_reference(
+        cls,
+        reference: ArtifactMemoryReference,
+        *,
+        reference_count: int = 1,
+        retain_until: str | None = None,
+    ) -> ArtifactRetentionClaim:
+        return cls(
+            source_id=reference.source.source_id,
+            content_sha256=reference.content_sha256,
+            reference_count=reference_count,
+            retain_until=retain_until,
+        )
+
+    def is_active(self, now: datetime) -> bool:
+        if self.retain_until is None:
+            return True
+        return _parse_aware_utc(
+            self.retain_until,
+            field_name="retain_until",
+        ) > _aware_utc(now)
+
+
+@dataclass(frozen=True)
+class ArtifactCleanupPolicy:
+    """Deterministic limits for deleting expired, unreferenced artifacts."""
+
+    orphan_ttl_seconds: int = DEFAULT_ORPHAN_TTL_SECONDS
+    max_deletions: int | None = None
+    dry_run: bool = True
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.orphan_ttl_seconds, bool)
+            or not isinstance(self.orphan_ttl_seconds, int)
+            or self.orphan_ttl_seconds < 0
+        ):
+            raise ValueError("orphan_ttl_seconds must be a non-negative integer")
+        if self.max_deletions is not None and (
+            isinstance(self.max_deletions, bool)
+            or not isinstance(self.max_deletions, int)
+            or self.max_deletions < 0
+        ):
+            raise ValueError("max_deletions must be a non-negative integer or None")
+        if not isinstance(self.dry_run, bool):
+            raise ValueError("dry_run must be a boolean")
+
+
+@dataclass(frozen=True)
+class ArtifactCleanupDecision:
+    """One explainable retain/delete outcome without exposing a disk path."""
+
+    filename: str
+    source_id: str | None
+    status: ArtifactCleanupStatus
+    reason: str
+    byte_size: int | None = None
+    content_sha256: str | None = None
+    age_seconds: int | None = None
+    reference_count: int = 0
+    snapshot_mtime_ns: int | None = None
+    snapshot_device: int | None = None
+    snapshot_inode: int | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["status"] = self.status.value
+        payload.pop("snapshot_mtime_ns")
+        payload.pop("snapshot_device")
+        payload.pop("snapshot_inode")
+        return payload
+
+
+@dataclass(frozen=True)
+class ArtifactCleanupPlan:
+    """Immutable phase-one snapshot; no file is deleted while planning."""
+
+    session_id: str
+    planned_at: str
+    policy: ArtifactCleanupPolicy
+    decisions: tuple[ArtifactCleanupDecision, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "planned_at": self.planned_at,
+            "policy": asdict(self.policy),
+            "decisions": [decision.to_dict() for decision in self.decisions],
+        }
+
+
+@dataclass(frozen=True)
+class ArtifactCleanupReport:
+    """Phase-two cleanup outcomes and stable status counts."""
+
+    session_id: str
+    planned_at: str
+    applied_at: str
+    dry_run: bool
+    decisions: tuple[ArtifactCleanupDecision, ...]
+
+    @property
+    def counts(self) -> dict[str, int]:
+        counts = {status.value: 0 for status in ArtifactCleanupStatus}
+        for decision in self.decisions:
+            counts[decision.status.value] += 1
+        return {name: count for name, count in counts.items() if count}
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "planned_at": self.planned_at,
+            "applied_at": self.applied_at,
+            "dry_run": self.dry_run,
+            "counts": self.counts,
+            "decisions": [decision.to_dict() for decision in self.decisions],
+        }
+
+
 # ======================================================================
 # Token estimation (same rough heuristic as s18)
 # ======================================================================
@@ -191,6 +429,7 @@ class ToolResultExternalizer:
 
     def __init__(self, session_dir: Path):
         self.session_dir = session_dir
+        _source_component(self.session_dir.name, field_name="artifact session")
         self.tool_results_dir = session_dir / "tool-results"
         self.tool_results_dir.mkdir(parents=True, exist_ok=True)
         self._counter = 0
@@ -401,6 +640,339 @@ class ToolResultExternalizer:
             offset=offset,
             limit=limit,
         )
+
+    @staticmethod
+    def _stream_sha256(file_path: Path) -> str:
+        digest = hashlib.sha256()
+        with file_path.open("rb") as handle:
+            while chunk := handle.read(64 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _validated_claims(
+        self,
+        claims: Sequence[ArtifactRetentionClaim],
+        *,
+        now: datetime,
+    ) -> tuple[
+        dict[str, ArtifactRetentionClaim],
+        dict[str, ArtifactRetentionClaim],
+    ]:
+        by_source: dict[str, ArtifactRetentionClaim] = {}
+        active_by_filename: dict[str, ArtifactRetentionClaim] = {}
+        all_by_filename: dict[str, ArtifactRetentionClaim] = {}
+        for claim in claims:
+            if not isinstance(claim, ArtifactRetentionClaim):
+                raise ArtifactRetentionError(
+                    "cleanup claims must be ArtifactRetentionClaim values"
+                )
+            parsed = parse_artifact_source_id(claim.source_id)
+            if parsed.session_id != self.session_dir.name:
+                raise ArtifactRetentionError(
+                    "retention claim belongs to a different artifact session"
+                )
+            if claim.source_id in by_source:
+                raise ArtifactRetentionError(
+                    f"duplicate retention source ID: {claim.source_id}"
+                )
+            if parsed.filename in all_by_filename:
+                raise ArtifactRetentionError(
+                    f"multiple retention claims target {parsed.filename}"
+                )
+            by_source[claim.source_id] = claim
+            all_by_filename[parsed.filename] = claim
+            if claim.is_active(now):
+                active_by_filename[parsed.filename] = claim
+        return all_by_filename, active_by_filename
+
+    def plan_cleanup(
+        self,
+        claims: Sequence[ArtifactRetentionClaim] = (),
+        *,
+        policy: ArtifactCleanupPolicy | None = None,
+        now: datetime | None = None,
+    ) -> ArtifactCleanupPlan:
+        """Plan cleanup without deleting data or trusting Memory-owned paths."""
+
+        observed_at = _aware_utc(now)
+        active_policy = policy or ArtifactCleanupPolicy()
+        all_claims, active_claims = self._validated_claims(
+            claims,
+            now=observed_at,
+        )
+        decisions: list[ArtifactCleanupDecision] = []
+        seen_active_claims: set[str] = set()
+        planned_deletions = 0
+
+        for candidate in sorted(self.tool_results_dir.iterdir(), key=lambda path: path.name):
+            filename = candidate.name
+            if not _ARTIFACT_FILENAME_PATTERN.fullmatch(filename):
+                decisions.append(ArtifactCleanupDecision(
+                    filename=filename,
+                    source_id=None,
+                    status=ArtifactCleanupStatus.RETAINED_UNKNOWN,
+                    reason="filename_not_owned_by_s13",
+                ))
+                continue
+            if filename in active_claims:
+                seen_active_claims.add(active_claims[filename].source_id)
+            try:
+                if candidate.is_symlink():
+                    decisions.append(ArtifactCleanupDecision(
+                        filename=filename,
+                        source_id=None,
+                        status=ArtifactCleanupStatus.DENIED,
+                        reason="symbolic_link_not_owned",
+                    ))
+                    continue
+                owned_path = self._owned_path(candidate)
+                snapshot = owned_path.stat()
+                if not owned_path.is_file():
+                    decisions.append(ArtifactCleanupDecision(
+                        filename=filename,
+                        source_id=None,
+                        status=ArtifactCleanupStatus.RETAINED_UNKNOWN,
+                        reason="artifact_not_a_regular_file",
+                    ))
+                    continue
+                digest = self._stream_sha256(owned_path)
+            except PermissionError:
+                decisions.append(ArtifactCleanupDecision(
+                    filename=filename,
+                    source_id=None,
+                    status=ArtifactCleanupStatus.DENIED,
+                    reason="artifact_read_denied",
+                ))
+                continue
+            except (ArtifactAccessError, OSError):
+                decisions.append(ArtifactCleanupDecision(
+                    filename=filename,
+                    source_id=None,
+                    status=ArtifactCleanupStatus.RETAINED_CORRUPT,
+                    reason="artifact_snapshot_failed",
+                ))
+                continue
+
+            source_id = (
+                f"artifact:{self.session_dir.name}:{filename}:{digest[:12]}"
+            )
+            age_seconds = max(
+                0,
+                int(observed_at.timestamp() - snapshot.st_mtime),
+            )
+            claim = all_claims.get(filename)
+            common = {
+                "filename": filename,
+                "source_id": source_id,
+                "byte_size": snapshot.st_size,
+                "content_sha256": digest,
+                "age_seconds": age_seconds,
+                "reference_count": claim.reference_count if claim else 0,
+                "snapshot_mtime_ns": snapshot.st_mtime_ns,
+                "snapshot_device": snapshot.st_dev,
+                "snapshot_inode": snapshot.st_ino,
+            }
+            if claim is not None and (
+                claim.content_sha256 != digest
+            ):
+                decisions.append(ArtifactCleanupDecision(
+                    **common,
+                    status=ArtifactCleanupStatus.RETAINED_CORRUPT,
+                    reason="retention_claim_digest_mismatch",
+                ))
+                continue
+            if filename in active_claims:
+                decisions.append(ArtifactCleanupDecision(
+                    **common,
+                    status=ArtifactCleanupStatus.RETAINED_REFERENCED,
+                    reason="active_memory_retention_claim",
+                ))
+                continue
+            if age_seconds < active_policy.orphan_ttl_seconds:
+                decisions.append(ArtifactCleanupDecision(
+                    **common,
+                    status=ArtifactCleanupStatus.RETAINED_RECENT,
+                    reason=(
+                        "retention_claim_expired_but_orphan_ttl_not_reached"
+                        if claim is not None
+                        else "orphan_ttl_not_reached"
+                    ),
+                ))
+                continue
+            if (
+                active_policy.max_deletions is not None
+                and planned_deletions >= active_policy.max_deletions
+            ):
+                decisions.append(ArtifactCleanupDecision(
+                    **common,
+                    status=ArtifactCleanupStatus.RETAINED_LIMIT,
+                    reason="cleanup_deletion_limit_reached",
+                ))
+                continue
+            planned_deletions += 1
+            decisions.append(ArtifactCleanupDecision(
+                **common,
+                status=ArtifactCleanupStatus.PLANNED_DELETE,
+                reason=(
+                    "expired_retention_claim"
+                    if claim is not None
+                    else "expired_unreferenced_artifact"
+                ),
+            ))
+
+        for filename, claim in sorted(active_claims.items()):
+            if claim.source_id in seen_active_claims:
+                continue
+            decisions.append(ArtifactCleanupDecision(
+                filename=filename,
+                source_id=claim.source_id,
+                status=ArtifactCleanupStatus.MISSING_REFERENCED,
+                reason="active_retention_claim_has_no_artifact",
+                content_sha256=claim.content_sha256,
+                reference_count=claim.reference_count,
+            ))
+
+        return ArtifactCleanupPlan(
+            session_id=self.session_dir.name,
+            planned_at=observed_at.isoformat(),
+            policy=active_policy,
+            decisions=tuple(decisions),
+        )
+
+    @staticmethod
+    def _snapshot_matches(
+        decision: ArtifactCleanupDecision,
+        snapshot: os.stat_result,
+    ) -> bool:
+        return (
+            decision.byte_size == snapshot.st_size
+            and decision.snapshot_mtime_ns == snapshot.st_mtime_ns
+            and decision.snapshot_device == snapshot.st_dev
+            and decision.snapshot_inode == snapshot.st_ino
+        )
+
+    def apply_cleanup(
+        self,
+        plan: ArtifactCleanupPlan,
+        *,
+        claims: Sequence[ArtifactRetentionClaim] | None = None,
+        now: datetime | None = None,
+    ) -> ArtifactCleanupReport:
+        """Apply deletions after rechecking current claims and file identity."""
+
+        if not isinstance(plan, ArtifactCleanupPlan):
+            raise ArtifactRetentionError("cleanup requires an ArtifactCleanupPlan")
+        if plan.session_id != self.session_dir.name:
+            raise ArtifactRetentionError("cleanup plan belongs to a different session")
+        applied_at = _aware_utc(now)
+        has_deletions = any(
+            decision.status is ArtifactCleanupStatus.PLANNED_DELETE
+            for decision in plan.decisions
+        )
+        if has_deletions and not plan.policy.dry_run and claims is None:
+            raise ArtifactRetentionError(
+                "current retention claims are required when applying deletions"
+            )
+        current_claims, active_claims = self._validated_claims(
+            claims or (),
+            now=applied_at,
+        )
+        outcomes: list[ArtifactCleanupDecision] = []
+        for decision in plan.decisions:
+            if decision.status is not ArtifactCleanupStatus.PLANNED_DELETE:
+                outcomes.append(decision)
+                continue
+            if plan.policy.dry_run:
+                outcomes.append(decision)
+                continue
+            current_claim = current_claims.get(decision.filename)
+            if current_claim is not None and (
+                current_claim.content_sha256 != decision.content_sha256
+            ):
+                outcomes.append(replace(
+                    decision,
+                    status=ArtifactCleanupStatus.RETAINED_CORRUPT,
+                    reason="current_retention_claim_digest_mismatch",
+                    reference_count=current_claim.reference_count,
+                ))
+                continue
+            if decision.filename in active_claims:
+                outcomes.append(replace(
+                    decision,
+                    status=ArtifactCleanupStatus.RETAINED_REFERENCED,
+                    reason="active_claim_added_after_cleanup_plan",
+                    reference_count=active_claims[decision.filename].reference_count,
+                ))
+                continue
+            if not _ARTIFACT_FILENAME_PATTERN.fullmatch(decision.filename):
+                outcomes.append(replace(
+                    decision,
+                    status=ArtifactCleanupStatus.DENIED,
+                    reason="cleanup_plan_filename_not_owned",
+                ))
+                continue
+            candidate = self.tool_results_dir / decision.filename
+            try:
+                if candidate.is_symlink():
+                    raise ArtifactAccessError("symbolic link changed after planning")
+                owned_path = self._owned_path(candidate)
+                before_hash = owned_path.stat()
+                if not owned_path.is_file() or not self._snapshot_matches(
+                    decision,
+                    before_hash,
+                ):
+                    raise ArtifactIntegrityError("artifact snapshot changed")
+                digest = self._stream_sha256(owned_path)
+                after_hash = owned_path.stat()
+                if (
+                    digest != decision.content_sha256
+                    or not self._snapshot_matches(decision, after_hash)
+                ):
+                    raise ArtifactIntegrityError("artifact changed while hashing")
+                owned_path.unlink()
+            except FileNotFoundError:
+                outcomes.append(replace(
+                    decision,
+                    status=ArtifactCleanupStatus.ALREADY_MISSING,
+                    reason="artifact_already_missing",
+                ))
+            except PermissionError:
+                outcomes.append(replace(
+                    decision,
+                    status=ArtifactCleanupStatus.DENIED,
+                    reason="artifact_delete_denied",
+                ))
+            except (ArtifactAccessError, ArtifactIntegrityError, OSError):
+                outcomes.append(replace(
+                    decision,
+                    status=ArtifactCleanupStatus.RACE_DETECTED,
+                    reason="artifact_changed_after_cleanup_plan",
+                ))
+            else:
+                outcomes.append(replace(
+                    decision,
+                    status=ArtifactCleanupStatus.DELETED,
+                    reason="expired_unreferenced_artifact_deleted",
+                ))
+        return ArtifactCleanupReport(
+            session_id=self.session_dir.name,
+            planned_at=plan.planned_at,
+            applied_at=applied_at.isoformat(),
+            dry_run=plan.policy.dry_run,
+            decisions=tuple(outcomes),
+        )
+
+    def cleanup_artifacts(
+        self,
+        claims: Sequence[ArtifactRetentionClaim] = (),
+        *,
+        policy: ArtifactCleanupPolicy | None = None,
+        now: datetime | None = None,
+    ) -> ArtifactCleanupReport:
+        """Plan then apply one cleanup pass; defaults to a safe dry run."""
+
+        plan = self.plan_cleanup(claims, policy=policy, now=now)
+        return self.apply_cleanup(plan, claims=claims, now=now)
 
     def externalize(
         self,

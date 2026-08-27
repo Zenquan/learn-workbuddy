@@ -18,6 +18,10 @@ flowchart LR
     D --> E["Read Page Fault"]
     C --> F["ArtifactReference<br/>digest + provenance"]
     F -. "later policy" .-> G["Memory Reference<br/>summary + pointer, no body"]
+    G --> H["ArtifactRetentionClaim<br/>source ID + digest + lease"]
+    C --> I["plan_cleanup → snapshot"]
+    H --> I
+    I --> J["retain referenced / recent<br/>delete expired orphan"]
 ```
 
 ## 学习前置知识
@@ -31,6 +35,8 @@ flowchart LR
 - 把大输出 swap 到 artifact 文件, prompt 里只留摘要和路径。
 - 为 artifact 生成稳定 source ID、摘要、来源工具、时间与 SHA-256，避免它变成不可审计的匿名文件。
 - Memory 只能接收 `ArtifactMemoryReference`，保留必要摘要与可检索指针，不复制大结果正文。
+- 用无路径 `ArtifactRetentionClaim` 把 Memory 引用投影为清理租约；物理路径始终由 S13 的可信 session root 决定。
+- 清理分成 plan/apply 两阶段，执行前重新核验文件 identity、mtime、大小与 SHA-256；变化时 fail-closed。
 - 模拟按需读取片段, 类似缺页中断。
 - 为 s14 的压缩减轻压力。
 
@@ -41,6 +47,10 @@ flowchart LR
 - 外部化文件不纳入审计, 会影响复盘。
 - 用进程内计数器重新从 `001` 写起，会覆盖旧 artifact，让已经保存的 pointer 指向错误证据。
 - 把 pointer 中的 head/tail 预览原样写进 Memory，本质上仍在复制可能巨大或敏感的工具正文。
+- 会话结束就删除整个 `tool-results/`，会让仍被 Workspace/User Memory 引用的证据立即悬空。
+- 直接相信 Memory 中的 `artifact_path` 做删除，会把不可信持久化数据变成任意文件删除入口。
+- 扫描到未知文件、符号链接、digest 冲突或竞态仍继续删除，违背证据清理的 fail-closed 边界。
+
 ## 问题
 
 一条 `grep -r "TODO" .` 命令能产生多少输出？
@@ -189,6 +199,55 @@ payload = memory_reference.to_dict()
 ```
 
 `source` 与 s09、s12 使用同一组核心字段：`source_id`、`source_type`、`title`、`captured_at`。其中 `source_id` 组合 session、artifact 文件名和内容摘要前缀；`content_sha256` 用于发现文件被替换或损坏。这里没有直接写入 Memory，因为 artifact 是否值得跨会话保留，仍需后续 policy 判断。
+
+### 引用感知的生命周期与 GC
+
+Artifact 不能永久累积，也不能跟随 session 一刀切删除。S13 把“是否还需要这份证据”建模成有界租约：
+
+```text
+ArtifactMemoryReference
+    └─ ArtifactRetentionClaim
+         ├─ source_id              # path-free owner identity
+         ├─ content_sha256         # full digest
+         ├─ reference_count        # Memory adapter 聚合的活跃引用数
+         └─ retain_until?          # 可选租约截止时间
+```
+
+`ArtifactRetentionClaim` 刻意没有路径。清理器只解析 `artifact:<session>:<filename>:<digest>`，并要求 session 与当前 `ToolResultExternalizer` 一致；文件最终位置只能从可信 `session_dir/tool-results` 推导。跨 session claim、路径分量和不匹配 digest 在删除前就会被拒绝。
+
+清理分成两个阶段：
+
+1. `plan_cleanup()` 只读扫描，流式计算 SHA-256，并冻结 size、mtime、device 与 inode 快照；默认 policy 为 dry-run。
+2. `apply_cleanup()` 只处理计划中的 `planned_delete`，并强制接收执行时的当前 claim 视图；新增 active claim 会保留文件。删除前还会重新检查 ownership、文件类型、快照和 digest，任何变化都 fail-closed。
+
+| 状态 | 含义 | 是否删除 |
+|---|---|---|
+| `retained_referenced` | active claim 与完整 digest 都匹配 | 否 |
+| `retained_recent` | 尚未达到 orphan TTL | 否 |
+| `retained_limit` | 本轮达到最大删除数量 | 否 |
+| `retained_unknown` / `denied` | 非 S13 文件、目录或符号链接边界 | 否 |
+| `retained_corrupt` | claim 与文件 digest/快照矛盾 | 否 |
+| `missing_referenced` | active claim 指向的 artifact 已不存在 | 无文件可删，显式报告悬空引用 |
+| `planned_delete` | 已过 TTL 且没有 active claim | dry-run 仅报告 |
+| `deleted` | apply 阶段重验成功 | 是 |
+| `already_missing` / `race_detected` | 重复执行或 plan 后文件发生变化 | 否 |
+
+```python
+claim = ArtifactRetentionClaim.from_memory_reference(
+    memory_reference,
+    reference_count=2,
+    retain_until="2026-09-01T00:00:00+00:00",
+)
+policy = ArtifactCleanupPolicy(
+    orphan_ttl_seconds=24 * 60 * 60,
+    max_deletions=100,
+    dry_run=False,
+)
+plan = externalizer.plan_cleanup((claim,), policy=policy)
+report = externalizer.apply_cleanup(plan, claims=(claim,))
+```
+
+`reference_count` 由可信 Memory adapter 聚合，不让模型直接声明；claim 缺席或租约过期后，文件仍必须超过 orphan TTL 才有资格删除。非 dry-run apply 若没有显式的当前 claim 视图会直接拒绝，调用方应在同一一致性边界内读取 claims 并执行 apply。cleanup plan/report 只公开 filename、source ID、digest、age 和 reason，不泄露或接受物理路径。这个教学实现把竞态窗口压缩到删除前的 claim 与文件二次校验；生产系统若有并发 writer，还应增加 session lease、目录锁或对象存储条件删除。
 
 ### 按需读取 (Read = 缺页中断)
 
@@ -403,16 +462,24 @@ if (resultSize > CODEBUDDY_TOOL_RESULT_THRESHOLD_KB * 1024) {
    - `for_memory()` 进一步生成瘦引用；没有 `content` 字段，也不复制 pointer 中的预览
    - 读取路径被限制在当前 session 的 `tool-results/` 下，pointer 不能变成任意文件读取入口
 
-3. **`MockLLM`** — 模拟 LLM 的行为
+3. **`ArtifactRetentionClaim` / `ArtifactCleanupPolicy`** — 引用租约与清理策略
+   - claim 只携带 typed source ID、完整 digest、引用计数与可选过期时间，不接受 Memory 路径
+   - policy 显式控制 orphan TTL、最大删除数量和 dry-run
+
+4. **`ArtifactCleanupPlan` / `ArtifactCleanupReport`** — 两阶段、可审计清理
+   - plan 冻结文件快照并解释每个 retain/delete 决策，不产生写操作
+   - apply 重验归属、identity 与 digest；支持竞态检测和重复执行幂等
+
+5. **`MockLLM`** — 模拟 LLM 的行为
    - 按预设脚本生成工具调用
    - 看到外部化指针时，决定是否触发"缺页中断"（调 Read 读完整输出）
 
-4. **Agent 循环** — 集成外部化
+6. **Agent 循环** — 集成外部化
    - 工具执行后检查是否需要外部化
    - 需要则写 artifact + 生成结构化 reference + 替换上下文内容
    - 打印 `[externalize]` 日志，显示节省效果
 
-5. **Demo 场景** — 完整演示
+7. **Demo 场景** — 完整演示
    - 模拟一条产生 1.3MB 输出的 grep 命令
    - 展示外部化前后的上下文大小对比
    - 模拟 agent 需要完整输出时的缺页中断
@@ -442,7 +509,7 @@ python s13_output_externalization/code.py
 ## 练习
 
 1. 当前 `make_pointer` 保留 head 6KB + tail 24KB。如果 agent 最常需要的是输出的中间部分（比如第 40000 行的错误），怎么改进预览策略？提示：考虑基于正则匹配的关键行提取，或分块索引。
-2. 给 `ToolResultExternalizer` 加一个清理机制：会话结束时删除未被引用的 `tool-results/` 文件。但如果 Memory 仍持有某个 `ArtifactMemoryReference`，清理器应如何用 source ID、TTL 和引用计数避免产生悬空指针？
+2. 把进程内的 retention claims 持久化为 append-only lease journal，并实现 crash recovery。证明“引用写入成功但 claim 尚未落盘”时清理器仍然 fail-closed。
 3. 当前的 `should_externalize` 只看输出大小。如果一条命令的输出是 30KB 的随机字符串（对 agent 无用）vs 30KB 的结构化 JSON（每行都有用），应该用不同策略吗？思考：能否让外部化策略感知输出的信息密度？
 
 ---

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 660" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0,0 L10,5 L0,10 Z" fill="#1a73e8"/>
@@ -20,11 +20,11 @@
   </defs>
 
   <!-- Background -->
-  <rect width="800" height="560" fill="#f8f9fa"/>
+  <rect width="800" height="660" fill="#f8f9fa"/>
 
   <!-- Title -->
   <text x="400" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#202124">工具输出外部化 (Output Swap)</text>
-  <text x="400" y="60" text-anchor="middle" font-size="13" fill="#5f6368">完整正文归 Artifact；Context 与 Memory 只保存有来源的有界引用</text>
+  <text x="400" y="60" text-anchor="middle" font-size="13" fill="#5f6368">完整正文归 Artifact；Context / Memory 留有界引用；GC 按租约与 digest 回收孤儿</text>
 
   <!-- ===== LEFT: 上下文窗口 (RAM) ===== -->
   <rect x="40" y="110" width="280" height="200" rx="12" fill="url(#ram-grad)" stroke="#1a73e8" stroke-width="2"/>
@@ -113,4 +113,19 @@
   <text x="430" y="469" font-size="14" font-weight="700" fill="#1a73e8">Bash 输出 ≤ 30K chars</text>
   <text x="430" y="489" font-size="12" fill="#5f6368">→ 直接进入当前上下文</text>
   <text x="430" y="508" font-size="11" fill="#5f6368">仍不等于自动写入长期 Memory</text>
+
+  <!-- ===== Reference-aware lifecycle ===== -->
+  <rect x="40" y="555" width="720" height="88" rx="12" fill="#ffffff" stroke="#f9ab00" stroke-width="1.5"/>
+  <text x="60" y="577" font-size="13" font-weight="700" fill="#a15c00">引用感知 GC（session close / scheduled cleanup）</text>
+  <rect x="60" y="588" width="190" height="38" rx="7" fill="#fff7e0" stroke="#f9ab00"/>
+  <text x="155" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#a15c00">RetentionClaim</text>
+  <text x="155" y="618" text-anchor="middle" font-size="9" fill="#5f6368">source ID + digest + lease</text>
+  <line x1="250" y1="607" x2="292" y2="607" stroke="#f9ab00" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <rect x="300" y="588" width="200" height="38" rx="7" fill="#e8f0fe" stroke="#1a73e8"/>
+  <text x="400" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#174ea6">plan → snapshot → recheck</text>
+  <text x="400" y="618" text-anchor="middle" font-size="9" fill="#5f6368">identity + mtime + size + SHA-256</text>
+  <line x1="500" y1="607" x2="542" y2="607" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <rect x="550" y="588" width="190" height="38" rx="7" fill="#e6f4ea" stroke="#34a853"/>
+  <text x="645" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#137333">retain / delete orphan</text>
+  <text x="645" y="618" text-anchor="middle" font-size="9" fill="#5f6368">异常或竞态一律 fail-closed</text>
 </svg>

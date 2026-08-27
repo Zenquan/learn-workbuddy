@@ -15,6 +15,7 @@ import argparse
 import copy
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -181,6 +182,16 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         summary="Build verification completed for the layered memory walkthrough.",
     )
     artifact_memory = externalized.artifact.for_memory()
+    orphaned_artifact = externalizer.externalize(
+        "temporary diagnostic output",
+        "search",
+        summary="Temporary diagnostic output with no durable owner.",
+    ).artifact
+    for artifact_path in (externalized.artifact.path, orphaned_artifact.path):
+        os.utime(
+            artifact_path,
+            (recorded_at.timestamp(), recorded_at.timestamp()),
+        )
     _print_stage(2, "Artifact reference", artifact_memory.source.source_id)
 
     # 3. Workspace memory keeps project facts in an append log, then distills
@@ -295,10 +306,31 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         as_of=as_of,
     )
     restarted_externalizer = chapters.s13.ToolResultExternalizer(artifact_session)
+    cleanup_claim = chapters.s13.ArtifactRetentionClaim.from_memory_reference(
+        artifact_memory,
+    )
+    cleanup_plan = restarted_externalizer.plan_cleanup(
+        (cleanup_claim,),
+        policy=chapters.s13.ArtifactCleanupPolicy(
+            orphan_ttl_seconds=24 * 60 * 60,
+            dry_run=False,
+        ),
+        now=as_of,
+    )
+    cleanup_report = restarted_externalizer.apply_cleanup(
+        cleanup_plan,
+        claims=(cleanup_claim,),
+        now=as_of,
+    )
     recovered_artifact_head = restarted_externalizer.read_artifact(
         externalized.artifact,
         offset=0,
         limit=2,
+    )
+    _print_stage(
+        6,
+        "Reference-aware artifact cleanup",
+        "referenced retained=1; expired orphan deleted=1",
     )
 
     durable_state = chapters.s14.DurableContextState(
@@ -358,6 +390,9 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         compacted.durable_state,
         source_resolver,
     )
+    orphan_resolution = source_resolver.resolve(
+        orphaned_artifact.source.source_id,
+    )
     durable_context = chapters.s14.render_durable_context(
         compacted.durable_state,
         source_resolutions=source_resolutions,
@@ -375,7 +410,7 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         and messages == original_messages
     )
     _print_stage(
-        6,
+        7,
         "Compaction boundary",
         f"layers={','.join(compacted.applied_layers)}; "
         f"durable preserved={durable_state_preserved}; "
@@ -405,6 +440,16 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         "artifact_recovered_with_digest": (
             "build verification log" in recovered_artifact_head
             and len(artifact_memory.content_sha256) == 64
+        ),
+        "artifact_cleanup_preserved_references": (
+            cleanup_report.counts == {
+                "retained_referenced": 1,
+                "deleted": 1,
+            }
+            and externalized.artifact.path.exists()
+            and not orphaned_artifact.path.exists()
+            and orphan_resolution.status
+            is chapters.s14.SourceResolutionStatus.MISSING
         ),
         "compaction_exercised": bool(compacted.applied_layers),
         "adversarial_summary_exercised": poisoned_summary_visible,
@@ -439,7 +484,13 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
             "query_id": recovered_recall.query.query_id,
             "hits": [hit.to_dict() for hit in recovered_recall.hits],
         },
-        "artifact": artifact_memory.to_dict(),
+        "artifact": {
+            "reference": artifact_memory.to_dict(),
+            "cleanup": cleanup_report.to_dict(),
+            "orphan_resolution": orphan_resolution.to_dict(
+                include_excerpt=False,
+            ),
+        },
         "compaction": {
             "applied_layers": list(compacted.applied_layers),
             "tokens_before": compacted.tokens_before,

@@ -43,15 +43,19 @@ Teaching version uses: 4-chars ≈ 1-token estimation, simple thresholds.
 Usage:
     python s14_context_compact/code.py
 """
+import codecs
 import copy
+import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 # Machine-readable learning path metadata. Tests enforce that every
@@ -64,6 +68,7 @@ PROGRESSION = {
         "structured compaction",
         "durable state preservation",
         "selected retrieval evidence retention",
+        "typed source pointer verification",
     ],
     "preserves": [
         "externalized output pointers",
@@ -159,6 +164,376 @@ def _confirmed_at(value: str) -> str:
     """Validate a durable fact or pending item's confirmation time."""
 
     return _zoned_timestamp(value, field_name="last_confirmed_at")
+
+
+MAX_SOURCE_EXCERPT_CHARS = 2_000
+MAX_TRANSCRIPT_RECORD_CHARS = 100_000
+_SOURCE_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_ARTIFACT_DIGEST_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{12}|[0-9a-fA-F]{64})$")
+_EVIDENCE_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+class SourcePointerError(ValueError):
+    """Base class for source identifiers rejected at the Harness boundary."""
+
+
+class UnsupportedSourcePointerError(SourcePointerError):
+    """Raised when no trusted resolver owns a source pointer scheme."""
+
+
+class SourceEvidenceCorruptionError(RuntimeError):
+    """Raised internally when located bytes contradict their source identity."""
+
+
+class SourcePointerKind(str, Enum):
+    TRANSCRIPT = "transcript"
+    ARTIFACT = "artifact"
+
+
+class SourceResolutionStatus(str, Enum):
+    AVAILABLE = "available"
+    MISSING = "missing"
+    DENIED = "denied"
+    CORRUPT = "corrupt"
+    UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class ParsedSourcePointer:
+    """A path-free identifier parsed before any filesystem lookup occurs."""
+
+    raw: str
+    kind: SourcePointerKind
+    session_id: str
+    sequence: int | None = None
+    artifact_name: str | None = None
+    digest_prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceResolution:
+    """Immutable verification result; excerpts are never auto-injected in Prompt."""
+
+    pointer: str
+    status: SourceResolutionStatus
+    source_type: str | None
+    evidence_sha256: str | None = None
+    excerpt: str | None = None
+    reason: str | None = None
+
+    def to_dict(self, *, include_excerpt: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "pointer": self.pointer,
+            "status": self.status.value,
+            "source_type": self.source_type,
+            "evidence_sha256": self.evidence_sha256,
+            "reason": self.reason,
+        }
+        if include_excerpt:
+            payload["excerpt"] = self.excerpt
+        return payload
+
+
+def _source_component(value: str, *, field_name: str) -> str:
+    if value in {".", ".."} or not _SOURCE_COMPONENT_PATTERN.fullmatch(value):
+        raise SourcePointerError(
+            f"{field_name} must be one path-free identifier component"
+        )
+    return value
+
+
+def parse_source_pointer(value: str) -> ParsedSourcePointer:
+    """Parse only the two evidence schemes owned by earlier chapters.
+
+    Identifiers never carry a user-controlled path.  Filesystem roots belong
+    to the trusted resolver configuration, while the pointer contributes only
+    validated session, sequence, filename, and digest components.
+    """
+
+    raw = str(value)
+    if not raw or any(character.isspace() for character in raw):
+        raise SourcePointerError("source pointer must be non-empty and path-free")
+    scheme = raw.partition(":")[0]
+    if scheme not in {kind.value for kind in SourcePointerKind}:
+        raise UnsupportedSourcePointerError(f"unsupported source scheme: {scheme}")
+    parts = raw.split(":")
+    if scheme == SourcePointerKind.TRANSCRIPT.value:
+        if len(parts) != 3:
+            raise SourcePointerError(
+                "transcript pointer must be transcript:<session>:<sequence>"
+            )
+        session_id = _source_component(parts[1], field_name="transcript session")
+        if not parts[2].isdigit() or int(parts[2]) < 1:
+            raise SourcePointerError("transcript sequence must be a positive integer")
+        return ParsedSourcePointer(
+            raw=raw,
+            kind=SourcePointerKind.TRANSCRIPT,
+            session_id=session_id,
+            sequence=int(parts[2]),
+        )
+
+    if len(parts) != 4:
+        raise SourcePointerError(
+            "artifact pointer must be artifact:<session>:<filename>:<digest>"
+        )
+    session_id = _source_component(parts[1], field_name="artifact session")
+    artifact_name = _source_component(parts[2], field_name="artifact filename")
+    if not _ARTIFACT_DIGEST_PATTERN.fullmatch(parts[3]):
+        raise SourcePointerError("artifact digest must contain 12 or 64 hex characters")
+    return ParsedSourcePointer(
+        raw=raw,
+        kind=SourcePointerKind.ARTIFACT,
+        session_id=session_id,
+        artifact_name=artifact_name,
+        digest_prefix=parts[3].lower(),
+    )
+
+
+class SourcePointerResolver:
+    """Resolve source IDs beneath trusted roots with bounded evidence reads."""
+
+    def __init__(
+        self,
+        *,
+        transcript_root: Path,
+        artifact_root: Path,
+        authorize: Callable[[ParsedSourcePointer], bool] | None = None,
+        max_excerpt_chars: int = MAX_SOURCE_EXCERPT_CHARS,
+    ):
+        if (
+            isinstance(max_excerpt_chars, bool)
+            or not isinstance(max_excerpt_chars, int)
+            or max_excerpt_chars < 1
+        ):
+            raise ValueError("max_excerpt_chars must be a positive integer")
+        if authorize is not None and not callable(authorize):
+            raise TypeError("authorize must be callable")
+        self.transcript_root = Path(transcript_root).expanduser().resolve()
+        self.artifact_root = Path(artifact_root).expanduser().resolve()
+        self.authorize = authorize or (lambda _pointer: True)
+        self.max_excerpt_chars = int(max_excerpt_chars)
+
+    @staticmethod
+    def _result(
+        pointer: str,
+        status: SourceResolutionStatus,
+        *,
+        source_type: str | None,
+        evidence_sha256: str | None = None,
+        excerpt: str | None = None,
+        reason: str | None = None,
+    ) -> SourceResolution:
+        return SourceResolution(
+            pointer=pointer,
+            status=status,
+            source_type=source_type,
+            evidence_sha256=evidence_sha256,
+            excerpt=excerpt,
+            reason=reason,
+        )
+
+    def resolve(self, pointer: str) -> SourceResolution:
+        raw = str(pointer)
+        try:
+            parsed = parse_source_pointer(raw)
+        except UnsupportedSourcePointerError:
+            return self._result(
+                raw,
+                SourceResolutionStatus.UNSUPPORTED,
+                source_type=None,
+                reason="unsupported_scheme",
+            )
+        except SourcePointerError:
+            return self._result(
+                raw,
+                SourceResolutionStatus.CORRUPT,
+                source_type=raw.partition(":")[0] or None,
+                reason="malformed_pointer",
+            )
+
+        try:
+            allowed = bool(self.authorize(parsed))
+        except PermissionError:
+            allowed = False
+        if not allowed:
+            return self._result(
+                raw,
+                SourceResolutionStatus.DENIED,
+                source_type=parsed.kind.value,
+                reason="policy_denied",
+            )
+
+        try:
+            if parsed.kind is SourcePointerKind.TRANSCRIPT:
+                return self._resolve_transcript(parsed)
+            return self._resolve_artifact(parsed)
+        except PermissionError:
+            return self._result(
+                raw,
+                SourceResolutionStatus.DENIED,
+                source_type=parsed.kind.value,
+                reason="filesystem_denied",
+            )
+        except SourceEvidenceCorruptionError as exc:
+            return self._result(
+                raw,
+                SourceResolutionStatus.CORRUPT,
+                source_type=parsed.kind.value,
+                reason=str(exc),
+            )
+        except UnicodeDecodeError:
+            return self._result(
+                raw,
+                SourceResolutionStatus.CORRUPT,
+                source_type=parsed.kind.value,
+                reason="source_not_utf8",
+            )
+        except FileNotFoundError:
+            return self._result(
+                raw,
+                SourceResolutionStatus.MISSING,
+                source_type=parsed.kind.value,
+                reason="source_disappeared",
+            )
+        except OSError:
+            return self._result(
+                raw,
+                SourceResolutionStatus.CORRUPT,
+                source_type=parsed.kind.value,
+                reason="source_read_failed",
+            )
+
+    def _resolve_transcript(self, pointer: ParsedSourcePointer) -> SourceResolution:
+        transcript_path = self.transcript_root / f"{pointer.session_id}.jsonl"
+        candidate = transcript_path.resolve()
+        if candidate.parent != self.transcript_root:
+            return self._result(
+                pointer.raw,
+                SourceResolutionStatus.DENIED,
+                source_type=pointer.kind.value,
+                reason="ownership_boundary",
+            )
+        if not candidate.exists():
+            return self._result(
+                pointer.raw,
+                SourceResolutionStatus.MISSING,
+                source_type=pointer.kind.value,
+                reason="transcript_missing",
+            )
+        if not candidate.is_file():
+            raise SourceEvidenceCorruptionError("transcript_not_a_file")
+
+        assert pointer.sequence is not None
+        with candidate.open("r", encoding="utf-8") as handle:
+            for expected_sequence, line in enumerate(handle, start=1):
+                if len(line) > MAX_TRANSCRIPT_RECORD_CHARS:
+                    raise SourceEvidenceCorruptionError("transcript_record_too_large")
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SourceEvidenceCorruptionError(
+                        "transcript_invalid_json"
+                    ) from exc
+                if not isinstance(event, dict):
+                    raise SourceEvidenceCorruptionError("transcript_record_not_object")
+                sequence = event.get("sequence", expected_sequence)
+                session_id = event.get("session_id", pointer.session_id)
+                expected_event_id = (
+                    f"transcript:{pointer.session_id}:{expected_sequence}"
+                )
+                event_id = event.get("event_id", expected_event_id)
+                if type(sequence) is not int or sequence != expected_sequence:
+                    raise SourceEvidenceCorruptionError("transcript_sequence_mismatch")
+                if session_id != pointer.session_id:
+                    raise SourceEvidenceCorruptionError("transcript_session_mismatch")
+                if event_id != expected_event_id:
+                    raise SourceEvidenceCorruptionError("transcript_event_id_mismatch")
+                if expected_sequence != pointer.sequence:
+                    continue
+                encoded = line.rstrip("\r\n").encode("utf-8")
+                content = event.get("content", event)
+                if not isinstance(content, str):
+                    content = json.dumps(content, ensure_ascii=False, sort_keys=True)
+                return self._result(
+                    pointer.raw,
+                    SourceResolutionStatus.AVAILABLE,
+                    source_type=pointer.kind.value,
+                    evidence_sha256=hashlib.sha256(encoded).hexdigest(),
+                    excerpt=content[: self.max_excerpt_chars],
+                    reason="verified_transcript_event",
+                )
+        return self._result(
+            pointer.raw,
+            SourceResolutionStatus.MISSING,
+            source_type=pointer.kind.value,
+            reason="transcript_event_missing",
+        )
+
+    def _resolve_artifact(self, pointer: ParsedSourcePointer) -> SourceResolution:
+        assert pointer.artifact_name is not None
+        assert pointer.digest_prefix is not None
+        owned_root = (
+            self.artifact_root / pointer.session_id / "tool-results"
+        ).resolve()
+        if not owned_root.is_relative_to(self.artifact_root):
+            return self._result(
+                pointer.raw,
+                SourceResolutionStatus.DENIED,
+                source_type=pointer.kind.value,
+                reason="ownership_boundary",
+            )
+        candidate = (owned_root / pointer.artifact_name).resolve()
+        if candidate.parent != owned_root:
+            return self._result(
+                pointer.raw,
+                SourceResolutionStatus.DENIED,
+                source_type=pointer.kind.value,
+                reason="ownership_boundary",
+            )
+        if not candidate.exists():
+            return self._result(
+                pointer.raw,
+                SourceResolutionStatus.MISSING,
+                source_type=pointer.kind.value,
+                reason="artifact_missing",
+            )
+        if not candidate.is_file():
+            raise SourceEvidenceCorruptionError("artifact_not_a_file")
+
+        digest = hashlib.sha256()
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        excerpt_parts: list[str] = []
+        excerpt_length = 0
+        with candidate.open("rb") as handle:
+            while chunk := handle.read(64 * 1024):
+                digest.update(chunk)
+                try:
+                    decoded = decoder.decode(chunk)
+                except UnicodeDecodeError as exc:
+                    raise SourceEvidenceCorruptionError(
+                        "artifact_not_utf8"
+                    ) from exc
+                if excerpt_length < self.max_excerpt_chars:
+                    remaining = self.max_excerpt_chars - excerpt_length
+                    excerpt_parts.append(decoded[:remaining])
+                    excerpt_length += len(decoded[:remaining])
+        try:
+            tail = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise SourceEvidenceCorruptionError("artifact_not_utf8") from exc
+        if excerpt_length < self.max_excerpt_chars:
+            excerpt_parts.append(tail[: self.max_excerpt_chars - excerpt_length])
+        actual_digest = digest.hexdigest()
+        if not actual_digest.startswith(pointer.digest_prefix):
+            raise SourceEvidenceCorruptionError("artifact_digest_mismatch")
+        return self._result(
+            pointer.raw,
+            SourceResolutionStatus.AVAILABLE,
+            source_type=pointer.kind.value,
+            evidence_sha256=actual_digest,
+            excerpt="".join(excerpt_parts),
+            reason="verified_artifact",
+        )
 
 
 @dataclass(frozen=True)
@@ -341,6 +716,19 @@ class DurableContextState:
             raise ValueError("retrieval evidence memory ids must be unique")
 
 
+def resolve_durable_sources(
+    state: DurableContextState,
+    resolver: SourcePointerResolver,
+) -> tuple[SourceResolution, ...]:
+    """Resolve each distinct durable pointer once, outside lossy compaction."""
+
+    pointers = dict.fromkeys(
+        [item.source_pointer for item in state.facts]
+        + [item.source_pointer for item in state.pending_items]
+    )
+    return tuple(resolver.resolve(pointer) for pointer in pointers)
+
+
 EMPTY_DURABLE_STATE = DurableContextState()
 
 
@@ -355,25 +743,75 @@ class CompactionResult:
     applied_layers: tuple[str, ...]
 
 
-def render_durable_context(state: DurableContextState) -> str:
-    """Render source-bearing state separately from a generated conversation summary."""
+def render_durable_context(
+    state: DurableContextState,
+    *,
+    source_resolutions: Sequence[SourceResolution] | None = None,
+) -> str:
+    """Render durable state without treating unavailable evidence as verified."""
 
     if not state.facts and not state.pending_items and not state.retrieval_evidence:
         return ""
+    resolution_by_pointer: dict[str, SourceResolution] | None = None
+    if source_resolutions is not None:
+        resolution_by_pointer = {}
+        for resolution in source_resolutions:
+            if resolution.pointer in resolution_by_pointer:
+                raise ValueError(
+                    f"duplicate source resolution: {resolution.pointer}"
+                )
+            resolution_by_pointer[resolution.pointer] = resolution
+        expected_pointers = {
+            item.source_pointer for item in (*state.facts, *state.pending_items)
+        }
+        if set(resolution_by_pointer) != expected_pointers:
+            raise ValueError(
+                "source resolutions must match every durable source pointer exactly"
+            )
+
+    def source_status(pointer: str) -> str:
+        if resolution_by_pointer is None:
+            return ""
+        resolution = resolution_by_pointer[pointer]
+        if resolution.status is SourceResolutionStatus.AVAILABLE:
+            if not resolution.evidence_sha256 or not _EVIDENCE_SHA256_PATTERN.fullmatch(
+                resolution.evidence_sha256
+            ):
+                raise ValueError(
+                    f"available source {pointer} must carry a full SHA-256 digest"
+                )
+            return (
+                f"; source_status=available; "
+                f"evidence_sha256={resolution.evidence_sha256}"
+            )
+        return (
+            f"; source_status={resolution.status.value}; "
+            "evidence_unavailable=true"
+        )
+
+    def rendered_pointer(pointer: str) -> str:
+        # Keep ordinary IDs readable while preventing control characters in an
+        # untrusted pointer from creating new Prompt lines.
+        return json.dumps(pointer, ensure_ascii=False)[1:-1]
+
     lines = ["[Durable context — do not reinterpret as conversation summary]"]
     if state.facts:
         lines.append("Confirmed facts:")
         for fact in state.facts:
             lines.append(
                 f"- {fact.fact_id}: {fact.content} "
-                f"(source={fact.source_pointer}; confirmed={fact.last_confirmed_at})"
+                f"(source={rendered_pointer(fact.source_pointer)}"
+                f"{source_status(fact.source_pointer)}; "
+                f"confirmed={fact.last_confirmed_at})"
             )
     if state.pending_items:
         lines.append("Pending work:")
         for item in state.pending_items:
             lines.append(
                 f"- {item.item_id}: {item.description} "
-                f"(source={item.source_pointer}; confirmed={item.last_confirmed_at})"
+                f"(source={rendered_pointer(item.source_pointer)}"
+                f"{source_status(item.source_pointer)}; "
+                f"confirmed={item.last_confirmed_at})"
             )
     if state.retrieval_evidence:
         lines.append("Selected retrieval evidence:")

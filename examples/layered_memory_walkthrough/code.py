@@ -347,8 +347,26 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         messages,
         durable_state,
     )
-    durable_context = chapters.s14.render_durable_context(compacted.durable_state)
+    # The fresh resolver receives trusted ownership roots, not paths supplied
+    # by durable text. It locates both sources from their typed identifiers and
+    # reports verification state without injecting source excerpts into Prompt.
+    source_resolver = chapters.s14.SourcePointerResolver(
+        transcript_root=home / "transcripts",
+        artifact_root=home,
+    )
+    source_resolutions = chapters.s14.resolve_durable_sources(
+        compacted.durable_state,
+        source_resolver,
+    )
+    durable_context = chapters.s14.render_durable_context(
+        compacted.durable_state,
+        source_resolutions=source_resolutions,
+    )
     poisoned_summary_visible = "migration is complete" in str(compacted.messages).lower()
+    verified_source_count = sum(
+        resolution.status is chapters.s14.SourceResolutionStatus.AVAILABLE
+        for resolution in source_resolutions
+    )
     durable_state_preserved = (
         compacted.durable_state is durable_state
         and first_fact.content in durable_context
@@ -359,7 +377,9 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
     _print_stage(
         6,
         "Compaction boundary",
-        f"layers={','.join(compacted.applied_layers)}; durable preserved={durable_state_preserved}",
+        f"layers={','.join(compacted.applied_layers)}; "
+        f"durable preserved={durable_state_preserved}; "
+        f"sources verified={verified_source_count}",
     )
 
     curated_payload = json.loads(
@@ -389,6 +409,7 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         "compaction_exercised": bool(compacted.applied_layers),
         "adversarial_summary_exercised": poisoned_summary_visible,
         "durable_state_preserved": durable_state_preserved,
+        "source_pointers_verified": verified_source_count == 2,
     }
     artifacts = {
         "transcript": str(transcript_path),
@@ -424,6 +445,10 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
             "tokens_before": compacted.tokens_before,
             "tokens_after": compacted.tokens_after,
             "durable_context": durable_context,
+            "source_resolutions": [
+                resolution.to_dict(include_excerpt=False)
+                for resolution in source_resolutions
+            ],
         },
     }
     payload = {

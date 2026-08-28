@@ -1119,7 +1119,22 @@ class ComprehensiveAgent:
             iterations += 1
 
             # s14: Context compaction
-            compaction = compact_context(self.messages, self.durable_state)
+            try:
+                compaction = compact_context(self.messages, self.durable_state)
+            except self.s14.MessageViewLimitExceeded as exc:
+                # The audit entry explains why this turn stopped without
+                # copying the potentially huge or sensitive message content.
+                self.audit.append(
+                    "message_view_limit_exceeded",
+                    {
+                        "tokens_before": exc.tokens_before,
+                        "tokens_after": exc.tokens_after,
+                        "hard_limit": exc.hard_limit,
+                        "applied_layers": list(exc.applied_layers),
+                    },
+                    "blocked",
+                )
+                raise
             self.messages = compaction.messages
             self.durable_state = compaction.durable_state
 

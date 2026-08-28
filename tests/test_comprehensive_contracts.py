@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -166,6 +167,47 @@ def test_s14_compaction_cannot_rewrite_or_backfill_retrieval_proof(
     assert result["memory_id"] in proof
     assert result["loser_memory_id"] not in proof
     assert f"conflict_winner={s24.RAG_MEMORY_CONFLICT_KEY}" in proof
+
+
+def test_comprehensive_agent_blocks_over_limit_view_before_provider(
+    s24,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    agent = s24.ComprehensiveAgent()
+    monkeypatch.setattr(agent.s14, "TOKEN_THRESHOLD", 10)
+    monkeypatch.setattr(agent.s14, "HARD_LIMIT", 20)
+
+    class GuardedMessages:
+        calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            pytest.fail("provider must not receive an over-limit message view")
+
+    guarded_messages = GuardedMessages()
+    monkeypatch.setattr(
+        s24,
+        "client",
+        SimpleNamespace(messages=guarded_messages),
+    )
+
+    try:
+        with pytest.raises(agent.s14.MessageViewLimitExceeded):
+            agent.run("oversized " * 200)
+
+        assert guarded_messages.calls == 0
+        blocked = [
+            entry
+            for entry in agent.audit.entries()
+            if entry["action"] == "message_view_limit_exceeded"
+        ][-1]
+        assert blocked["result"] == "blocked"
+        assert blocked["params"]["tokens_after"] >= blocked["params"]["hard_limit"]
+        assert "query" not in blocked["params"]
+    finally:
+        agent.close()
 
 
 def test_replayed_retrieval_evidence_fails_closed_on_selection_mismatch(

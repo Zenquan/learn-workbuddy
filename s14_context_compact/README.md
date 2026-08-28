@@ -14,7 +14,8 @@
 flowchart LR
     A["Transcript-derived messages"] --> B["Deep-copy prompt view"]
     B --> C["L1 truncate → L2 dedup → L3 prune → L4 summary"]
-    C --> D["Compacted messages"]
+    C -->|"below soft threshold or hard limit"| D["Compacted messages"]
+    C -->|"at or above hard limit"| X["MessageViewLimitExceeded"]
     H["Selected MemoryHit"] --> P["capture source / score / rank / conflict"]
     P --> S["DurableContextState"]
     T["Trusted Transcript / Artifact roots"] --> V["SourcePointerResolver"]
@@ -54,6 +55,7 @@ flowchart LR
 - 把核验时读取的 excerpt 自动注入 Prompt，会让外部证据正文绕过既有预算与选择边界。
 - 原地修改 messages 会连带污染 Transcript 回放或调用方保存的证据视图。
 - 摘要生成失败后仍用错误字符串替换旧历史，会静默丢失最后一份可用上下文。
+- 把压缩当成一定成功的操作，会让不可压缩的超长消息继续进入 provider 请求。
 ## 问题
 
 agent 跑得越久，消息历史越长。一次对话可能产生几十条消息——每次工具调用的输入输出都堆在 `messages` 列表里。模型的上下文窗口是有限的（128K、200K，无论多大终归有限），一旦超限，API 直接报错。
@@ -378,21 +380,24 @@ def agent_loop(messages: list, durable_state: DurableContextState, resolver):
         # ... 正常循环 ...
 ```
 
-`compact_context()` 返回 `CompactionResult`，同时记录压缩前后 token 和实际触发的层。它会深拷贝输入 messages，因此原始 Transcript 回放视图不随 L1/L2 的就地整理发生变化。兼容入口 `compact_if_needed()` 仍只返回 messages，方便前面章节的调用方式保持简单。
+`compact_context()` 成功时返回 `CompactionResult`，同时记录压缩前后 token 和实际触发的层。它会深拷贝输入 messages，因此原始 Transcript 回放视图不随 L1/L2 的就地整理发生变化。兼容入口 `compact_if_needed()` 仍只返回 messages，方便前面章节的调用方式保持简单。
+
+四层执行后，如果消息视图仍达到 `HARD_LIMIT`，函数抛出 `MessageViewLimitExceeded`。异常携带压缩前后 token、硬上限和已执行层，不携带消息正文；调用方可以审计阻断原因，同时避免把超长内容复制到日志。
 
 ---
 
 ## 教学版的触发与停止条件
 
-本章只有一个公开触发条件：`estimate_tokens(messages) >= TOKEN_THRESHOLD`。触发后按 L1 → L4 依次尝试；每层结束都重新估算，低于阈值就立即停止。本章没有声称某个外部产品采用特定百分比、内部 Agent 名称或环境变量。
+本章用两个条件承担不同职责：`estimate_tokens(messages) >= TOKEN_THRESHOLD` 是启动压缩的软阈值；`tokens_after >= HARD_LIMIT` 是四层都执行后阻止 provider 请求的硬上限。每层结束都重新估算，低于软阈值就立即停止。本章没有声称某个外部产品采用特定百分比、内部 Agent 名称或环境变量。
 
 ```text
 低于 80,000 tokens ──> 不压缩，返回深拷贝
 达到 80,000 tokens ──> L1 → 检查 → L2 → 检查 → L3 → 检查 → L4
                          └──────── 任一层达标即停止 ────────┘
+L4 后仍达到 120,000 ──> 抛出类型化错误，不请求 provider
 ```
 
-`HARD_LIMIT` 是后续练习可使用的紧急上限常量，当前调度器尚未为它实现第二套策略，因此不能把它描述成已经存在的 emergency 模式。
+这里的 token 估算只覆盖 `messages`。system prompt、工具定义和 provider 自己的精确计数不在本章输入里，因此 `HARD_LIMIT` 是消息视图准入边界，不等同于完整模型上下文上限。
 
 ---
 

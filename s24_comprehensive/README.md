@@ -58,6 +58,7 @@ flowchart LR
 - 串起 block-driven loop、单一工具注册表、显式权限、作用域记忆、JSONL transcript、SQLite 和审计。
 - 复用 S12 `RecallEngine` 与 S15 `select_memory_context`，把 `query → recall → select → context → tool → transcript/memory → restart` 变成一个可回归契约。
 - 复用 S14 `capture_retrieval_evidence()` 与 `compact_context()`，不在综合章维护第二套压缩语义。
+- S14 四层压缩后仍达到消息视图硬上限时，记录阻断审计并在 provider 请求前失败关闭。
 - 用 clean-room Python 证明 WorkBuddy-style harness 的核心可以从零搭建。
 - 把前 23 章收束成一个可运行 mini WorkBuddy。
 
@@ -437,7 +438,7 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 2. 查询交给 S12 `RecallEngine`，得到带 rank、score、scope、provenance 的 `RecallResult`。
 3. S15 把 hit 投影成 candidate，再按 scope、最低分、authority、top-k 和字符/token 预算选择。
 4. S14 只接收 S15 已选 candidate，冻结 source、score、rank 与 conflict winner；rejected candidate 永远不进入 durable state。
-5. S24 调用 S14 公共 `compact_context()`。recalled text 属于可压缩消息，`DurableContextState` 绕过 L1–L4。
+5. S24 调用 S14 公共 `compact_context()`。recalled text 属于可压缩消息，`DurableContextState` 绕过 L1–L4；若四层结束后消息视图仍达到硬上限，类型化错误会在 provider 请求前终止本轮。
 6. recalled text 与 durable proof 分成两个 Prompt 片段：前者提供回答内容，后者只证明选择依据，二者都不能充当指令。
 7. 原有 `ToolRegistry → permission → execute_tool` 执行只读 `list_files`，结果与选择证据按顺序追加到 transcript。
 8. 新建 `Memory`、`Transcript`、`RemoteMemoryStore` 重新读盘；从选择事件重建 evidence，并与同 query 的 `recall_result` 交叉校验。context、durable proof 及其 SHA-256 一并写入 manifest。
@@ -453,7 +454,7 @@ WorkBuddy-style harness = 一个 agent loop (s01)
 - 未包含 evidence schema 的旧事件按“没有持久化 proof”恢复为空状态，不伪造来源；
 - adversarial summary 即使声称应采用 conflict loser，也只能污染 disposable summary，不能改写 `DurableContextState`。
 
-S24 的 `compact_context()` 现在是 S14 的薄 adapter，返回 `CompactionResult`。在线循环和 `/compact` 命令都显式接回 `messages` 与 `durable_state`，并将 applied layers 展示给用户；因此综合章不会再和 S14 各自维护阈值或裁剪策略。
+S24 的 `compact_context()` 现在是 S14 的薄 adapter，成功时返回 `CompactionResult`。在线循环和 `/compact` 命令都显式接回 `messages` 与 `durable_state`，并将 applied layers 展示给用户；因此综合章不会再和 S14 各自维护阈值或裁剪策略。若 S14 抛出 `MessageViewLimitExceeded`，在线循环把压缩前后 token、硬上限和 applied layers 写入审计链后继续抛出，既不记录消息正文，也不调用 provider。
 
 ### 为什么重试不应该再写一份记忆
 

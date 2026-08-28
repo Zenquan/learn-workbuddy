@@ -549,3 +549,47 @@ def test_source_resolution_is_recomputed_after_compaction_and_cleanup(
     )
     assert "All evidence is available" not in rendered
     assert "source_status=missing" in rendered
+def test_irreducible_message_view_fails_closed_without_mutating_evidence(
+    s14, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(s14, "TOKEN_THRESHOLD", 10)
+    monkeypatch.setattr(s14, "HARD_LIMIT", 20)
+    messages = [{"role": "user", "content": "oversized " * 200}]
+    original_messages = copy.deepcopy(messages)
+    state = _durable_state(s14)
+
+    with pytest.raises(s14.MessageViewLimitExceeded) as captured:
+        s14.compact_context(messages, state, verbose=False)
+
+    error = captured.value
+    assert error.tokens_before == error.tokens_after
+    assert error.tokens_after >= error.hard_limit == 20
+    assert error.applied_layers == ()
+    assert messages == original_messages
+    assert state == _durable_state(s14)
+
+
+def test_failed_summary_cannot_release_a_view_above_the_hard_limit(
+    s14, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(s14, "TOKEN_THRESHOLD", 1)
+    monkeypatch.setattr(s14, "HARD_LIMIT", 5)
+    monkeypatch.setattr(s14, "KEEP_RECENT_TURNS", 6)
+    summary_calls: list[str] = []
+
+    def failed_summary(conversation: str) -> str:
+        summary_calls.append(conversation)
+        raise RuntimeError("offline")
+
+    with pytest.raises(s14.MessageViewLimitExceeded) as captured:
+        s14.compact_context(
+            _long_messages(),
+            _durable_state(s14),
+            summarizer=failed_summary,
+            verbose=False,
+        )
+
+    assert summary_calls
+    assert captured.value.tokens_after >= captured.value.hard_limit
+    assert "message_pruning" in captured.value.applied_layers
+    assert "conversation_summary" not in captured.value.applied_layers

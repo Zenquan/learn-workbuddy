@@ -66,6 +66,7 @@ PROGRESSION = {
     "adds": [
         "token pressure detection",
         "structured compaction",
+        "hard message-view ceiling",
         "durable state preservation",
         "selected retrieval evidence retention",
         "typed source pointer verification",
@@ -743,6 +744,32 @@ class CompactionResult:
     applied_layers: tuple[str, ...]
 
 
+class MessageViewLimitExceeded(RuntimeError):
+    """Report an irreducible message view before a provider request is made.
+
+    The limit covers ``messages`` only. System prompts, tool definitions, and
+    provider-specific token accounting remain separate budgets, so callers
+    must not present this estimate as the model's complete context size.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokens_before: int,
+        tokens_after: int,
+        hard_limit: int,
+        applied_layers: tuple[str, ...],
+    ) -> None:
+        self.tokens_before = tokens_before
+        self.tokens_after = tokens_after
+        self.hard_limit = hard_limit
+        self.applied_layers = applied_layers
+        super().__init__(
+            "message view remains above the hard limit after compaction: "
+            f"{tokens_after:,} >= {hard_limit:,} estimated tokens"
+        )
+
+
 def render_durable_context(
     state: DurableContextState,
     *,
@@ -1095,7 +1122,9 @@ def compact_context(
     """Compact an isolated message copy while carrying durable state unchanged.
 
     Tries layers in order: L1 → L2 → L3 → L4.
-    Stops as soon as token count drops below threshold.
+    Stops as soon as token count drops below the soft threshold. If all four
+    layers leave the message view at or above ``HARD_LIMIT``, raises
+    ``MessageViewLimitExceeded`` so a caller cannot accidentally send it.
 
     ``messages`` are a disposable prompt view, so the pipeline may truncate,
     deduplicate, prune, or summarize them. ``durable_state`` is a typed Memory
@@ -1162,6 +1191,17 @@ def compact_context(
         applied_layers.append("conversation_summary")
     if saved > 0 and verbose:
         print(f"\033[33m[compact] L4 生成摘要: 节省 {saved:,} tokens, 当前 {tokens:,}\033[0m")
+
+    # Compaction is best-effort, but provider admission is fail-closed. A
+    # single oversized message or a failed summarizer may be impossible to
+    # shrink; returning that view would merely defer failure to the provider.
+    if tokens >= HARD_LIMIT:
+        raise MessageViewLimitExceeded(
+            tokens_before=tokens_before,
+            tokens_after=tokens,
+            hard_limit=HARD_LIMIT,
+            applied_layers=tuple(applied_layers),
+        )
 
     return CompactionResult(
         messages=working,

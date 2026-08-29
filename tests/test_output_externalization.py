@@ -7,8 +7,10 @@ import importlib.util
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -385,3 +387,444 @@ def test_cleanup_rejects_cross_session_claims_and_symlink_escape(
     assert plan.decisions[0].status is s13.ArtifactCleanupStatus.DENIED
     externalizer.apply_cleanup(plan)
     assert outside.read_text(encoding="utf-8") == "outside owner"
+
+
+def test_retention_journal_survives_restart_and_drives_cleanup(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "journal-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    referenced = externalizer.externalize(
+        "durable referenced evidence",
+        "search",
+        summary="Referenced evidence persisted before cleanup.",
+    ).artifact
+    orphan = externalizer.externalize(
+        "old orphan",
+        "search",
+        summary="Unreferenced diagnostic output.",
+    ).artifact
+    for artifact in (referenced, orphan):
+        _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(referenced.for_memory())
+    published: list[str] = []
+    transaction, result = journal.publish_reference(
+        claim,
+        lambda: published.append(referenced.source.source_id) or "published",
+        transaction_id="publish-reference-1",
+        prepared_at=now - timedelta(minutes=2),
+        committed_at=now - timedelta(minutes=1),
+    )
+
+    assert result == "published"
+    assert published == [referenced.source.source_id]
+    assert transaction.transaction_id == "publish-reference-1"
+    restarted_journal = s13.ArtifactRetentionJournal(session_dir)
+    recovery = restarted_journal.recover(now=now)
+    assert len(recovery.claims) == 1
+    assert recovery.claims[0] == claim
+    assert recovery.pending_transaction_ids == ()
+    assert recovery.states[0].phases == (
+        s13.ArtifactLeasePhase.PREPARED,
+        s13.ArtifactLeasePhase.COMMITTED,
+    )
+    assert str(tmp_path) not in json.dumps(recovery.to_dict(), sort_keys=True)
+    retried_publisher_called = False
+
+    def retried_publisher() -> None:
+        nonlocal retried_publisher_called
+        retried_publisher_called = True
+
+    with pytest.raises(s13.ArtifactLeaseJournalError, match="reconciliation"):
+        restarted_journal.publish_reference(
+            claim,
+            retried_publisher,
+            transaction_id=transaction.transaction_id,
+            prepared_at=now,
+        )
+    assert retried_publisher_called is False
+
+    restarted_externalizer = s13.ToolResultExternalizer(session_dir)
+    with pytest.raises(s13.ArtifactRetentionError, match="journal-aware cleanup"):
+        restarted_externalizer.cleanup_artifacts((claim,), now=now)
+    report = restarted_externalizer.cleanup_artifacts_from_journal(
+        restarted_journal,
+        policy=s13.ArtifactCleanupPolicy(
+            orphan_ttl_seconds=60,
+            dry_run=False,
+        ),
+        now=now,
+    )
+    assert report.counts == {"retained_referenced": 1, "deleted": 1}
+    assert referenced.path.exists()
+    assert not orphan.path.exists()
+
+
+def test_prepared_lease_protects_reference_when_commit_was_not_written(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "prepared-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "memory publication completed before process exit",
+        "search",
+        summary="Reference publication crossed the crash boundary.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    expired_claim = s13.ArtifactRetentionClaim.from_memory_reference(
+        artifact.for_memory(),
+        retain_until=(now - timedelta(hours=1)).isoformat(),
+    )
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    journal.prepare(
+        expired_claim,
+        transaction_id="crash-before-commit",
+        prepared_at=now - timedelta(hours=2),
+    )
+
+    # The external Memory write succeeded, but the process exited before the
+    # committed phase. A fresh journal must keep the uncertain intent alive.
+    memory_publication = tmp_path / "published-reference.json"
+    memory_publication.write_text(
+        json.dumps(artifact.for_memory().to_dict(), sort_keys=True),
+        encoding="utf-8",
+    )
+    restarted = s13.ArtifactRetentionJournal(session_dir)
+    recovery = restarted.recover(now=now)
+    assert recovery.pending_transaction_ids == ("crash-before-commit",)
+    assert recovery.claims[0].retain_until is None
+
+    report = externalizer.cleanup_artifacts_from_journal(
+        restarted,
+        policy=s13.ArtifactCleanupPolicy(
+            orphan_ttl_seconds=60,
+            dry_run=False,
+        ),
+        now=now,
+    )
+    assert report.counts == {"retained_referenced": 1}
+    assert artifact.path.exists()
+
+
+def test_expired_committed_lease_allows_orphan_collection(s13, tmp_path: Path) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "expired-journal-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "expired committed evidence",
+        "search",
+        summary="The committed lease has reached its explicit deadline.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(
+        artifact.for_memory(),
+        retain_until=(now - timedelta(seconds=1)).isoformat(),
+    )
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    journal.prepare(
+        claim,
+        transaction_id="expired-committed-reference",
+        prepared_at=now - timedelta(hours=2),
+    )
+    journal.commit(
+        "expired-committed-reference",
+        committed_at=now - timedelta(hours=1),
+    )
+
+    assert journal.recover(now=now).claims == ()
+    report = externalizer.cleanup_artifacts_from_journal(
+        journal,
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False),
+        now=now,
+    )
+    assert report.counts == {"deleted": 1}
+    assert not artifact.path.exists()
+
+
+def test_failed_reference_publication_aborts_lease(s13, tmp_path: Path) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "aborted-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "publication failure evidence",
+        "search",
+        summary="Reference publisher raises before commit.",
+    ).artifact
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    journal = s13.ArtifactRetentionJournal(session_dir)
+
+    def reject_publication() -> None:
+        raise RuntimeError("memory adapter rejected the write")
+
+    with pytest.raises(RuntimeError, match="rejected the write"):
+        journal.publish_reference(
+            claim,
+            reject_publication,
+            transaction_id="aborted-publication",
+            prepared_at=now,
+        )
+
+    recovery = s13.ArtifactRetentionJournal(session_dir).recover(now=now)
+    assert recovery.claims == ()
+    assert recovery.states[0].current_phase is s13.ArtifactLeasePhase.ABORTED
+
+
+def test_post_fsync_commit_crash_recovers_and_retry_is_idempotent(
+    s13, tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "commit-crash-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "commit crash evidence",
+        "search",
+        summary="Committed phase reaches disk before process exit.",
+    ).artifact
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    transaction = journal.prepare(
+        claim,
+        transaction_id="commit-crash",
+        prepared_at=now - timedelta(minutes=1),
+    )
+
+    def crash_after_fsync(name: str) -> None:
+        if name == "after_committed":
+            raise RuntimeError("simulated process exit after commit fsync")
+
+    monkeypatch.setattr(journal, "_checkpoint", crash_after_fsync)
+    with pytest.raises(RuntimeError, match="after commit fsync"):
+        journal.commit(transaction.transaction_id, committed_at=now)
+
+    restarted = s13.ArtifactRetentionJournal(session_dir)
+    recovery = restarted.recover(now=now)
+    assert recovery.states[0].current_phase is s13.ArtifactLeasePhase.COMMITTED
+    journal_before = restarted.path.read_bytes()
+    restarted.commit(transaction.transaction_id, committed_at=now)
+    assert restarted.path.read_bytes() == journal_before
+
+
+def test_journal_discards_only_partial_tail_and_detects_tampering(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "journal-integrity-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "journal integrity evidence",
+        "search",
+        summary="Journal integrity test artifact.",
+    ).artifact
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    transaction = journal.prepare(
+        claim,
+        transaction_id="integrity-transaction",
+        prepared_at=now - timedelta(minutes=2),
+    )
+    journal.commit(transaction.transaction_id, committed_at=now - timedelta(minutes=1))
+    with journal.path.open("ab") as handle:
+        handle.write(b'{"partial_crash_record":"\xe2\x82')
+
+    assert len(s13.ArtifactRetentionJournal(session_dir).recover(now=now).claims) == 1
+    restarted = s13.ArtifactRetentionJournal(session_dir)
+    restarted.release(transaction.transaction_id, released_at=now)
+    records = [
+        json.loads(line)
+        for line in restarted.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["sequence"] for record in records] == [1, 2, 3]
+
+    valid_journal = restarted.path.read_text(encoding="utf-8")
+    restarted.path.write_text(valid_journal + "{complete bad record}\n", encoding="utf-8")
+    with pytest.raises(s13.ArtifactLeaseJournalError, match="invalid.*JSON"):
+        s13.ArtifactRetentionJournal(session_dir).recover(now=now)
+    restarted.path.write_text(valid_journal, encoding="utf-8")
+
+    records[0]["intent"]["claim"]["reference_count"] = 99
+    restarted.path.write_text(
+        "\n".join(json.dumps(record, sort_keys=True) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(s13.ArtifactLeaseJournalError, match="hash mismatch"):
+        s13.ArtifactRetentionJournal(session_dir).recover(now=now)
+
+
+def test_journal_aggregates_and_releases_multiple_references(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "aggregate-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "shared evidence",
+        "search",
+        summary="Two Memory records reference one Artifact.",
+    ).artifact
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    for transaction_id in ("reference-a", "reference-b"):
+        journal.prepare(claim, transaction_id=transaction_id, prepared_at=now)
+        journal.commit(transaction_id, committed_at=now)
+
+    assert journal.recover(now=now).claims[0].reference_count == 2
+
+    def fail_removal() -> None:
+        raise RuntimeError("reference removal failed")
+
+    with pytest.raises(RuntimeError, match="reference removal failed"):
+        journal.remove_reference(
+            "reference-a",
+            fail_removal,
+            released_at=now,
+        )
+    assert journal.recover(now=now).claims[0].reference_count == 2
+    assert journal.remove_reference(
+        "reference-a",
+        lambda: "removed",
+        released_at=now,
+    ) == "removed"
+    assert journal.recover(now=now).claims[0].reference_count == 1
+    journal.release("reference-b", released_at=now)
+    assert journal.recover(now=now).claims == ()
+
+
+def test_concurrent_journal_writers_preserve_sequence_and_hash_chain(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "concurrent-journal-session"
+    artifact = s13.ToolResultExternalizer(session_dir).externalize(
+        "shared concurrent evidence",
+        "search",
+        summary="Concurrent publishers share one immutable Artifact.",
+    ).artifact
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    writer_count = 6
+    barrier = Barrier(writer_count)
+
+    def prepare(index: int) -> None:
+        writer = s13.ArtifactRetentionJournal(session_dir)
+        barrier.wait()
+        writer.prepare(
+            claim,
+            transaction_id=f"concurrent-reference-{index}",
+            prepared_at=now,
+        )
+
+    with ThreadPoolExecutor(max_workers=writer_count) as executor:
+        list(executor.map(prepare, range(writer_count)))
+
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    recovery = journal.recover(now=now)
+    assert recovery.claims[0].reference_count == writer_count
+    assert len(recovery.pending_transaction_ids) == writer_count
+    records = [
+        json.loads(line)
+        for line in journal.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["sequence"] for record in records] == list(
+        range(1, writer_count + 1)
+    )
+
+
+def test_journal_apply_rechecks_reference_added_after_plan(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "journal-late-claim-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "late durable reference",
+        "search",
+        summary="Reference is published after cleanup planning.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    policy = s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False)
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    plan = externalizer.plan_cleanup_from_journal(journal, policy=policy, now=now)
+
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    journal.publish_reference(
+        claim,
+        lambda: None,
+        transaction_id="late-reference",
+        prepared_at=now,
+        committed_at=now,
+    )
+    report = externalizer.apply_cleanup_from_journal(plan, journal, now=now)
+    assert report.counts == {"retained_referenced": 1}
+    assert artifact.path.exists()
+
+
+def test_reference_publication_is_rejected_when_cleanup_wins_the_lock(
+    s13, tmp_path: Path
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "cleanup-first-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "unowned evidence",
+        "search",
+        summary="Cleanup removes this artifact before publication begins.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    report = externalizer.cleanup_artifacts_from_journal(
+        journal,
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False),
+        now=now,
+    )
+    assert report.counts == {"deleted": 1}
+
+    publisher_called = False
+
+    def publisher() -> None:
+        nonlocal publisher_called
+        publisher_called = True
+
+    with pytest.raises(s13.ArtifactRetentionError, match="missing artifact"):
+        journal.publish_reference(
+            claim,
+            publisher,
+            transaction_id="too-late-reference",
+            prepared_at=now,
+        )
+    assert publisher_called is False
+    assert journal.recover(now=now).states == ()
+
+
+def test_cleanup_rejects_journal_owned_by_another_session(s13, tmp_path: Path) -> None:
+    externalizer = s13.ToolResultExternalizer(tmp_path / "cleanup-owner")
+    other_journal = s13.ArtifactRetentionJournal(tmp_path / "other-owner")
+    with pytest.raises(s13.ArtifactRetentionError, match="different artifact session"):
+        externalizer.plan_cleanup_from_journal(other_journal)
+
+
+def test_retention_journal_rejects_symlink_escape(s13, tmp_path: Path) -> None:
+    session_dir = tmp_path / "journal-symlink-session"
+    artifact = s13.ToolResultExternalizer(session_dir).externalize(
+        "owned artifact",
+        "search",
+        summary="The lease journal must remain in its session root.",
+    ).artifact
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
+    outside = tmp_path / "outside-journal.jsonl"
+    outside.write_text("outside owner\n", encoding="utf-8")
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    try:
+        journal.path.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this platform")
+
+    with pytest.raises(s13.ArtifactLeaseJournalError, match="owned regular file"):
+        journal.prepare(
+            claim,
+            transaction_id="symlink-escape",
+        )
+    assert outside.read_text(encoding="utf-8") == "outside owner\n"

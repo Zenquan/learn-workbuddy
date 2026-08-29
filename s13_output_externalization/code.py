@@ -30,14 +30,23 @@ Usage:
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import tempfile
-from collections.abc import Sequence
+import uuid
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import TypeVar
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 # Machine-readable learning path metadata. Tests enforce that every
 # chapter declares what it inherits and what it adds.
@@ -49,6 +58,7 @@ PROGRESSION = {
         "source-bearing artifact references",
         "page-fault reads",
         "reference-aware artifact retention",
+        "crash-recoverable retention lease journal",
     ],
     "preserves": ["context budget mindset", "memory as a selective derived view"],
 }
@@ -74,6 +84,9 @@ TAIL_BYTES = 24 * 1024                   # 24KB tail in pointer
 SUMMARY_MAX_CHARS = 240                  # bounded text suitable for later retrieval
 ARTIFACT_SOURCE_TYPE = "artifact"
 DEFAULT_ORPHAN_TTL_SECONDS = 24 * 60 * 60
+RETENTION_JOURNAL_SCHEMA_VERSION = 1
+RETENTION_JOURNAL_NAME = "retention-leases.jsonl"
+_ZERO_SHA256 = "0" * 64
 _SOURCE_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _ARTIFACT_DIGEST_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{12}|[0-9a-fA-F]{64})$")
 _FULL_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -92,6 +105,10 @@ class ArtifactRetentionError(ValueError):
     """A retention claim or cleanup plan violated an ownership contract."""
 
 
+class ArtifactLeaseJournalError(RuntimeError):
+    """A durable retention journal is corrupt or used out of phase."""
+
+
 class ArtifactCleanupStatus(str, Enum):
     """Terminal or planned state for one artifact cleanup decision."""
 
@@ -106,6 +123,15 @@ class ArtifactCleanupStatus(str, Enum):
     ALREADY_MISSING = "already_missing"
     RACE_DETECTED = "race_detected"
     DENIED = "denied"
+
+
+class ArtifactLeasePhase(str, Enum):
+    """Durable lifecycle for publishing and later releasing one reference."""
+
+    PREPARED = "prepared"
+    COMMITTED = "committed"
+    RELEASED = "released"
+    ABORTED = "aborted"
 
 
 @dataclass(frozen=True)
@@ -164,6 +190,85 @@ def _parse_aware_utc(value: str, *, field_name: str) -> datetime:
     if parsed.tzinfo is None:
         raise ArtifactRetentionError(f"{field_name} must include a timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def _iso_utc(value: datetime | None = None) -> str:
+    return _aware_utc(value).isoformat()
+
+
+def _canonical_sha256(payload: dict[str, object]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a new journal entry on platforms with directory fsync."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _discard_incomplete_jsonl_tail(path: Path) -> None:
+    """Discard only a final record that never reached a newline boundary."""
+
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("rb+") as handle:
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return
+        handle.seek(0)
+        content = handle.read()
+        last_newline = content.rfind(b"\n")
+        handle.seek(0)
+        handle.truncate(last_newline + 1)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+@contextmanager
+def _exclusive_journal_lock(path: Path) -> Iterator[None]:
+    """Serialize cooperating journal writers and cleanup readers."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise ArtifactLeaseJournalError("retention journal lock is not an owned file")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    locked = False
+    try:
+        if os.name == "nt":
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+_PublicationValue = TypeVar("_PublicationValue")
 
 
 @dataclass(frozen=True)
@@ -286,6 +391,9 @@ class ArtifactRetentionClaim:
             field_name="retain_until",
         ) > _aware_utc(now)
 
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
 
 @dataclass(frozen=True)
 class ArtifactCleanupPolicy:
@@ -381,6 +489,681 @@ class ArtifactCleanupReport:
             "counts": self.counts,
             "decisions": [decision.to_dict() for decision in self.decisions],
         }
+
+
+@dataclass(frozen=True)
+class ArtifactLeaseTransaction:
+    """Immutable intent written before a Memory reference is published."""
+
+    transaction_id: str
+    session_id: str
+    claim: ArtifactRetentionClaim
+    prepared_at: str
+
+    def __post_init__(self) -> None:
+        _source_component(self.transaction_id, field_name="lease transaction ID")
+        session_id = _source_component(self.session_id, field_name="lease session")
+        parsed = parse_artifact_source_id(self.claim.source_id)
+        if parsed.session_id != session_id:
+            raise ArtifactRetentionError(
+                "lease transaction and retention claim sessions differ"
+            )
+        _parse_aware_utc(self.prepared_at, field_name="prepared_at")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "transaction_id": self.transaction_id,
+            "session_id": self.session_id,
+            "claim": self.claim.to_dict(),
+            "prepared_at": self.prepared_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> ArtifactLeaseTransaction:
+        claim_payload = payload.get("claim")
+        if not isinstance(claim_payload, dict):
+            raise ArtifactRetentionError("lease transaction has no retention claim")
+        return cls(
+            transaction_id=str(payload.get("transaction_id", "")),
+            session_id=str(payload.get("session_id", "")),
+            claim=ArtifactRetentionClaim(
+                source_id=str(claim_payload.get("source_id", "")),
+                content_sha256=str(claim_payload.get("content_sha256", "")),
+                reference_count=claim_payload.get("reference_count", 0),
+                retain_until=(
+                    None
+                    if claim_payload.get("retain_until") is None
+                    else str(claim_payload["retain_until"])
+                ),
+            ),
+            prepared_at=str(payload.get("prepared_at", "")),
+        )
+
+
+@dataclass(frozen=True)
+class ArtifactLeaseState:
+    """Recovered phase history for one reference publication transaction."""
+
+    transaction: ArtifactLeaseTransaction
+    phases: tuple[ArtifactLeasePhase, ...]
+
+    @property
+    def current_phase(self) -> ArtifactLeasePhase:
+        return self.phases[-1]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "transaction": self.transaction.to_dict(),
+            "phases": [phase.value for phase in self.phases],
+        }
+
+
+@dataclass(frozen=True)
+class ArtifactLeaseRecovery:
+    """Auditable, path-free claim view rebuilt from the durable journal."""
+
+    session_id: str
+    claims: tuple[ArtifactRetentionClaim, ...]
+    pending_transaction_ids: tuple[str, ...]
+    states: tuple[ArtifactLeaseState, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "claims": [claim.to_dict() for claim in self.claims],
+            "pending_transaction_ids": list(self.pending_transaction_ids),
+            "states": [state.to_dict() for state in self.states],
+        }
+
+
+class ArtifactRetentionJournal:
+    """Crash-recoverable owner for Artifact retention leases.
+
+    A PREPARED intent is durable before the caller publishes a Memory
+    reference. If the process exits after publication but before COMMITTED is
+    appended, recovery still treats PREPARED as an active, unbounded claim.
+    Cleanup and new journal events share one advisory lock so a reference
+    cannot be prepared between the final claim read and artifact deletion.
+    """
+
+    def __init__(self, session_dir: Path):
+        self.session_dir = Path(session_dir)
+        self.session_id = _source_component(
+            self.session_dir.name,
+            field_name="lease session",
+        )
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.session_dir / RETENTION_JOURNAL_NAME
+
+    @staticmethod
+    def _intent_sha256(transaction: ArtifactLeaseTransaction) -> str:
+        return _canonical_sha256(transaction.to_dict())
+
+    @staticmethod
+    def _validate_transition(
+        current: ArtifactLeasePhase | None,
+        requested: ArtifactLeasePhase,
+    ) -> None:
+        allowed = {
+            None: {ArtifactLeasePhase.PREPARED},
+            ArtifactLeasePhase.PREPARED: {
+                ArtifactLeasePhase.COMMITTED,
+                ArtifactLeasePhase.ABORTED,
+            },
+            ArtifactLeasePhase.COMMITTED: {ArtifactLeasePhase.RELEASED},
+            ArtifactLeasePhase.RELEASED: set(),
+            ArtifactLeasePhase.ABORTED: set(),
+        }
+        if requested not in allowed[current]:
+            current_name = "none" if current is None else current.value
+            raise ArtifactLeaseJournalError(
+                f"invalid lease transition: {current_name} -> {requested.value}"
+            )
+
+    def _read_events_unlocked(self) -> list[dict[str, object]]:
+        if not self.path.exists():
+            return []
+        if self.path.is_symlink() or not self.path.is_file():
+            raise ArtifactLeaseJournalError(
+                "retention journal is not an owned regular file"
+            )
+        try:
+            encoded = self.path.read_bytes()
+            durable_end = encoded.rfind(b"\n") + 1
+            durable = encoded[:durable_end]
+            lines = durable.decode("utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError as exc:
+            raise ArtifactLeaseJournalError(
+                "retention journal is not valid UTF-8"
+            ) from exc
+
+        events: list[dict[str, object]] = []
+        previous_hash = _ZERO_SHA256
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                raise ArtifactLeaseJournalError(
+                    f"blank retention journal record at line {line_number}"
+                )
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ArtifactLeaseJournalError(
+                    f"invalid retention journal JSON at line {line_number}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ArtifactLeaseJournalError(
+                    f"retention journal line {line_number} is not an object"
+                )
+            if payload.get("schema_version") != RETENTION_JOURNAL_SCHEMA_VERSION:
+                raise ArtifactLeaseJournalError(
+                    f"unsupported retention journal schema at line {line_number}"
+                )
+            if payload.get("session_id") != self.session_id:
+                raise ArtifactLeaseJournalError(
+                    f"retention journal line {line_number} belongs to another session"
+                )
+            sequence = payload.get("sequence")
+            if (
+                isinstance(sequence, bool)
+                or not isinstance(sequence, int)
+                or sequence != line_number
+            ):
+                raise ArtifactLeaseJournalError(
+                    f"retention journal expected sequence {line_number}"
+                )
+            if payload.get("previous_sha256") != previous_hash:
+                raise ArtifactLeaseJournalError(
+                    f"retention journal hash chain broke at line {line_number}"
+                )
+            event_hash = payload.get("event_sha256")
+            if not isinstance(event_hash, str) or not _FULL_SHA256_PATTERN.fullmatch(
+                event_hash
+            ):
+                raise ArtifactLeaseJournalError(
+                    f"invalid retention event hash at line {line_number}"
+                )
+            unsigned = dict(payload)
+            unsigned.pop("event_sha256")
+            if _canonical_sha256(unsigned) != event_hash:
+                raise ArtifactLeaseJournalError(
+                    f"retention event hash mismatch at line {line_number}"
+                )
+            try:
+                ArtifactLeasePhase(payload.get("phase"))
+                _source_component(
+                    str(payload.get("transaction_id", "")),
+                    field_name="lease transaction ID",
+                )
+                _parse_aware_utc(
+                    str(payload.get("recorded_at", "")),
+                    field_name="recorded_at",
+                )
+            except (ArtifactRetentionError, TypeError, ValueError) as exc:
+                raise ArtifactLeaseJournalError(
+                    f"invalid retention journal fields at line {line_number}"
+                ) from exc
+            intent_hash = payload.get("intent_sha256")
+            if not isinstance(intent_hash, str) or not _FULL_SHA256_PATTERN.fullmatch(
+                intent_hash
+            ):
+                raise ArtifactLeaseJournalError(
+                    f"invalid retention intent hash at line {line_number}"
+                )
+            events.append(payload)
+            previous_hash = event_hash
+        return events
+
+    def _fold_events(
+        self,
+        events: Sequence[dict[str, object]],
+    ) -> tuple[ArtifactLeaseState, ...]:
+        states: dict[str, ArtifactLeaseState] = {}
+        for line_number, payload in enumerate(events, start=1):
+            phase = ArtifactLeasePhase(payload["phase"])
+            transaction_id = str(payload["transaction_id"])
+            intent_hash = str(payload["intent_sha256"])
+            state = states.get(transaction_id)
+            current = None if state is None else state.current_phase
+            self._validate_transition(current, phase)
+            if phase is ArtifactLeasePhase.PREPARED:
+                intent = payload.get("intent")
+                if not isinstance(intent, dict):
+                    raise ArtifactLeaseJournalError(
+                        f"prepared lease at line {line_number} has no intent"
+                    )
+                try:
+                    transaction = ArtifactLeaseTransaction.from_dict(intent)
+                except (ArtifactRetentionError, TypeError, ValueError) as exc:
+                    raise ArtifactLeaseJournalError(
+                        f"invalid lease intent at line {line_number}"
+                    ) from exc
+                if transaction.transaction_id != transaction_id:
+                    raise ArtifactLeaseJournalError(
+                        "lease transaction ID differs from prepared intent"
+                    )
+                if transaction.session_id != self.session_id:
+                    raise ArtifactLeaseJournalError(
+                        "prepared lease belongs to another session"
+                    )
+                if transaction.prepared_at != payload["recorded_at"]:
+                    raise ArtifactLeaseJournalError(
+                        "prepared lease timestamp differs from intent"
+                    )
+                if self._intent_sha256(transaction) != intent_hash:
+                    raise ArtifactLeaseJournalError(
+                        "prepared lease intent hash mismatch"
+                    )
+                states[transaction_id] = ArtifactLeaseState(
+                    transaction=transaction,
+                    phases=(phase,),
+                )
+                continue
+
+            if state is None:
+                raise ArtifactLeaseJournalError(
+                    f"lease transaction {transaction_id} has no prepared intent"
+                )
+            if self._intent_sha256(state.transaction) != intent_hash:
+                raise ArtifactLeaseJournalError(
+                    f"lease transaction {transaction_id} changed intent"
+                )
+            if "intent" in payload:
+                raise ArtifactLeaseJournalError(
+                    f"lease phase {phase.value} unexpectedly repeats its intent"
+                )
+            states[transaction_id] = ArtifactLeaseState(
+                transaction=state.transaction,
+                phases=(*state.phases, phase),
+            )
+        return tuple(states.values())
+
+    def _read_states_unlocked(
+        self,
+    ) -> tuple[list[dict[str, object]], tuple[ArtifactLeaseState, ...]]:
+        events = self._read_events_unlocked()
+        return events, self._fold_events(events)
+
+    def _append_event_unlocked(
+        self,
+        events: Sequence[dict[str, object]],
+        transaction: ArtifactLeaseTransaction,
+        phase: ArtifactLeasePhase,
+        *,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        timestamp = (
+            transaction.prepared_at
+            if phase is ArtifactLeasePhase.PREPARED
+            else _iso_utc(recorded_at)
+        )
+        previous_hash = (
+            str(events[-1]["event_sha256"]) if events else _ZERO_SHA256
+        )
+        payload: dict[str, object] = {
+            "schema_version": RETENTION_JOURNAL_SCHEMA_VERSION,
+            "sequence": len(events) + 1,
+            "session_id": self.session_id,
+            "transaction_id": transaction.transaction_id,
+            "phase": phase.value,
+            "recorded_at": timestamp,
+            "intent_sha256": self._intent_sha256(transaction),
+            "previous_sha256": previous_hash,
+        }
+        if phase is ArtifactLeasePhase.PREPARED:
+            payload["intent"] = transaction.to_dict()
+        payload["event_sha256"] = _canonical_sha256(payload)
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
+        if self.path.is_symlink() or (self.path.exists() and not self.path.is_file()):
+            raise ArtifactLeaseJournalError(
+                "retention journal is not an owned regular file"
+            )
+        _discard_incomplete_jsonl_tail(self.path)
+        flags = (
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(
+            self.path,
+            flags,
+            0o600,
+        )
+        try:
+            written = os.write(descriptor, encoded)
+            if written != len(encoded):
+                raise OSError(
+                    f"short retention journal write: {written}/{len(encoded)} bytes"
+                )
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(self.path.parent)
+
+    def _validate_claim_artifact_unlocked(
+        self,
+        claim: ArtifactRetentionClaim,
+    ) -> None:
+        """Prove the leased bytes still exist while cleanup is excluded."""
+
+        parsed = parse_artifact_source_id(claim.source_id)
+        if parsed.session_id != self.session_id:
+            raise ArtifactRetentionError(
+                "retention claim belongs to a different artifact session"
+            )
+        owned_root = (self.session_dir / "tool-results").resolve()
+        candidate = owned_root / parsed.filename
+        try:
+            if candidate.is_symlink():
+                raise ArtifactRetentionError(
+                    "cannot lease a symbolic-link artifact"
+                )
+            owned_path = candidate.resolve(strict=True)
+            if owned_path.parent != owned_root or not owned_path.is_file():
+                raise ArtifactRetentionError(
+                    "cannot lease an artifact outside the owned tool-results root"
+                )
+            before_hash = owned_path.stat()
+            digest = hashlib.sha256()
+            with owned_path.open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    digest.update(chunk)
+            after_hash = owned_path.stat()
+        except FileNotFoundError as exc:
+            raise ArtifactRetentionError(
+                f"cannot lease missing artifact {parsed.filename}"
+            ) from exc
+        if (
+            before_hash.st_size != after_hash.st_size
+            or before_hash.st_mtime_ns != after_hash.st_mtime_ns
+            or before_hash.st_dev != after_hash.st_dev
+            or before_hash.st_ino != after_hash.st_ino
+            or digest.hexdigest() != claim.content_sha256
+        ):
+            raise ArtifactRetentionError(
+                f"cannot lease changed artifact {parsed.filename}"
+            )
+
+    def _checkpoint(self, name: str) -> None:
+        """Fault-injection seam used to prove post-fsync crash recovery."""
+
+    def _prepare(
+        self,
+        claim: ArtifactRetentionClaim,
+        *,
+        transaction_id: str | None = None,
+        prepared_at: datetime | None = None,
+    ) -> tuple[ArtifactLeaseTransaction, bool]:
+        transaction = ArtifactLeaseTransaction(
+            transaction_id=transaction_id or uuid.uuid4().hex,
+            session_id=self.session_id,
+            claim=claim,
+            prepared_at=_iso_utc(prepared_at),
+        )
+        with _exclusive_journal_lock(self.path):
+            events, states = self._read_states_unlocked()
+            existing = next(
+                (
+                    state
+                    for state in states
+                    if state.transaction.transaction_id == transaction.transaction_id
+                ),
+                None,
+            )
+            if existing is not None:
+                if (
+                    existing.transaction.session_id != transaction.session_id
+                    or existing.transaction.claim != transaction.claim
+                ):
+                    raise ArtifactLeaseJournalError(
+                        f"lease transaction {transaction.transaction_id} changed intent"
+                    )
+                return existing.transaction, False
+            self._validate_claim_artifact_unlocked(transaction.claim)
+            self._append_event_unlocked(
+                events,
+                transaction,
+                ArtifactLeasePhase.PREPARED,
+            )
+            self._checkpoint("after_prepared")
+        return transaction, True
+
+    def prepare(
+        self,
+        claim: ArtifactRetentionClaim,
+        *,
+        transaction_id: str | None = None,
+        prepared_at: datetime | None = None,
+    ) -> ArtifactLeaseTransaction:
+        """Durably prepare a protective lease before publishing a reference."""
+
+        transaction, _ = self._prepare(
+            claim,
+            transaction_id=transaction_id,
+            prepared_at=prepared_at,
+        )
+        return transaction
+
+    def _transition(
+        self,
+        transaction_id: str,
+        phase: ArtifactLeasePhase,
+        *,
+        recorded_at: datetime | None = None,
+    ) -> ArtifactLeaseState:
+        normalized_id = _source_component(
+            transaction_id,
+            field_name="lease transaction ID",
+        )
+        with _exclusive_journal_lock(self.path):
+            events, states = self._read_states_unlocked()
+            state = next(
+                (
+                    item
+                    for item in states
+                    if item.transaction.transaction_id == normalized_id
+                ),
+                None,
+            )
+            if state is None:
+                raise ArtifactLeaseJournalError(
+                    f"unknown lease transaction: {normalized_id}"
+                )
+            if state.current_phase is phase:
+                return state
+            self._validate_transition(state.current_phase, phase)
+            self._append_event_unlocked(
+                events,
+                state.transaction,
+                phase,
+                recorded_at=recorded_at,
+            )
+            updated = ArtifactLeaseState(
+                transaction=state.transaction,
+                phases=(*state.phases, phase),
+            )
+            self._checkpoint(f"after_{phase.value}")
+            return updated
+
+    def commit(
+        self,
+        transaction_id: str,
+        *,
+        committed_at: datetime | None = None,
+    ) -> ArtifactLeaseState:
+        return self._transition(
+            transaction_id,
+            ArtifactLeasePhase.COMMITTED,
+            recorded_at=committed_at,
+        )
+
+    def release(
+        self,
+        transaction_id: str,
+        *,
+        released_at: datetime | None = None,
+    ) -> ArtifactLeaseState:
+        return self._transition(
+            transaction_id,
+            ArtifactLeasePhase.RELEASED,
+            recorded_at=released_at,
+        )
+
+    def abort(
+        self,
+        transaction_id: str,
+        *,
+        aborted_at: datetime | None = None,
+    ) -> ArtifactLeaseState:
+        return self._transition(
+            transaction_id,
+            ArtifactLeasePhase.ABORTED,
+            recorded_at=aborted_at,
+        )
+
+    def publish_reference(
+        self,
+        claim: ArtifactRetentionClaim,
+        publisher: Callable[[], _PublicationValue],
+        *,
+        transaction_id: str | None = None,
+        prepared_at: datetime | None = None,
+        committed_at: datetime | None = None,
+    ) -> tuple[ArtifactLeaseTransaction, _PublicationValue]:
+        """Prepare, invoke a Memory publisher, then commit its durable lease."""
+
+        transaction, created = self._prepare(
+            claim,
+            transaction_id=transaction_id,
+            prepared_at=prepared_at,
+        )
+        if not created:
+            raise ArtifactLeaseJournalError(
+                "lease publication retry requires explicit Memory reconciliation"
+            )
+        try:
+            value = publisher()
+        except Exception:
+            self.abort(transaction.transaction_id)
+            raise
+        self.commit(transaction.transaction_id, committed_at=committed_at)
+        return transaction, value
+
+    def remove_reference(
+        self,
+        transaction_id: str,
+        remover: Callable[[], _PublicationValue],
+        *,
+        released_at: datetime | None = None,
+    ) -> _PublicationValue:
+        """Remove the Memory reference before releasing its protective lease."""
+
+        normalized_id = _source_component(
+            transaction_id,
+            field_name="lease transaction ID",
+        )
+        with _exclusive_journal_lock(self.path):
+            events, states = self._read_states_unlocked()
+            state = next(
+                (
+                    item
+                    for item in states
+                    if item.transaction.transaction_id == normalized_id
+                ),
+                None,
+            )
+            if state is None:
+                raise ArtifactLeaseJournalError(
+                    f"unknown lease transaction: {normalized_id}"
+                )
+            self._validate_transition(
+                state.current_phase,
+                ArtifactLeasePhase.RELEASED,
+            )
+            value = remover()
+            self._append_event_unlocked(
+                events,
+                state.transaction,
+                ArtifactLeasePhase.RELEASED,
+                recorded_at=released_at,
+            )
+            self._checkpoint("after_released")
+            return value
+
+    def _recover_unlocked(self, *, now: datetime) -> ArtifactLeaseRecovery:
+        _, states = self._read_states_unlocked()
+        protected: dict[str, list[ArtifactRetentionClaim]] = {}
+        pending: list[str] = []
+        for state in states:
+            claim = state.transaction.claim
+            if state.current_phase is ArtifactLeasePhase.PREPARED:
+                pending.append(state.transaction.transaction_id)
+                claim = replace(claim, retain_until=None)
+            elif state.current_phase is ArtifactLeasePhase.COMMITTED:
+                if not claim.is_active(now):
+                    continue
+            else:
+                continue
+            parsed = parse_artifact_source_id(claim.source_id)
+            protected.setdefault(parsed.filename, []).append(claim)
+
+        claims: list[ArtifactRetentionClaim] = []
+        for filename, grouped in sorted(protected.items()):
+            digests = {claim.content_sha256 for claim in grouped}
+            if len(digests) != 1:
+                raise ArtifactLeaseJournalError(
+                    f"active leases disagree on digest for {filename}"
+                )
+            retain_until: str | None
+            if any(claim.retain_until is None for claim in grouped):
+                retain_until = None
+            else:
+                deadlines = [
+                    _parse_aware_utc(
+                        str(claim.retain_until),
+                        field_name="retain_until",
+                    )
+                    for claim in grouped
+                ]
+                retain_until = max(deadlines).isoformat()
+            claims.append(ArtifactRetentionClaim(
+                source_id=grouped[0].source_id,
+                content_sha256=grouped[0].content_sha256,
+                reference_count=sum(claim.reference_count for claim in grouped),
+                retain_until=retain_until,
+            ))
+        return ArtifactLeaseRecovery(
+            session_id=self.session_id,
+            claims=tuple(claims),
+            pending_transaction_ids=tuple(sorted(pending)),
+            states=states,
+        )
+
+    @contextmanager
+    def locked_recovery(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> Iterator[ArtifactLeaseRecovery]:
+        """Hold the journal boundary while a caller plans or applies cleanup."""
+
+        observed_at = _aware_utc(now)
+        with _exclusive_journal_lock(self.path):
+            yield self._recover_unlocked(now=observed_at)
+
+    def recover(self, *, now: datetime | None = None) -> ArtifactLeaseRecovery:
+        with self.locked_recovery(now=now) as recovery:
+            return recovery
+
+    def current_claims(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[ArtifactRetentionClaim, ...]:
+        return self.recover(now=now).claims
 
 
 # ======================================================================
@@ -694,6 +1477,30 @@ class ToolResultExternalizer:
     ) -> ArtifactCleanupPlan:
         """Plan cleanup without deleting data or trusting Memory-owned paths."""
 
+        return self._plan_cleanup(
+            claims,
+            policy=policy,
+            now=now,
+            journal_verified=False,
+        )
+
+    def _plan_cleanup(
+        self,
+        claims: Sequence[ArtifactRetentionClaim],
+        *,
+        policy: ArtifactCleanupPolicy | None,
+        now: datetime | None,
+        journal_verified: bool,
+    ) -> ArtifactCleanupPlan:
+
+        journal_path = self.session_dir / RETENTION_JOURNAL_NAME
+        if (
+            (journal_path.exists() or journal_path.is_symlink())
+            and not journal_verified
+        ):
+            raise ArtifactRetentionError(
+                "durable retention journal exists; use journal-aware cleanup"
+            )
         observed_at = _aware_utc(now)
         active_policy = policy or ArtifactCleanupPolicy()
         all_claims, active_claims = self._validated_claims(
@@ -860,6 +1667,30 @@ class ToolResultExternalizer:
     ) -> ArtifactCleanupReport:
         """Apply deletions after rechecking current claims and file identity."""
 
+        return self._apply_cleanup(
+            plan,
+            claims=claims,
+            now=now,
+            journal_verified=False,
+        )
+
+    def _apply_cleanup(
+        self,
+        plan: ArtifactCleanupPlan,
+        *,
+        claims: Sequence[ArtifactRetentionClaim] | None,
+        now: datetime | None,
+        journal_verified: bool,
+    ) -> ArtifactCleanupReport:
+
+        journal_path = self.session_dir / RETENTION_JOURNAL_NAME
+        if (
+            (journal_path.exists() or journal_path.is_symlink())
+            and not journal_verified
+        ):
+            raise ArtifactRetentionError(
+                "durable retention journal exists; use journal-aware cleanup"
+            )
         if not isinstance(plan, ArtifactCleanupPlan):
             raise ArtifactRetentionError("cleanup requires an ArtifactCleanupPlan")
         if plan.session_id != self.session_dir.name:
@@ -973,6 +1804,80 @@ class ToolResultExternalizer:
 
         plan = self.plan_cleanup(claims, policy=policy, now=now)
         return self.apply_cleanup(plan, claims=claims, now=now)
+
+    def _validated_journal(
+        self,
+        journal: ArtifactRetentionJournal,
+    ) -> ArtifactRetentionJournal:
+        if not isinstance(journal, ArtifactRetentionJournal):
+            raise ArtifactRetentionError(
+                "artifact cleanup requires an ArtifactRetentionJournal"
+            )
+        if journal.session_dir.resolve() != self.session_dir.resolve():
+            raise ArtifactRetentionError(
+                "retention journal belongs to a different artifact session"
+            )
+        return journal
+
+    def plan_cleanup_from_journal(
+        self,
+        journal: ArtifactRetentionJournal,
+        *,
+        policy: ArtifactCleanupPolicy | None = None,
+        now: datetime | None = None,
+    ) -> ArtifactCleanupPlan:
+        """Plan against a recovered journal view without accepting raw claims."""
+
+        owner = self._validated_journal(journal)
+        recovery = owner.recover(now=now)
+        return self._plan_cleanup(
+            recovery.claims,
+            policy=policy,
+            now=now,
+            journal_verified=True,
+        )
+
+    def apply_cleanup_from_journal(
+        self,
+        plan: ArtifactCleanupPlan,
+        journal: ArtifactRetentionJournal,
+        *,
+        now: datetime | None = None,
+    ) -> ArtifactCleanupReport:
+        """Re-fold and lock the journal across final validation and deletion."""
+
+        owner = self._validated_journal(journal)
+        with owner.locked_recovery(now=now) as recovery:
+            return self._apply_cleanup(
+                plan,
+                claims=recovery.claims,
+                now=now,
+                journal_verified=True,
+            )
+
+    def cleanup_artifacts_from_journal(
+        self,
+        journal: ArtifactRetentionJournal,
+        *,
+        policy: ArtifactCleanupPolicy | None = None,
+        now: datetime | None = None,
+    ) -> ArtifactCleanupReport:
+        """Plan and apply one cleanup pass under the journal consistency lock."""
+
+        owner = self._validated_journal(journal)
+        with owner.locked_recovery(now=now) as recovery:
+            plan = self._plan_cleanup(
+                recovery.claims,
+                policy=policy,
+                now=now,
+                journal_verified=True,
+            )
+            return self._apply_cleanup(
+                plan,
+                claims=recovery.claims,
+                now=now,
+                journal_verified=True,
+            )
 
     def externalize(
         self,

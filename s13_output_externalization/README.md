@@ -19,8 +19,9 @@ flowchart LR
     C --> F["ArtifactReference<br/>digest + provenance"]
     F -. "later policy" .-> G["Memory Reference<br/>summary + pointer, no body"]
     G --> H["ArtifactRetentionClaim<br/>source ID + digest + lease"]
+    H --> L["Lease Journal<br/>prepared → committed → released"]
     C --> I["plan_cleanup → snapshot"]
-    H --> I
+    L --> I
     I --> J["retain referenced / recent<br/>delete expired orphan"]
 ```
 
@@ -36,6 +37,7 @@ flowchart LR
 - 为 artifact 生成稳定 source ID、摘要、来源工具、时间与 SHA-256，避免它变成不可审计的匿名文件。
 - Memory 只能接收 `ArtifactMemoryReference`，保留必要摘要与可检索指针，不复制大结果正文。
 - 用无路径 `ArtifactRetentionClaim` 把 Memory 引用投影为清理租约；物理路径始终由 S13 的可信 session root 决定。
+- 在 Memory 发布引用前先把 lease intent 追加并 fsync 到 journal；重启后从 journal 恢复当前 claim view。
 - 清理分成 plan/apply 两阶段，执行前重新核验文件 identity、mtime、大小与 SHA-256；变化时 fail-closed。
 - 模拟按需读取片段, 类似缺页中断。
 - 为 s14 的压缩减轻压力。
@@ -49,6 +51,8 @@ flowchart LR
 - 把 pointer 中的 head/tail 预览原样写进 Memory，本质上仍在复制可能巨大或敏感的工具正文。
 - 会话结束就删除整个 `tool-results/`，会让仍被 Workspace/User Memory 引用的证据立即悬空。
 - 直接相信 Memory 中的 `artifact_path` 做删除，会把不可信持久化数据变成任意文件删除入口。
+- 先发布 Memory 引用、后记录进程内 claim，会在崩溃窗口里产生无法证明归属的 Artifact。
+- 删除 Memory 引用前先释放 lease，会在相反的崩溃窗口里留下仍可访问但已失去保护的指针。
 - 扫描到未知文件、符号链接、digest 冲突或竞态仍继续删除，违背证据清理的 fail-closed 边界。
 
 ## 问题
@@ -215,6 +219,41 @@ ArtifactMemoryReference
 
 `ArtifactRetentionClaim` 刻意没有路径。清理器只解析 `artifact:<session>:<filename>:<digest>`，并要求 session 与当前 `ToolResultExternalizer` 一致；文件最终位置只能从可信 `session_dir/tool-results` 推导。跨 session claim、路径分量和不匹配 digest 在删除前就会被拒绝。
 
+#### Crash-recoverable lease journal
+
+进程内 claim 无法独自跨过崩溃边界。`ArtifactRetentionJournal` 在 session 根写入 append-only `retention-leases.jsonl`，每条记录包含递增 sequence、前一条记录 hash 和自身 SHA-256。读取器只忽略没有换行的最后一条残缺记录；完整坏行、sequence 断裂、跨 session 记录、intent 改写或 hash-chain 断裂都会让恢复失败，GC 不会把损坏日志当成“没有引用”。
+
+引用发布协议按以下顺序执行：
+
+```text
+1. PREPARED  ── append + fsync ──▶ lease intent 已持久化
+2. Memory adapter 发布引用
+3. COMMITTED ── append + fsync ──▶ 引用确认可见
+```
+
+如果步骤 2 正常失败，Harness 追加 `ABORTED`。如果进程在步骤 1 后退出，无论 Memory 写入尚未发生、正在发生，还是已经成功但步骤 3 尚未执行，fresh journal 都把 `PREPARED` 恢复为无过期时间的保护性 claim，并把 transaction ID 放入 `pending_transaction_ids` 等待可信 adapter 对账。它宁可暂时多保留证据，也不会猜测引用不存在。
+
+删除方向采用相反的安全顺序：先由 Memory adapter 删除引用，成功后才追加 `RELEASED`。`remove_reference()` 封装了这个顺序；若删除失败或进程先退出，committed lease 继续保护 Artifact。
+
+```python
+journal = ArtifactRetentionJournal(session_dir)
+claim = ArtifactRetentionClaim.from_memory_reference(memory_reference)
+
+transaction, stored_record = journal.publish_reference(
+    claim,
+    lambda: memory_adapter.append(memory_reference),
+    transaction_id="workspace-artifact-reference-1",
+)
+
+# Memory 删除成功后才释放；异常时 lease 保持 committed。
+journal.remove_reference(
+    transaction.transaction_id,
+    lambda: memory_adapter.remove(memory_reference.source.source_id),
+)
+```
+
+`publish_reference()` 不会自动重放已有 transaction ID。看到已有 `PREPARED` 时，Harness 必须先查询 Memory owner 再显式 `commit()` 或 `abort()`；看到已有 `COMMITTED` 时也不能再次调用 publisher。这样重试不会把“不确定是否已经成功”变成重复 Memory 写入。
+
 清理分成两个阶段：
 
 1. `plan_cleanup()` 只读扫描，流式计算 SHA-256，并冻结 size、mtime、device 与 inode 快照；默认 policy 为 dry-run。
@@ -243,11 +282,12 @@ policy = ArtifactCleanupPolicy(
     max_deletions=100,
     dry_run=False,
 )
-plan = externalizer.plan_cleanup((claim,), policy=policy)
-report = externalizer.apply_cleanup(plan, claims=(claim,))
+journal = ArtifactRetentionJournal(session_dir)
+plan = externalizer.plan_cleanup_from_journal(journal, policy=policy)
+report = externalizer.apply_cleanup_from_journal(plan, journal)
 ```
 
-`reference_count` 由可信 Memory adapter 聚合，不让模型直接声明；claim 缺席或租约过期后，文件仍必须超过 orphan TTL 才有资格删除。非 dry-run apply 若没有显式的当前 claim 视图会直接拒绝，调用方应在同一一致性边界内读取 claims 并执行 apply。cleanup plan/report 只公开 filename、source ID、digest、age 和 reason，不泄露或接受物理路径。这个教学实现把竞态窗口压缩到删除前的 claim 与文件二次校验；生产系统若有并发 writer，还应增加 session lease、目录锁或对象存储条件删除。
+`reference_count` 由可信 Memory adapter 聚合，不让模型直接声明；同一 Artifact 的多个 committed/pending lease 会按完整 digest 聚合。claim 缺席或租约过期后，文件仍必须超过 orphan TTL 才有资格删除。`prepare()` 与 journal-aware cleanup 使用同一排他锁：prepare 在锁内重新核验 typed source、普通文件边界与完整 digest；apply 在锁内重新 fold claims，并把锁保持到文件重验和删除完成。lease 先拿锁则 GC 保留，GC 先删除则 prepare 拒绝发布悬空引用。session 一旦存在 durable journal，旧的 raw-claims cleanup 入口会拒绝执行，避免调用方意外绕过真实 owner。cleanup plan/report 和 recovery report 都不接受物理路径。生产对象存储应把相同契约映射为 generation fence、条件删除或事务，而不是假设本地 advisory lock 能跨主机生效。
 
 ### 按需读取 (Read = 缺页中断)
 
@@ -466,20 +506,25 @@ if (resultSize > CODEBUDDY_TOOL_RESULT_THRESHOLD_KB * 1024) {
    - claim 只携带 typed source ID、完整 digest、引用计数与可选过期时间，不接受 Memory 路径
    - policy 显式控制 orphan TTL、最大删除数量和 dry-run
 
-4. **`ArtifactCleanupPlan` / `ArtifactCleanupReport`** — 两阶段、可审计清理
-   - plan 冻结文件快照并解释每个 retain/delete 决策，不产生写操作
-   - apply 重验归属、identity 与 digest；支持竞态检测和重复执行幂等
+4. **`ArtifactRetentionJournal` / `ArtifactLeaseRecovery`** — 可崩溃恢复的租约所有者
+   - `prepared → committed → released` 与 `prepared → aborted` 显式表达引用发布结果
+   - sequence + hash chain 检查完整记录；只丢弃未换行的崩溃尾部
+   - fresh instance fold journal；pending prepare 默认继续保护证据
 
-5. **`MockLLM`** — 模拟 LLM 的行为
+5. **`ArtifactCleanupPlan` / `ArtifactCleanupReport`** — 两阶段、可审计清理
+   - plan 冻结文件快照并解释每个 retain/delete 决策，不产生写操作
+   - journal-aware apply 在同一排他锁内恢复 claims、重验 identity 与 digest
+
+6. **`MockLLM`** — 模拟 LLM 的行为
    - 按预设脚本生成工具调用
    - 看到外部化指针时，决定是否触发"缺页中断"（调 Read 读完整输出）
 
-6. **Agent 循环** — 集成外部化
+7. **Agent 循环** — 集成外部化
    - 工具执行后检查是否需要外部化
    - 需要则写 artifact + 生成结构化 reference + 替换上下文内容
    - 打印 `[externalize]` 日志，显示节省效果
 
-7. **Demo 场景** — 完整演示
+8. **Demo 场景** — 完整演示
    - 模拟一条产生 1.3MB 输出的 grep 命令
    - 展示外部化前后的上下文大小对比
    - 模拟 agent 需要完整输出时的缺页中断
@@ -509,7 +554,7 @@ python s13_output_externalization/code.py
 ## 练习
 
 1. 当前 `make_pointer` 保留 head 6KB + tail 24KB。如果 agent 最常需要的是输出的中间部分（比如第 40000 行的错误），怎么改进预览策略？提示：考虑基于正则匹配的关键行提取，或分块索引。
-2. 把进程内的 retention claims 持久化为 append-only lease journal，并实现 crash recovery。证明“引用写入成功但 claim 尚未落盘”时清理器仍然 fail-closed。
+2. 为 `pending_transaction_ids` 实现 owner reconciliation adapter：根据 Memory 中的稳定 reference ID 决定 `commit` 或 `abort`，并用 generation fence 证明对账期间的并发更新不会被旧结果覆盖。
 3. 当前的 `should_externalize` 只看输出大小。如果一条命令的输出是 30KB 的随机字符串（对 agent 无用）vs 30KB 的结构化 JSON（每行都有用），应该用不同策略吗？思考：能否让外部化策略感知输出的信息密度？
 
 ---

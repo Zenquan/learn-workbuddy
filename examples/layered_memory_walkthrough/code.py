@@ -182,6 +182,10 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         summary="Build verification completed for the layered memory walkthrough.",
     )
     artifact_memory = externalized.artifact.for_memory()
+    retention_journal = chapters.s13.ArtifactRetentionJournal(artifact_session)
+    artifact_claim = chapters.s13.ArtifactRetentionClaim.from_memory_reference(
+        artifact_memory,
+    )
     orphaned_artifact = externalizer.externalize(
         "temporary diagnostic output",
         "search",
@@ -217,18 +221,24 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         recorded_at=recorded_at,
         fact_id="workspace-decision-2",
     )
-    workspace.append_daily_log(
-        artifact_memory.summary,
-        kind=chapters.s10.FactKind.OUTCOME,
-        importance=3,
-        source="artifact",
-        evidence={
-            "source_id": artifact_memory.source.source_id,
-            "artifact_path": artifact_memory.artifact_path,
-            "content_sha256": artifact_memory.content_sha256,
-        },
-        recorded_at=recorded_at,
-        fact_id="workspace-artifact-1",
+    lease_transaction, _ = retention_journal.publish_reference(
+        artifact_claim,
+        lambda: workspace.append_daily_log(
+            artifact_memory.summary,
+            kind=chapters.s10.FactKind.OUTCOME,
+            importance=3,
+            source="artifact",
+            evidence={
+                "source_id": artifact_memory.source.source_id,
+                "artifact_path": artifact_memory.artifact_path,
+                "content_sha256": artifact_memory.content_sha256,
+            },
+            recorded_at=recorded_at,
+            fact_id="workspace-artifact-1",
+        ),
+        transaction_id="workspace-artifact-reference-1",
+        prepared_at=recorded_at,
+        committed_at=recorded_at,
     )
     distill = workspace.distill(
         policy=chapters.s10.DistillPolicy(
@@ -306,20 +316,19 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         as_of=as_of,
     )
     restarted_externalizer = chapters.s13.ToolResultExternalizer(artifact_session)
-    cleanup_claim = chapters.s13.ArtifactRetentionClaim.from_memory_reference(
-        artifact_memory,
-    )
-    cleanup_plan = restarted_externalizer.plan_cleanup(
-        (cleanup_claim,),
+    restarted_journal = chapters.s13.ArtifactRetentionJournal(artifact_session)
+    lease_recovery = restarted_journal.recover(now=as_of)
+    cleanup_plan = restarted_externalizer.plan_cleanup_from_journal(
+        restarted_journal,
         policy=chapters.s13.ArtifactCleanupPolicy(
             orphan_ttl_seconds=24 * 60 * 60,
             dry_run=False,
         ),
         now=as_of,
     )
-    cleanup_report = restarted_externalizer.apply_cleanup(
+    cleanup_report = restarted_externalizer.apply_cleanup_from_journal(
         cleanup_plan,
-        claims=(cleanup_claim,),
+        restarted_journal,
         now=as_of,
     )
     recovered_artifact_head = restarted_externalizer.read_artifact(
@@ -329,8 +338,8 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
     )
     _print_stage(
         6,
-        "Reference-aware artifact cleanup",
-        "referenced retained=1; expired orphan deleted=1",
+        "Crash-recovered artifact leases and cleanup",
+        "lease recovered=1; referenced retained=1; expired orphan deleted=1",
     )
 
     durable_state = chapters.s14.DurableContextState(
@@ -442,7 +451,11 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
             and len(artifact_memory.content_sha256) == 64
         ),
         "artifact_cleanup_preserved_references": (
-            cleanup_report.counts == {
+            lease_recovery.claims == (artifact_claim,)
+            and lease_recovery.pending_transaction_ids == ()
+            and lease_recovery.states[0].transaction.transaction_id
+            == lease_transaction.transaction_id
+            and cleanup_report.counts == {
                 "retained_referenced": 1,
                 "deleted": 1,
             }
@@ -463,6 +476,7 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         "user_preferences": str(alice.preferences_path),
         "remote_memory": str(remote_path),
         "tool_result": artifact_memory.artifact_path,
+        "retention_journal": str(retention_journal.path),
     }
     layers = {
         "transcript": {
@@ -486,6 +500,7 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         },
         "artifact": {
             "reference": artifact_memory.to_dict(),
+            "lease_recovery": lease_recovery.to_dict(),
             "cleanup": cleanup_report.to_dict(),
             "orphan_resolution": orphan_resolution.to_dict(
                 include_excerpt=False,

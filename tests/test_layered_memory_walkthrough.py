@@ -46,6 +46,7 @@ def test_layered_memory_walkthrough_is_keyless_and_restart_safe(
     assert result.returncode == 0, result.stdout[-4_000:]
     assert "RESULT: OK" in result.stdout
     assert "created -> unchanged; bob empty=True" in result.stdout
+    assert "lease recovered=1" in result.stdout
     assert "referenced retained=1; expired orphan deleted=1" in result.stdout
     assert "durable preserved=True" in result.stdout
     assert "sources verified=2" in result.stdout
@@ -75,6 +76,11 @@ def test_layered_memory_walkthrough_is_keyless_and_restart_safe(
     assert "content" not in artifact_reference
     assert len(artifact_reference["content_sha256"]) == 64
     assert Path(artifact_reference["artifact_path"]).stat().st_size > 30_000
+    lease_recovery = artifact_layer["lease_recovery"]
+    assert lease_recovery["pending_transaction_ids"] == []
+    assert lease_recovery["claims"][0]["reference_count"] == 1
+    assert lease_recovery["states"][0]["phases"] == ["prepared", "committed"]
+    assert str(home) not in json.dumps(lease_recovery, sort_keys=True)
     assert artifact_layer["cleanup"]["counts"] == {
         "deleted": 1,
         "retained_referenced": 1,

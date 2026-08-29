@@ -24,7 +24,7 @@
 
   <!-- Title -->
   <text x="400" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#202124">工具输出外部化 (Output Swap)</text>
-  <text x="400" y="60" text-anchor="middle" font-size="13" fill="#5f6368">完整正文归 Artifact；Context / Memory 留有界引用；GC 按租约与 digest 回收孤儿</text>
+  <text x="400" y="60" text-anchor="middle" font-size="13" fill="#5f6368">正文归 Artifact；引用先写 lease journal；重启恢复后再按 digest 回收孤儿</text>
 
   <!-- ===== LEFT: 上下文窗口 (RAM) ===== -->
   <rect x="40" y="110" width="280" height="200" rx="12" fill="url(#ram-grad)" stroke="#1a73e8" stroke-width="2"/>
@@ -116,16 +116,16 @@
 
   <!-- ===== Reference-aware lifecycle ===== -->
   <rect x="40" y="555" width="720" height="88" rx="12" fill="#ffffff" stroke="#f9ab00" stroke-width="1.5"/>
-  <text x="60" y="577" font-size="13" font-weight="700" fill="#a15c00">引用感知 GC（session close / scheduled cleanup）</text>
+  <text x="60" y="577" font-size="13" font-weight="700" fill="#a15c00">Crash-safe 引用生命周期与 GC</text>
   <rect x="60" y="588" width="190" height="38" rx="7" fill="#fff7e0" stroke="#f9ab00"/>
-  <text x="155" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#a15c00">RetentionClaim</text>
-  <text x="155" y="618" text-anchor="middle" font-size="9" fill="#5f6368">source ID + digest + lease</text>
+  <text x="155" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#a15c00">Lease journal</text>
+  <text x="155" y="618" text-anchor="middle" font-size="9" fill="#5f6368">prepare → commit → release</text>
   <line x1="250" y1="607" x2="292" y2="607" stroke="#f9ab00" stroke-width="2" marker-end="url(#arrow-green)"/>
   <rect x="300" y="588" width="200" height="38" rx="7" fill="#e8f0fe" stroke="#1a73e8"/>
-  <text x="400" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#174ea6">plan → snapshot → recheck</text>
-  <text x="400" y="618" text-anchor="middle" font-size="9" fill="#5f6368">identity + mtime + size + SHA-256</text>
+  <text x="400" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#174ea6">locked restart recovery</text>
+  <text x="400" y="618" text-anchor="middle" font-size="9" fill="#5f6368">pending prepare 默认 retain</text>
   <line x1="500" y1="607" x2="542" y2="607" stroke="#1a73e8" stroke-width="2" marker-end="url(#arrow-blue)"/>
   <rect x="550" y="588" width="190" height="38" rx="7" fill="#e6f4ea" stroke="#34a853"/>
-  <text x="645" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#137333">retain / delete orphan</text>
-  <text x="645" y="618" text-anchor="middle" font-size="9" fill="#5f6368">异常或竞态一律 fail-closed</text>
+  <text x="645" y="604" text-anchor="middle" font-size="11" font-weight="700" fill="#137333">snapshot → recheck → GC</text>
+  <text x="645" y="618" text-anchor="middle" font-size="9" fill="#5f6368">hash / identity 异常 fail-closed</text>
 </svg>

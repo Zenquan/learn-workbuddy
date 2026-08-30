@@ -24,7 +24,7 @@ flowchart LR
 | `storage.py` | session record、JSONL transcript、tool-results |
 | `tools.py` | bash/read_file/tool_search、权限和输出外部化 |
 | `agent.py` | 简化 agent loop |
-| `audit.py` | append-only hash chain 审计日志 |
+| `audit.py` | 串行化追加、hash chain 与 head anchor 审计日志 |
 | `server.py` | REST + ACP endpoint + SSE events |
 | `sidecar.py` | Unix socket sidecar manager |
 
@@ -60,6 +60,22 @@ python3 examples/mini_workbuddy_demo/code.py --mode offline
 - workspace memory 写入和读取。
 - JSONL transcript 恢复。
 - audit hash chain 校验。
+
+## 并发审计追加流程
+
+`server.py` 使用 `ThreadingHTTPServer`，多个请求会共享同一条审计链。`AuditLog.append()` 因此把链尾分配和落盘放在同一个临界区：
+
+```text
+请求线程
+  -> 进程内锁
+  -> 文件锁（协调共享目录的进程）
+  -> 校验 index / prev_hash / hash / audit.head
+  -> O_APPEND 写 audit.jsonl 并 fsync
+  -> 原子替换 audit.head 并 fsync 目录
+  -> 释放锁
+```
+
+锁解决的是“两个请求读到同一个旧链尾”的竞态；哈希链和 anchor 解决的是历史篡改与删尾检测。现有状态校验失败时，追加会直接拒绝，不会在损坏链上再写一条看似合法的记录。
 
 ## 启动服务
 

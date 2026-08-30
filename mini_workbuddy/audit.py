@@ -2,15 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .config import HarnessConfig
 
 
+if os.name == "nt":  # pragma: no cover - exercised only on Windows
+    import msvcrt
+else:  # pragma: no cover - platform branch is covered on POSIX CI
+    import fcntl
+
+
 GENESIS_HASH = "0" * 64
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_PROCESS_LOCKS: dict[Path, threading.Lock] = {}
+_PROCESS_LOCKS_GUARD = threading.Lock()
+
+
+class AuditCorruptionError(RuntimeError):
+    """Raised when an existing audit chain cannot be extended safely."""
 
 
 @dataclass(frozen=True)
@@ -23,8 +41,25 @@ class AuditEntry:
     hash: str
 
 
+def _process_lock(path: Path) -> threading.Lock:
+    """Return one lock for every audit path used by this Python process.
+
+    ``flock`` locks are process-scoped on POSIX, so two ``AuditLog`` objects
+    in the threaded HTTP server also need a Python lock to exclude each other.
+    """
+
+    key = path.resolve()
+    with _PROCESS_LOCKS_GUARD:
+        return _PROCESS_LOCKS.setdefault(key, threading.Lock())
+
+
 class AuditLog:
-    """Append-only hash chain for high-risk harness events."""
+    """Append-only hash chain for high-risk harness events.
+
+    Appends are serialized across threads and cooperating processes. The
+    chain and its anchor are checked while the lock is held, so a writer never
+    extends a tip that it has already proved to be corrupt or stale.
+    """
 
     def __init__(self, config: HarnessConfig) -> None:
         self.config = config
@@ -35,77 +70,229 @@ class AuditLog:
         # *truncation*: any prefix of a valid chain is itself a valid chain.
         # Anchoring the tip out-of-band closes that gap for the teaching harness.
         self.head_path = self.config.audit_dir / "audit.head"
+        self.lock_path = self.config.audit_dir / "audit.lock"
+        self._thread_lock = _process_lock(self.lock_path)
 
     def append(self, action: str, data: dict[str, Any]) -> AuditEntry:
-        entries = self.read_entries()
-        prev_hash = entries[-1].hash if entries else GENESIS_HASH
-        index = len(entries) + 1
-        timestamp = int(time.time() * 1000)
-        digest = self._hash_payload(index, timestamp, action, data, prev_hash)
-        entry = AuditEntry(
-            index=index,
-            timestamp=timestamp,
-            action=action,
-            data=data,
-            prev_hash=prev_hash,
-            hash=digest,
-        )
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry.__dict__, ensure_ascii=False, sort_keys=True) + "\n")
-        self.head_path.write_text(
-            json.dumps({"count": index, "head": digest}, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        return entry
+        """Validate and extend the current chain as one serialized operation."""
+
+        with self._exclusive_lock():
+            try:
+                entries = self._read_entries_unlocked()
+                prev_hash = self._validated_tip_unlocked(entries)
+            except AuditCorruptionError:
+                raise
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                raise AuditCorruptionError(
+                    "audit chain is unreadable; refusing to append"
+                ) from exc
+
+            index = len(entries) + 1
+            timestamp = int(time.time() * 1000)
+            digest = self._hash_payload(index, timestamp, action, data, prev_hash)
+            entry = AuditEntry(
+                index=index,
+                timestamp=timestamp,
+                action=action,
+                data=data,
+                prev_hash=prev_hash,
+                hash=digest,
+            )
+
+            # Persist the JSONL record before publishing its new chain tip. A
+            # crash between these two fsync boundaries leaves a detectable
+            # anchor mismatch; the next append fails closed instead of forking.
+            self._append_entry_unlocked(entry)
+            self._replace_head_unlocked(index, digest)
+            return entry
 
     def read_entries(self) -> list[AuditEntry]:
+        # Readers share the writer boundary so they cannot observe the brief
+        # interval between the durable JSONL append and head replacement.
+        with self._exclusive_lock():
+            return self._read_entries_unlocked()
+
+    def verify(self) -> bool:
+        try:
+            with self._exclusive_lock():
+                entries = self._read_entries_unlocked()
+                self._validated_tip_unlocked(entries)
+            return True
+        except (
+            AuditCorruptionError,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+        ):
+            return False
+
+    @contextmanager
+    def _exclusive_lock(self) -> Iterator[None]:
+        """Serialize the read-validate-append-anchor critical section."""
+
+        with self._thread_lock:
+            fd = os.open(
+                self.lock_path,
+                os.O_CREAT | os.O_RDWR | _NOFOLLOW,
+                0o600,
+            )
+            try:
+                self._require_regular_file(fd, self.lock_path)
+                self._lock_fd(fd)
+                try:
+                    yield
+                finally:
+                    self._unlock_fd(fd)
+            finally:
+                os.close(fd)
+
+    def _read_entries_unlocked(self) -> list[AuditEntry]:
         if not self.path.exists():
             return []
         entries: list[AuditEntry] = []
-        for line in self._read_lines():
+        for line in self._read_lines_unlocked():
             if not line.strip():
                 continue
             data = json.loads(line)
             entries.append(AuditEntry(**data))
         return entries
 
-    def verify(self) -> bool:
-        try:
-            prev_hash = GENESIS_HASH
-            for expected_index, entry in enumerate(self.read_entries(), start=1):
-                if entry.index != expected_index or entry.prev_hash != prev_hash:
-                    return False
-                digest = self._hash_payload(
-                    entry.index,
-                    entry.timestamp,
-                    entry.action,
-                    entry.data,
-                    entry.prev_hash,
+    def _validated_tip_unlocked(self, entries: list[AuditEntry]) -> str:
+        """Return the verified chain tip or reject the existing state."""
+
+        prev_hash = GENESIS_HASH
+        for expected_index, entry in enumerate(entries, start=1):
+            if entry.index != expected_index or entry.prev_hash != prev_hash:
+                raise AuditCorruptionError(
+                    f"audit chain linkage is invalid at entry {expected_index}"
                 )
-                if digest != entry.hash:
-                    return False
-                prev_hash = entry.hash
-            return self._verify_head_anchor(prev_hash)
-        except (OSError, json.JSONDecodeError, TypeError):
-            return False
+            digest = self._hash_payload(
+                entry.index,
+                entry.timestamp,
+                entry.action,
+                entry.data,
+                entry.prev_hash,
+            )
+            if digest != entry.hash:
+                raise AuditCorruptionError(
+                    f"audit entry hash is invalid at entry {expected_index}"
+                )
+            prev_hash = entry.hash
 
-    def _verify_head_anchor(self, tip_hash: str) -> bool:
-        """Cross-check the chain tip against the out-of-band anchor.
-
-        Without this, deleting the last N lines of audit.jsonl leaves a chain
-        that still verifies — hash chains only bind history, not length.
-        """
         if not self.head_path.exists():
-            # Legacy logs written before anchoring existed: chain-only verification.
-            return True
-        anchor = json.loads(self.head_path.read_text(encoding="utf-8"))
-        entries = self.read_entries()
-        if not entries:
-            return anchor.get("count", 0) == 0
-        return anchor.get("count") == len(entries) and anchor.get("head") == tip_hash
+            # Legacy logs written before anchoring existed remain readable. The
+            # next successful append upgrades them by creating an anchor.
+            return prev_hash
 
-    def _read_lines(self) -> Iterable[str]:
-        return self.path.read_text(encoding="utf-8").splitlines()
+        anchor = json.loads(self._read_text_file(self.head_path))
+        if not isinstance(anchor, dict):
+            raise AuditCorruptionError("audit head anchor is not an object")
+        if anchor.get("count") != len(entries) or anchor.get("head") != prev_hash:
+            raise AuditCorruptionError("audit head anchor does not match the chain tip")
+        return prev_hash
+
+    def _append_entry_unlocked(self, entry: AuditEntry) -> None:
+        payload = (
+            json.dumps(entry.__dict__, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        fd = os.open(
+            self.path,
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW,
+            0o600,
+        )
+        try:
+            self._require_regular_file(fd, self.path)
+            self._write_all(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _replace_head_unlocked(self, count: int, head: str) -> None:
+        payload = (
+            json.dumps({"count": count, "head": head}, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        temporary = self.head_path.with_name(
+            f".{self.head_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        fd = os.open(
+            temporary,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW,
+            0o600,
+        )
+        try:
+            try:
+                self._require_regular_file(fd, temporary)
+                self._write_all(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, self.head_path)
+            self._fsync_directory(self.config.audit_dir)
+        finally:
+            # Only a failure before os.replace leaves the temporary file.
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _read_lines_unlocked(self) -> Iterable[str]:
+        return self._read_text_file(self.path).splitlines()
+
+    @staticmethod
+    def _read_text_file(path: Path) -> str:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        try:
+            AuditLog._require_regular_file(fd, path)
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 64 * 1024):
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8")
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _write_all(fd: int, payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written == 0:
+                raise OSError("short write while persisting audit state")
+            view = view[written:]
+
+    @staticmethod
+    def _require_regular_file(fd: int, path: Path) -> None:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"audit path is not a regular file: {path}")
+
+    @staticmethod
+    def _lock_fd(fd: int) -> None:
+        if os.name == "nt":  # pragma: no cover - exercised only on Windows
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+                os.fsync(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+
+    @staticmethod
+    def _unlock_fd(fd: int) -> None:
+        if os.name == "nt":  # pragma: no cover - exercised only on Windows
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        if os.name == "nt":  # pragma: no cover - not supported by Windows
+            return
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _hash_payload(
         self,
@@ -122,5 +309,10 @@ class AuditLog:
             "data": data,
             "prev_hash": prev_hash,
         }
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        raw = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()

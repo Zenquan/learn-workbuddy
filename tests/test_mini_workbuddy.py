@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import queue
+import subprocess
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from mini_workbuddy.audit import AuditLog
+from mini_workbuddy.audit import AuditCorruptionError, AuditLog
 from mini_workbuddy.agent import MiniAgent
 from mini_workbuddy.config import HarnessConfig, workspace_id
 from mini_workbuddy.events import Event, EventBus
@@ -79,6 +82,80 @@ def test_audit_log_detects_corrupt_trailing_line(tmp_path: Path) -> None:
         fh.write("{not-json\n")
 
     assert audit.verify() is False
+
+
+def test_audit_log_serializes_concurrent_appends_across_instances(
+    tmp_path: Path,
+) -> None:
+    config = HarnessConfig(root_dir=tmp_path / "home")
+    audits = [AuditLog(config) for _ in range(4)]
+
+    def append(index: int) -> None:
+        audits[index % len(audits)].append("tool_call", {"request": index})
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(append, range(100)))
+
+    entries = audits[0].read_entries()
+    assert len(entries) == 100
+    assert [entry.index for entry in entries] == list(range(1, 101))
+    assert len({entry.hash for entry in entries}) == 100
+    assert {entry.data["request"] for entry in entries} == set(range(100))
+    assert audits[0].verify() is True
+
+
+def test_audit_log_serializes_appends_across_processes(tmp_path: Path) -> None:
+    root_dir = tmp_path / "home"
+    child_script = "\n".join(
+        [
+            "import sys",
+            "from pathlib import Path",
+            "from mini_workbuddy.audit import AuditLog",
+            "from mini_workbuddy.config import HarnessConfig",
+            "audit = AuditLog(HarnessConfig(root_dir=Path(sys.argv[1])))",
+            "worker = int(sys.argv[2])",
+            "for sequence in range(10):",
+            "    audit.append('tool_call', {'worker': worker, 'sequence': sequence})",
+        ]
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", child_script, str(root_dir), str(worker)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for worker in range(4)
+    ]
+
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stdout + stderr
+
+    audit = AuditLog(HarnessConfig(root_dir=root_dir))
+    entries = audit.read_entries()
+    assert len(entries) == 40
+    assert [entry.index for entry in entries] == list(range(1, 41))
+    assert {
+        (entry.data["worker"], entry.data["sequence"]) for entry in entries
+    } == {(worker, sequence) for worker in range(4) for sequence in range(10)}
+    assert audit.verify() is True
+
+
+def test_audit_log_refuses_to_extend_a_corrupt_chain(tmp_path: Path) -> None:
+    audit = AuditLog(HarnessConfig(root_dir=tmp_path / "home"))
+    audit.append("tool_call", {"tool": "bash", "argument": "pwd"})
+    original_head = audit.head_path.read_bytes()
+
+    tampered = audit.path.read_text(encoding="utf-8").replace("pwd", "whoami")
+    audit.path.write_text(tampered, encoding="utf-8")
+    original_log = audit.path.read_bytes()
+
+    with pytest.raises(AuditCorruptionError, match="hash is invalid"):
+        audit.append("tool_result", {"exit_code": 0})
+
+    assert audit.path.read_bytes() == original_log
+    assert audit.head_path.read_bytes() == original_head
 
 
 def test_tool_search_lists_and_filters_tools(tmp_path: Path) -> None:

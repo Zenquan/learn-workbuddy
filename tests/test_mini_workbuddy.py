@@ -11,10 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from mini_workbuddy.audit import AuditCorruptionError, AuditLog
+from mini_workbuddy.audit import AuditCorruptionError, AuditLog, GENESIS_HASH
 from mini_workbuddy.agent import MiniAgent
 from mini_workbuddy.config import HarnessConfig, workspace_id
 from mini_workbuddy.events import Event, EventBus
+from mini_workbuddy.server import HarnessRuntime
 from mini_workbuddy.storage import Storage
 from mini_workbuddy.tools import PermissionError, ToolRegistry
 
@@ -153,9 +154,78 @@ def test_audit_log_refuses_to_extend_a_corrupt_chain(tmp_path: Path) -> None:
 
     with pytest.raises(AuditCorruptionError, match="hash is invalid"):
         audit.append("tool_result", {"exit_code": 0})
+    with pytest.raises(AuditCorruptionError, match="hash is invalid"):
+        audit.recover_interrupted_append()
 
     assert audit.path.read_bytes() == original_log
     assert audit.head_path.read_bytes() == original_head
+
+
+def test_runtime_recovers_one_entry_after_log_fsync_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = HarnessConfig(root_dir=tmp_path / "home")
+    audit = AuditLog(config)
+    audit.append("before_crash", {"step": 1})
+
+    def crash_before_head_replace(count: int, head: str) -> None:
+        raise RuntimeError("simulated crash after audit.jsonl fsync")
+
+    monkeypatch.setattr(audit, "_replace_head_unlocked", crash_before_head_replace)
+    with pytest.raises(RuntimeError, match="after audit.jsonl fsync"):
+        audit.append("crossed_fsync", {"step": 2})
+
+    restarted = AuditLog(config)
+    assert len(restarted.read_entries()) == 2
+    assert restarted.verify() is False
+
+    runtime = HarnessRuntime(config)
+    assert runtime.audit_recovered is True
+    assert runtime.audit.verify() is True
+    assert [entry.action for entry in runtime.audit.read_entries()] == [
+        "before_crash",
+        "crossed_fsync",
+    ]
+    runtime.audit.append("after_restart", {"step": 3})
+    assert runtime.audit.verify() is True
+
+    second_restart = HarnessRuntime(config)
+    assert second_restart.audit_recovered is False
+    assert second_restart.audit.verify() is True
+    assert len(second_restart.audit.read_entries()) == 3
+
+
+def test_audit_recovery_rejects_more_than_one_unanchored_entry(
+    tmp_path: Path,
+) -> None:
+    config = HarnessConfig(root_dir=tmp_path / "home")
+    audit = AuditLog(config)
+    for step in range(1, 4):
+        audit.append("tool_call", {"step": step})
+    entries = audit.read_entries()
+    stale_anchor = json.dumps(
+        {"count": 1, "head": entries[0].hash},
+        sort_keys=True,
+    ) + "\n"
+    audit.head_path.write_text(stale_anchor, encoding="utf-8")
+
+    with pytest.raises(AuditCorruptionError, match="exactly one unanchored entry"):
+        audit.recover_interrupted_append()
+    with pytest.raises(AuditCorruptionError, match="exactly one unanchored entry"):
+        HarnessRuntime(config)
+
+    assert audit.head_path.read_text(encoding="utf-8") == stale_anchor
+
+    mismatched_anchor = json.dumps(
+        {"count": 2, "head": GENESIS_HASH},
+        sort_keys=True,
+    ) + "\n"
+    audit.head_path.write_text(mismatched_anchor, encoding="utf-8")
+    with pytest.raises(AuditCorruptionError, match="penultimate entry"):
+        audit.recover_interrupted_append()
+
+    assert audit.head_path.read_text(encoding="utf-8") == mismatched_anchor
 
 
 def test_tool_search_lists_and_filters_tools(tmp_path: Path) -> None:

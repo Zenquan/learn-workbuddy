@@ -22,6 +22,10 @@ class HarnessRuntime:
         self.events = EventBus()
         self.tools = ToolRegistry(config, self.storage)
         self.audit = AuditLog(config)
+        # A previous process may have stopped after the durable JSONL append
+        # but before publishing audit.head.  Recover only that one provable
+        # state; ambiguous or tampered histories prevent runtime startup.
+        self.audit_recovered = self.audit.recover_interrupted_append()
         self.agent = MiniAgent(self.storage, self.tools, self.events, self.audit)
 
 

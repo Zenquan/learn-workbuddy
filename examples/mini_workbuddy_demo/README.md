@@ -77,6 +77,8 @@ python3 examples/mini_workbuddy_demo/code.py --mode offline
 
 锁解决的是“两个请求读到同一个旧链尾”的竞态；哈希链和 anchor 解决的是历史篡改与删尾检测。现有状态校验失败时，追加会直接拒绝，不会在损坏链上再写一条看似合法的记录。
 
+服务重启时，`HarnessRuntime` 还会处理一个精确的崩溃状态：如果 `audit.jsonl` 的完整有效链只比 `audit.head` 多一条，并且旧 head 仍精确指向倒数第二条，就原子推进 anchor。这对应日志已经 `fsync`、但进程在发布新 head 前退出的窗口。多出两条以上、旧 head 不匹配或任一记录损坏时不会猜测恢复，运行时直接 fail closed。
+
 ## 启动服务
 
 ```bash

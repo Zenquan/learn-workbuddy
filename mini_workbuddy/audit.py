@@ -82,7 +82,12 @@ class AuditLog:
                 prev_hash = self._validated_tip_unlocked(entries)
             except AuditCorruptionError:
                 raise
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                TypeError,
+            ) as exc:
                 raise AuditCorruptionError(
                     "audit chain is unreadable; refusing to append"
                 ) from exc
@@ -105,6 +110,55 @@ class AuditLog:
             self._append_entry_unlocked(entry)
             self._replace_head_unlocked(index, digest)
             return entry
+
+    def recover_interrupted_append(self) -> bool:
+        """Publish one complete entry left behind by an interrupted append.
+
+        The recovery is intentionally narrow.  It advances ``audit.head`` only
+        when the complete hash chain is valid, the old anchor still identifies
+        the penultimate entry, and exactly one durable JSONL entry follows it.
+        Every other mismatch remains a fail-closed corruption error.
+
+        Returns ``True`` when the anchor was advanced and ``False`` when the
+        chain was already consistent or no legacy anchor exists.
+        """
+
+        with self._exclusive_lock():
+            try:
+                entries = self._read_entries_unlocked()
+                tip_hash = self._validated_chain_tip_unlocked(entries)
+                anchor = self._read_anchor_unlocked()
+            except AuditCorruptionError:
+                raise
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                raise AuditCorruptionError(
+                    "audit chain is unreadable; refusing recovery"
+                ) from exc
+
+            # A missing anchor can be a legitimate legacy log.  Without a
+            # previously published tip there is no evidence that distinguishes
+            # an interrupted append from an arbitrary complete chain.
+            if anchor is None:
+                return False
+
+            anchor_count, anchor_hash = anchor
+            if anchor_count == len(entries) and anchor_hash == tip_hash:
+                return False
+
+            if anchor_count != len(entries) - 1:
+                raise AuditCorruptionError(
+                    "audit recovery requires exactly one unanchored entry"
+                )
+            anchored_hash = (
+                entries[anchor_count - 1].hash if anchor_count else GENESIS_HASH
+            )
+            if anchor_hash != anchored_hash:
+                raise AuditCorruptionError(
+                    "audit head anchor does not match the penultimate entry"
+                )
+
+            self._replace_head_unlocked(len(entries), tip_hash)
+            return True
 
     def read_entries(self) -> list[AuditEntry]:
         # Readers share the writer boundary so they cannot observe the brief
@@ -161,6 +215,23 @@ class AuditLog:
     def _validated_tip_unlocked(self, entries: list[AuditEntry]) -> str:
         """Return the verified chain tip or reject the existing state."""
 
+        prev_hash = self._validated_chain_tip_unlocked(entries)
+        anchor = self._read_anchor_unlocked()
+        if anchor is None:
+            # Legacy logs written before anchoring existed remain readable. The
+            # next successful append upgrades them by creating an anchor.
+            return prev_hash
+
+        anchor_count, anchor_hash = anchor
+        if anchor_count != len(entries) or anchor_hash != prev_hash:
+            raise AuditCorruptionError(
+                "audit head anchor does not match the chain tip"
+            )
+        return prev_hash
+
+    def _validated_chain_tip_unlocked(self, entries: list[AuditEntry]) -> str:
+        """Validate JSONL linkage and hashes without consulting the anchor."""
+
         prev_hash = GENESIS_HASH
         for expected_index, entry in enumerate(entries, start=1):
             if entry.index != expected_index or entry.prev_hash != prev_hash:
@@ -179,18 +250,26 @@ class AuditLog:
                     f"audit entry hash is invalid at entry {expected_index}"
                 )
             prev_hash = entry.hash
+        return prev_hash
 
+    def _read_anchor_unlocked(self) -> tuple[int, str] | None:
         if not self.head_path.exists():
-            # Legacy logs written before anchoring existed remain readable. The
-            # next successful append upgrades them by creating an anchor.
-            return prev_hash
+            return None
 
         anchor = json.loads(self._read_text_file(self.head_path))
         if not isinstance(anchor, dict):
             raise AuditCorruptionError("audit head anchor is not an object")
-        if anchor.get("count") != len(entries) or anchor.get("head") != prev_hash:
-            raise AuditCorruptionError("audit head anchor does not match the chain tip")
-        return prev_hash
+        count = anchor.get("count")
+        head = anchor.get("head")
+        if type(count) is not int or count < 0:
+            raise AuditCorruptionError("audit head count is invalid")
+        if (
+            not isinstance(head, str)
+            or len(head) != len(GENESIS_HASH)
+            or any(character not in "0123456789abcdef" for character in head)
+        ):
+            raise AuditCorruptionError("audit head hash is invalid")
+        return count, head
 
     def _append_entry_unlocked(self, entry: AuditEntry) -> None:
         payload = (

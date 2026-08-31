@@ -545,7 +545,85 @@ def test_expired_committed_lease_allows_orphan_collection(s13, tmp_path: Path) -
     assert not artifact.path.exists()
 
 
-def test_failed_reference_publication_aborts_lease(s13, tmp_path: Path) -> None:
+@pytest.mark.parametrize("error_type", [TimeoutError, ConnectionError, OSError, RuntimeError])
+@pytest.mark.parametrize("write_before_error", [False, True], ids=["before-write", "after-write"])
+def test_uncertain_publication_preserves_pending_lease_across_restart_and_gc(
+    s13, tmp_path: Path, error_type, write_before_error: bool
+) -> None:
+    now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
+    session_dir = tmp_path / "uncertain-publication-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        "evidence whose Memory publication result is uncertain",
+        "search",
+        summary="Publication acknowledgement may be lost after a durable write.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(
+        artifact.for_memory(),
+        retain_until=(now - timedelta(hours=1)).isoformat(),
+    )
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    memory_path = tmp_path / "published-reference.json"
+    payload = artifact.for_memory().to_dict()
+    failure = error_type("publication result is unknown")
+    calls = []
+
+    def uncertain_publication() -> None:
+        calls.append("publish")
+        if write_before_error:
+            # 模拟 Memory 已持久化、但成功回执未到达 Harness 的边界。
+            with memory_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+        raise failure
+
+    with pytest.raises(error_type) as raised:
+        journal.publish_reference(
+            claim,
+            uncertain_publication,
+            transaction_id="uncertain-publication",
+            prepared_at=now - timedelta(hours=2),
+        )
+    assert raised.value is failure
+
+    restarted_journal = s13.ArtifactRetentionJournal(session_dir)
+    restarted_externalizer = s13.ToolResultExternalizer(session_dir)
+    recovery = restarted_journal.recover(now=now)
+    assert recovery.pending_transaction_ids == ("uncertain-publication",)
+    assert recovery.states[0].phases == (s13.ArtifactLeasePhase.PREPARED,)
+    assert len(recovery.claims) == 1
+    assert recovery.claims[0].source_id == artifact.source.source_id
+    assert recovery.claims[0].retain_until is None
+    if write_before_error:
+        assert json.loads(memory_path.read_text(encoding="utf-8")) == payload
+    else:
+        assert not memory_path.exists()
+
+    journal_before = restarted_journal.path.read_bytes()
+    with pytest.raises(s13.ArtifactLeaseJournalError, match="reconciliation"):
+        restarted_journal.publish_reference(
+            claim,
+            uncertain_publication,
+            transaction_id="uncertain-publication",
+        )
+    assert calls == ["publish"]
+    assert restarted_journal.path.read_bytes() == journal_before
+
+    # 即使原租约和 orphan TTL 均已到期，不确定结果仍必须保护证据。
+    report = restarted_externalizer.cleanup_artifacts_from_journal(
+        restarted_journal,
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False),
+        now=now,
+    )
+    assert report.counts == {"retained_referenced": 1}
+    assert artifact.path.exists()
+
+
+def test_explicitly_rejected_publication_aborts_lease_and_allows_gc(
+    s13, tmp_path: Path
+) -> None:
     now = datetime(2026, 8, 29, 12, tzinfo=timezone.utc)
     session_dir = tmp_path / "aborted-session"
     externalizer = s13.ToolResultExternalizer(session_dir)
@@ -554,23 +632,38 @@ def test_failed_reference_publication_aborts_lease(s13, tmp_path: Path) -> None:
         "search",
         summary="Reference publisher raises before commit.",
     ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
     claim = s13.ArtifactRetentionClaim.from_memory_reference(artifact.for_memory())
     journal = s13.ArtifactRetentionJournal(session_dir)
+    rejection = s13.ArtifactPublicationRejected("memory adapter rejected the write")
 
     def reject_publication() -> None:
-        raise RuntimeError("memory adapter rejected the write")
+        raise rejection
 
-    with pytest.raises(RuntimeError, match="rejected the write"):
+    with pytest.raises(s13.ArtifactPublicationRejected, match="rejected the write") as raised:
         journal.publish_reference(
             claim,
             reject_publication,
             transaction_id="aborted-publication",
             prepared_at=now,
         )
+    assert raised.value is rejection
 
-    recovery = s13.ArtifactRetentionJournal(session_dir).recover(now=now)
+    restarted_journal = s13.ArtifactRetentionJournal(session_dir)
+    recovery = restarted_journal.recover(now=now)
     assert recovery.claims == ()
-    assert recovery.states[0].current_phase is s13.ArtifactLeasePhase.ABORTED
+    assert recovery.pending_transaction_ids == ()
+    assert recovery.states[0].phases == (
+        s13.ArtifactLeasePhase.PREPARED,
+        s13.ArtifactLeasePhase.ABORTED,
+    )
+    report = s13.ToolResultExternalizer(session_dir).cleanup_artifacts_from_journal(
+        restarted_journal,
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False),
+        now=now,
+    )
+    assert report.counts == {"deleted": 1}
+    assert not artifact.path.exists()
 
 
 def test_post_fsync_commit_crash_recovers_and_retry_is_idempotent(

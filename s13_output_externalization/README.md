@@ -231,7 +231,9 @@ ArtifactMemoryReference
 3. COMMITTED ── append + fsync ──▶ 引用确认可见
 ```
 
-如果步骤 2 正常失败，Harness 追加 `ABORTED`。如果进程在步骤 1 后退出，无论 Memory 写入尚未发生、正在发生，还是已经成功但步骤 3 尚未执行，fresh journal 都把 `PREPARED` 恢复为无过期时间的保护性 claim，并把 transaction ID 放入 `pending_transaction_ids` 等待可信 adapter 对账。它宁可暂时多保留证据，也不会猜测引用不存在。
+步骤 2 的异常不等于“引用未写入”：Memory 可能已持久化引用，只是成功回执因超时或连接中断没有到达 Harness。`publish_reference()` 只在可信 adapter 抛出 `ArtifactPublicationRejected` 时追加 `ABORTED`；该类型必须保证**引用没有写入，且没有仍可能提交的在途写入**。不能依据异常消息、HTTP 状态码或模型输出直接推断这个保证。
+
+其他异常（包括 `TimeoutError`、`ConnectionError`、`OSError` 和普通 `RuntimeError`）原样传播，租约保持 `PREPARED`。进程在步骤 1 后退出也采用同样的恢复方式：无论 Memory 写入尚未发生、正在发生，还是已经成功但步骤 3 尚未执行，fresh journal 都把 `PREPARED` 恢复为无过期时间的保护性 claim，并把 transaction ID 放入 `pending_transaction_ids` 等待可信 adapter 对账。即使原 `retain_until` 和 orphan TTL 已过期，GC 仍会保留证据；这是待对账状态，不是永久完成状态。
 
 删除方向采用相反的安全顺序：先由 Memory adapter 删除引用，成功后才追加 `RELEASED`。`remove_reference()` 封装了这个顺序；若删除失败或进程先退出，committed lease 继续保护 Artifact。
 
@@ -252,7 +254,18 @@ journal.remove_reference(
 )
 ```
 
-`publish_reference()` 不会自动重放已有 transaction ID。看到已有 `PREPARED` 时，Harness 必须先查询 Memory owner 再显式 `commit()` 或 `abort()`；看到已有 `COMMITTED` 时也不能再次调用 publisher。这样重试不会把“不确定是否已经成功”变成重复 Memory 写入。
+publisher 成功返回必须表示引用已持久化。明确拒绝可以来自完全未发起写入的 adapter 校验，例如：
+
+```python
+def publish_validated_reference():
+    if not memory_adapter.accepts(memory_reference):
+        # 仅本地校验，尚未发起任何写入。
+        raise ArtifactPublicationRejected("reference rejected before write")
+    # 不把这里的普通异常转换成明确拒绝：写入结果可能已经不确定。
+    return memory_adapter.append(memory_reference)
+```
+
+`publish_reference()` 不会自动重放已有 transaction ID。看到已有 `PREPARED` 时，Harness 必须先向 Memory owner 对账：确认引用已持久化才显式 `commit()`；确认引用未发布、并排除在途写入后才显式 `abort()`。一次查询“未找到”本身不足以排除延迟提交或读视图滞后。看到已有 `COMMITTED` 时也不能再次调用 publisher。这样重试不会把“不确定是否已经成功”变成重复 Memory 写入。
 
 清理分成两个阶段：
 
@@ -507,7 +520,7 @@ if (resultSize > CODEBUDDY_TOOL_RESULT_THRESHOLD_KB * 1024) {
    - policy 显式控制 orphan TTL、最大删除数量和 dry-run
 
 4. **`ArtifactRetentionJournal` / `ArtifactLeaseRecovery`** — 可崩溃恢复的租约所有者
-   - `prepared → committed → released` 与 `prepared → aborted` 显式表达引用发布结果
+   - `prepared → committed → released` 表达成功发布与释放；仅确认未发布且不会再提交时才允许 `prepared → aborted`
    - sequence + hash chain 检查完整记录；只丢弃未换行的崩溃尾部
    - fresh instance fold journal；pending prepare 默认继续保护证据
 

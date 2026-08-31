@@ -109,6 +109,13 @@ class ArtifactLeaseJournalError(RuntimeError):
     """A durable retention journal is corrupt or used out of phase."""
 
 
+class ArtifactPublicationRejected(RuntimeError):
+    """可信 Memory adapter 确认引用未写入，且没有仍可能提交的在途写入。
+
+    仅用于可证明的发布拒绝；超时、连接中断或普通异常不满足此契约。
+    """
+
+
 class ArtifactCleanupStatus(str, Enum):
     """Terminal or planned state for one artifact cleanup decision."""
 
@@ -1018,6 +1025,8 @@ class ArtifactRetentionJournal:
         *,
         aborted_at: datetime | None = None,
     ) -> ArtifactLeaseState:
+        """仅在可信 owner 确认引用未发布且不会再提交后，终止准备中的租约。"""
+
         return self._transition(
             transaction_id,
             ArtifactLeasePhase.ABORTED,
@@ -1033,7 +1042,11 @@ class ArtifactRetentionJournal:
         prepared_at: datetime | None = None,
         committed_at: datetime | None = None,
     ) -> tuple[ArtifactLeaseTransaction, _PublicationValue]:
-        """Prepare, invoke a Memory publisher, then commit its durable lease."""
+        """先准备租约，再发布引用；仅明确拒绝才 abort，不确定结果保持 PREPARED。
+
+        publisher 成功返回必须表示引用已持久化。普通异常原样传播，等待
+        Memory owner 对账；只有 ArtifactPublicationRejected 允许自动 abort。
+        """
 
         transaction, created = self._prepare(
             claim,
@@ -1046,7 +1059,7 @@ class ArtifactRetentionJournal:
             )
         try:
             value = publisher()
-        except Exception:
+        except ArtifactPublicationRejected:
             self.abort(transaction.transaction_id)
             raise
         self.commit(transaction.transaction_id, committed_at=committed_at)

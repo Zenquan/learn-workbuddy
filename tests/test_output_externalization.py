@@ -10,7 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, RLock
 
 import pytest
 
@@ -30,6 +30,112 @@ def s13():
     spec.loader.exec_module(module)
     yield module
     sys.modules.pop(name, None)
+
+
+class _OwnerFence:
+    def __init__(self, owner, transaction, observation):
+        self.owner = owner
+        self.transaction = transaction
+        self._observation = observation
+
+    @property
+    def observation(self):
+        return self._observation
+
+    def seal_absent(self):
+        record = self.owner.records[self.transaction.transaction_id]
+        if self.owner.change_generation_before_seal:
+            record["generation"] += 1
+            self.owner.change_generation_before_seal = False
+            raise self.owner.s13.ArtifactOwnerGenerationChanged("owner changed")
+        if record["generation"] != self._observation.generation:
+            raise self.owner.s13.ArtifactOwnerGenerationChanged("owner changed")
+        if record["presence"] is not self.owner.s13.ArtifactReferencePresence.ABSENT:
+            raise self.owner.s13.ArtifactOwnerGenerationChanged("reference appeared")
+        record["generation"] += 1
+        record["absence_sealed"] = True
+        self._observation = self.owner._observation(self.transaction.transaction_id)
+        return self._observation
+
+
+class _OwnerFenceContext:
+    def __init__(self, owner, transaction):
+        self.owner = owner
+        self.transaction = transaction
+
+    def __enter__(self):
+        self.owner.lock.acquire()
+        self.owner.inspections += 1
+        self.owner.records.setdefault(
+            self.transaction.transaction_id,
+            {
+                "generation": 0,
+                "presence": self.owner.s13.ArtifactReferencePresence.ABSENT,
+                "source_id": None,
+                "content_sha256": None,
+                "absence_sealed": False,
+            },
+        )
+        return _OwnerFence(
+            self.owner,
+            self.transaction,
+            self.owner._observation(self.transaction.transaction_id),
+        )
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.owner.lock.release()
+        return False
+
+
+class _FakeReferenceOwner:
+    """用排他锁模拟远端 Memory 的 generation fence 与缺失 tombstone。"""
+
+    def __init__(self, s13):
+        self.s13 = s13
+        self.lock = RLock()
+        self.records = {}
+        self.inspections = 0
+        self.change_generation_before_seal = False
+
+    def _observation(self, transaction_id):
+        record = self.records[transaction_id]
+        return self.s13.ArtifactReferenceObservation(
+            transaction_id=transaction_id,
+            generation=record["generation"],
+            presence=record["presence"],
+            source_id=record["source_id"],
+            content_sha256=record["content_sha256"],
+            absence_sealed=record["absence_sealed"],
+        )
+
+    def inspect_fenced(self, transaction):
+        return _OwnerFenceContext(self, transaction)
+
+    def set_unknown(self, transaction_id):
+        with self.lock:
+            self.records[transaction_id] = {
+                "generation": 1,
+                "presence": self.s13.ArtifactReferencePresence.UNKNOWN,
+                "source_id": None,
+                "content_sha256": None,
+                "absence_sealed": False,
+            }
+
+    def publish(self, transaction_id, claim):
+        with self.lock:
+            current = self.records.get(transaction_id)
+            if current is not None and current["absence_sealed"]:
+                raise self.s13.ArtifactPublicationRejected(
+                    "owner tombstone rejects late publication"
+                )
+            generation = 1 if current is None else current["generation"] + 1
+            self.records[transaction_id] = {
+                "generation": generation,
+                "presence": self.s13.ArtifactReferencePresence.PUBLISHED,
+                "source_id": claim.source_id,
+                "content_sha256": claim.content_sha256,
+                "absence_sealed": False,
+            }
 
 
 def test_externalized_result_separates_body_pointer_and_reference(s13, tmp_path: Path) -> None:
@@ -135,6 +241,35 @@ def test_invalid_summary_fails_before_creating_artifact(s13, tmp_path: Path) -> 
 def _set_artifact_age(path: Path, *, now: datetime, age_seconds: int) -> None:
     observed = now.timestamp() - age_seconds
     os.utime(path, (observed, observed))
+
+
+def _prepare_pending_lease(
+    s13,
+    tmp_path: Path,
+    transaction_id: str,
+    *,
+    expired: bool = True,
+):
+    now = datetime(2026, 9, 1, 9, tzinfo=timezone.utc)
+    session_dir = tmp_path / f"{transaction_id}-session"
+    externalizer = s13.ToolResultExternalizer(session_dir)
+    artifact = externalizer.externalize(
+        f"reconciliation evidence for {transaction_id}",
+        "search",
+        summary="A pending Memory publication needs owner reconciliation.",
+    ).artifact
+    _set_artifact_age(artifact.path, now=now, age_seconds=7_200)
+    claim = s13.ArtifactRetentionClaim.from_memory_reference(
+        artifact.for_memory(),
+        retain_until=(now - timedelta(hours=1)).isoformat() if expired else None,
+    )
+    journal = s13.ArtifactRetentionJournal(session_dir)
+    journal.prepare(
+        claim,
+        transaction_id=transaction_id,
+        prepared_at=now - timedelta(hours=2),
+    )
+    return now, session_dir, externalizer, artifact, claim, journal
 
 
 def test_cleanup_retains_memory_reference_and_deletes_expired_orphan(
@@ -664,6 +799,206 @@ def test_explicitly_rejected_publication_aborts_lease_and_allows_gc(
     )
     assert report.counts == {"deleted": 1}
     assert not artifact.path.exists()
+
+
+def test_reconciliation_commits_exact_published_reference_after_restart_and_is_idempotent(
+    s13, tmp_path: Path
+) -> None:
+    now, session_dir, externalizer, artifact, claim, _journal = _prepare_pending_lease(
+        s13,
+        tmp_path,
+        "published-owner-reference",
+        expired=False,
+    )
+    owner = _FakeReferenceOwner(s13)
+    owner.publish("published-owner-reference", claim)
+
+    restarted = s13.ArtifactRetentionJournal(session_dir)
+    reports = restarted.reconcile_pending(
+        owner,
+        resolved_at=now,
+    )
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.to_dict() == {
+        "transaction_id": "published-owner-reference",
+        "status": "committed",
+        "reason": "owner_confirmed_reference",
+        "observed_generation": 1,
+    }
+    recovery = s13.ArtifactRetentionJournal(session_dir).recover(now=now)
+    assert recovery.pending_transaction_ids == ()
+    assert recovery.states[0].current_phase is s13.ArtifactLeasePhase.COMMITTED
+
+    journal_before = restarted.path.read_bytes()
+    repeated = restarted.reconcile_reference("published-owner-reference", owner)
+    assert repeated.status is s13.ArtifactReconciliationStatus.ALREADY_COMMITTED
+    assert owner.inspections == 1
+    assert restarted.path.read_bytes() == journal_before
+
+    cleanup = externalizer.cleanup_artifacts_from_journal(
+        restarted,
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False),
+        now=now,
+    )
+    assert cleanup.counts == {"retained_referenced": 1}
+    assert artifact.path.exists()
+    assert str(tmp_path) not in json.dumps(report.to_dict(), sort_keys=True)
+
+
+def test_reconciliation_seals_absence_before_abort_and_rejects_late_publication(
+    s13, tmp_path: Path
+) -> None:
+    now, session_dir, externalizer, artifact, claim, journal = _prepare_pending_lease(
+        s13,
+        tmp_path,
+        "absent-owner-reference",
+    )
+    owner = _FakeReferenceOwner(s13)
+
+    report = journal.reconcile_reference(
+        "absent-owner-reference",
+        owner,
+        resolved_at=now,
+    )
+    assert report.status is s13.ArtifactReconciliationStatus.ABORTED
+    assert report.observed_generation == 1
+    assert owner.records["absent-owner-reference"]["absence_sealed"] is True
+    recovery = s13.ArtifactRetentionJournal(session_dir).recover(now=now)
+    assert recovery.pending_transaction_ids == ()
+    assert recovery.claims == ()
+    assert recovery.states[0].current_phase is s13.ArtifactLeasePhase.ABORTED
+
+    with pytest.raises(s13.ArtifactPublicationRejected, match="late publication"):
+        owner.publish("absent-owner-reference", claim)
+
+    cleanup = externalizer.cleanup_artifacts_from_journal(
+        journal,
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False),
+        now=now,
+    )
+    assert cleanup.counts == {"deleted": 1}
+    assert not artifact.path.exists()
+
+
+@pytest.mark.parametrize(
+    ("owner_setup", "expected_status", "expected_reason"),
+    [
+        ("unknown", "pending_unknown", "owner_result_unknown"),
+        ("mismatch", "pending_conflict", "owner_reference_mismatch"),
+        ("stale", "pending_stale", "owner_generation_changed"),
+    ],
+)
+def test_untrusted_or_stale_owner_result_remains_prepared_and_protects_gc(
+    s13,
+    tmp_path: Path,
+    owner_setup: str,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    now, session_dir, externalizer, artifact, claim, journal = _prepare_pending_lease(
+        s13,
+        tmp_path,
+        f"{owner_setup}-owner-reference",
+    )
+    transaction_id = f"{owner_setup}-owner-reference"
+    owner = _FakeReferenceOwner(s13)
+    if owner_setup == "unknown":
+        owner.set_unknown(transaction_id)
+    elif owner_setup == "mismatch":
+        owner.publish(transaction_id, claim)
+        owner.records[transaction_id]["content_sha256"] = "f" * 64
+    else:
+        owner.change_generation_before_seal = True
+
+    report = journal.reconcile_reference(transaction_id, owner, resolved_at=now)
+    assert report.status.value == expected_status
+    assert report.reason == expected_reason
+    recovery = s13.ArtifactRetentionJournal(session_dir).recover(now=now)
+    assert recovery.pending_transaction_ids == (transaction_id,)
+    assert recovery.states[0].phases == (s13.ArtifactLeasePhase.PREPARED,)
+    assert recovery.claims[0].retain_until is None
+
+    cleanup = externalizer.cleanup_artifacts_from_journal(
+        journal,
+        policy=s13.ArtifactCleanupPolicy(orphan_ttl_seconds=60, dry_run=False),
+        now=now,
+    )
+    assert cleanup.counts == {"retained_referenced": 1}
+    assert artifact.path.exists()
+
+
+def test_crash_after_owner_seal_recovers_without_reopening_publication_window(
+    s13, tmp_path: Path, monkeypatch
+) -> None:
+    now, session_dir, _externalizer, _artifact, claim, journal = _prepare_pending_lease(
+        s13,
+        tmp_path,
+        "seal-crash-reference",
+    )
+    owner = _FakeReferenceOwner(s13)
+
+    def crash_after_seal(name: str) -> None:
+        if name == "after_owner_absence_sealed":
+            raise RuntimeError("simulated exit after owner tombstone fsync")
+
+    monkeypatch.setattr(journal, "_checkpoint", crash_after_seal)
+    with pytest.raises(RuntimeError, match="owner tombstone fsync"):
+        journal.reconcile_reference("seal-crash-reference", owner, resolved_at=now)
+
+    assert owner.records["seal-crash-reference"]["absence_sealed"] is True
+    restarted = s13.ArtifactRetentionJournal(session_dir)
+    assert restarted.recover(now=now).pending_transaction_ids == (
+        "seal-crash-reference",
+    )
+    with pytest.raises(s13.ArtifactPublicationRejected):
+        owner.publish("seal-crash-reference", claim)
+
+    report = restarted.reconcile_reference(
+        "seal-crash-reference",
+        owner,
+        resolved_at=now,
+    )
+    assert report.status is s13.ArtifactReconciliationStatus.ABORTED
+    assert report.observed_generation == 1
+    assert restarted.recover(now=now).pending_transaction_ids == ()
+
+
+def test_concurrent_reconciliation_appends_one_terminal_transition(
+    s13, tmp_path: Path
+) -> None:
+    now, session_dir, _externalizer, _artifact, claim, journal = _prepare_pending_lease(
+        s13,
+        tmp_path,
+        "concurrent-owner-reference",
+    )
+    owner = _FakeReferenceOwner(s13)
+    owner.publish("concurrent-owner-reference", claim)
+    barrier = Barrier(2)
+
+    def reconcile_once():
+        barrier.wait()
+        return journal.reconcile_reference(
+            "concurrent-owner-reference",
+            owner,
+            resolved_at=now,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reports = list(executor.map(lambda _index: reconcile_once(), range(2)))
+
+    assert {report.status for report in reports} == {
+        s13.ArtifactReconciliationStatus.COMMITTED,
+        s13.ArtifactReconciliationStatus.ALREADY_COMMITTED,
+    }
+    records = [
+        json.loads(line)
+        for line in journal.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["phase"] for record in records] == ["prepared", "committed"]
+    assert s13.ArtifactRetentionJournal(session_dir).recover(
+        now=now
+    ).pending_transaction_ids == ()
 
 
 def test_post_fsync_commit_crash_recovers_and_retry_is_idempotent(

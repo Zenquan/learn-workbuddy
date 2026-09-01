@@ -122,7 +122,7 @@ Manifest 只是一份验收报告，不是新的 Memory 真源。需要核验时
 - **重复不等于多存一份。** Workspace 用 evidence IDs 合并重复事实；User preference 用稳定 key 返回 `unchanged`。
 - **同一 state root 不等于同一用户。** Alice 和 Bob 的 scope digest 不同，不能互读 canonical state。
 - **引用不等于复制。** Memory-facing Artifact reference 没有 `content` 字段，大结果仍归 Artifact 文件所有。
-- **发布不等于立即可信。** lease intent 必须先于 Memory 引用落盘；重启遇到 pending prepare 时默认保留 Artifact，等待 owner 对账。
+- **发布不等于立即可信。** lease intent 必须先于 Memory 引用落盘；重启遇到 pending prepare 时默认保留 Artifact，等待 generation-fenced owner 对账。确认缺失时必须先在 owner 侧封存稳定 transaction ID、拒绝迟到写入，再把 lease 标成 `ABORTED`。
 - **清理不等于删除整个 session。** active claim 只按 source ID + 完整 digest 保护对应证据；达到 TTL 的无引用孤儿才能在重验后删除。
 - **恢复不等于复用旧对象。** walkthrough 明确创建 fresh store instances，再从磁盘重建视图。
 - **摘要不拥有事实。** S14 只压缩 messages 副本，source-bearing facts 和 pending items 单独渲染。

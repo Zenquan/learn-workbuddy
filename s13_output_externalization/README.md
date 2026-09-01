@@ -20,6 +20,8 @@ flowchart LR
     F -. "later policy" .-> G["Memory Reference<br/>summary + pointer, no body"]
     G --> H["ArtifactRetentionClaim<br/>source ID + digest + lease"]
     H --> L["Lease Journal<br/>prepared → committed → released"]
+    L --> R["Owner Reconciliation<br/>generation fence + tombstone"]
+    R --> L
     C --> I["plan_cleanup → snapshot"]
     L --> I
     I --> J["retain referenced / recent<br/>delete expired orphan"]
@@ -38,6 +40,7 @@ flowchart LR
 - Memory 只能接收 `ArtifactMemoryReference`，保留必要摘要与可检索指针，不复制大结果正文。
 - 用无路径 `ArtifactRetentionClaim` 把 Memory 引用投影为清理租约；物理路径始终由 S13 的可信 session root 决定。
 - 在 Memory 发布引用前先把 lease intent 追加并 fsync 到 journal；重启后从 journal 恢复当前 claim view。
+- 用稳定 transaction ID 和 generation-fenced owner observation 对账 pending lease；不确定结果继续保护 Artifact。
 - 清理分成 plan/apply 两阶段，执行前重新核验文件 identity、mtime、大小与 SHA-256；变化时 fail-closed。
 - 模拟按需读取片段, 类似缺页中断。
 - 为 s14 的压缩减轻压力。
@@ -53,6 +56,7 @@ flowchart LR
 - 直接相信 Memory 中的 `artifact_path` 做删除，会把不可信持久化数据变成任意文件删除入口。
 - 先发布 Memory 引用、后记录进程内 claim，会在崩溃窗口里产生无法证明归属的 Artifact。
 - 删除 Memory 引用前先释放 lease，会在相反的崩溃窗口里留下仍可访问但已失去保护的指针。
+- 把一次“未找到”查询直接当成 `ABSENT`，会漏掉读取滞后、并发更新或迟到写入；缺失必须先在 owner 侧封存。
 - 扫描到未知文件、符号链接、digest 冲突或竞态仍继续删除，违背证据清理的 fail-closed 边界。
 
 ## 问题
@@ -265,7 +269,33 @@ def publish_validated_reference():
     return memory_adapter.append(memory_reference)
 ```
 
-`publish_reference()` 不会自动重放已有 transaction ID。看到已有 `PREPARED` 时，Harness 必须先向 Memory owner 对账：确认引用已持久化才显式 `commit()`；确认引用未发布、并排除在途写入后才显式 `abort()`。一次查询“未找到”本身不足以排除延迟提交或读视图滞后。看到已有 `COMMITTED` 时也不能再次调用 publisher。这样重试不会把“不确定是否已经成功”变成重复 Memory 写入。
+`publish_reference()` 不会自动重放已有 transaction ID。看到已有 `PREPARED` 时，Harness 必须先向 Memory owner 对账：确认引用已持久化才 `commit()`；确认引用未发布、并排除在途写入后才 `abort()`。一次查询“未找到”本身不足以排除延迟提交或读视图滞后。看到已有 `COMMITTED` 时也不能再次调用 publisher。这样重试不会把“不确定是否已经成功”变成重复 Memory 写入。
+
+#### Generation-fenced owner reconciliation
+
+`ArtifactReferenceOwner` 是 Memory adapter 必须实现的可信边界。`inspect_fenced(transaction)` 返回的 context manager 在整个裁决期间排除同一 transaction ID 的发布变化，并提供 `ArtifactReferenceObservation`：
+
+| owner observation | Harness 行为 | lease 结果 |
+|---|---|---|
+| `PUBLISHED`，source ID 与完整 digest 都匹配 | fence 内追加 `COMMITTED` | 引用按原租约保护 |
+| `PUBLISHED`，identity 不匹配 | 记录 `pending_conflict` | 保持 `PREPARED`，无限期保护 |
+| `UNKNOWN` | 记录 `pending_unknown` | 保持 `PREPARED`，等待重试 |
+| 未封存的 `ABSENT` | owner 先用 CAS 写 tombstone 并推进 generation | seal 成功后追加 `ABORTED` |
+| seal 前 generation 变化 | 记录 `pending_stale` | 保持 `PREPARED`，重新观察 |
+| 已封存的 `ABSENT` | 不重复 seal，直接完成 journal transition | 追加 `ABORTED` |
+
+缺失路径刻意采用 `owner tombstone → journal ABORTED` 的顺序。tombstone 必须永久拒绝这个稳定 transaction ID 的迟到写入和未来重放。如果进程在 tombstone fsync 后、journal append 前退出，Artifact 仍受 `PREPARED` 保护；重启后 owner 返回已封存的 absence，再安全完成 `ABORTED`。反过来先 abort 再封存，会重新打开“GC 已删除证据、迟到 Memory 引用随后可见”的窗口。
+
+```python
+# adapter 自己负责把数据库行版本、ETag 或对象 generation 映射为 fence。
+reports = journal.reconcile_pending(memory_owner_adapter)
+for report in reports:
+    audit_sink.append(report.to_dict())
+```
+
+`reconcile_pending()` 只处理调用开始时看到的 pending snapshot；并发新增的 prepare 留给下一轮。单条 `reconcile_reference()` 和 terminal report 都是幂等的：并发 reconciler 最多追加一个终态事件，后来者得到 `already_committed`、`already_aborted` 或 `already_released`。报告只包含 transaction ID、状态、原因和 generation，不携带物理路径、Memory 正文或凭证。
+
+这里不能由 S13 提供一个“适配所有 Memory”的默认实现：本地 JSONL、SQLite、远端数据库和对象存储的线性化点不同。具体 adapter 必须在真正的 Memory owner 内实现排他 fence、条件 tombstone 和稳定 publication ID；仅在客户端查询两次 generation 不能替代服务端 CAS 或事务。
 
 清理分成两个阶段：
 
@@ -524,20 +554,25 @@ if (resultSize > CODEBUDDY_TOOL_RESULT_THRESHOLD_KB * 1024) {
    - sequence + hash chain 检查完整记录；只丢弃未换行的崩溃尾部
    - fresh instance fold journal；pending prepare 默认继续保护证据
 
-5. **`ArtifactCleanupPlan` / `ArtifactCleanupReport`** — 两阶段、可审计清理
+5. **`ArtifactReferenceOwner` / `ArtifactReconciliationReport`** — generation-fenced Memory 对账
+   - owner fence 下核对稳定 transaction ID、source ID、完整 digest 与 generation
+   - 缺失先封存再 abort；unknown、conflict、stale 都保持 pending
+   - terminal retry 和并发 reconciler 幂等，报告不暴露路径或 Memory 正文
+
+6. **`ArtifactCleanupPlan` / `ArtifactCleanupReport`** — 两阶段、可审计清理
    - plan 冻结文件快照并解释每个 retain/delete 决策，不产生写操作
    - journal-aware apply 在同一排他锁内恢复 claims、重验 identity 与 digest
 
-6. **`MockLLM`** — 模拟 LLM 的行为
+7. **`MockLLM`** — 模拟 LLM 的行为
    - 按预设脚本生成工具调用
    - 看到外部化指针时，决定是否触发"缺页中断"（调 Read 读完整输出）
 
-7. **Agent 循环** — 集成外部化
+8. **Agent 循环** — 集成外部化
    - 工具执行后检查是否需要外部化
    - 需要则写 artifact + 生成结构化 reference + 替换上下文内容
    - 打印 `[externalize]` 日志，显示节省效果
 
-8. **Demo 场景** — 完整演示
+9. **Demo 场景** — 完整演示
    - 模拟一条产生 1.3MB 输出的 grep 命令
    - 展示外部化前后的上下文大小对比
    - 模拟 agent 需要完整输出时的缺页中断
@@ -567,7 +602,7 @@ python s13_output_externalization/code.py
 ## 练习
 
 1. 当前 `make_pointer` 保留 head 6KB + tail 24KB。如果 agent 最常需要的是输出的中间部分（比如第 40000 行的错误），怎么改进预览策略？提示：考虑基于正则匹配的关键行提取，或分块索引。
-2. 为 `pending_transaction_ids` 实现 owner reconciliation adapter：根据 Memory 中的稳定 reference ID 决定 `commit` 或 `abort`，并用 generation fence 证明对账期间的并发更新不会被旧结果覆盖。
+2. 为你使用的真实 Memory 数据库实现 `ArtifactReferenceOwner`：把数据库行版本、ETag 或对象 generation 映射成排他 fence，并证明 tombstone 能拒绝已经发出但尚未完成的迟到写入。
 3. 当前的 `should_externalize` 只看输出大小。如果一条命令的输出是 30KB 的随机字符串（对 agent 无用）vs 30KB 的结构化 JSON（每行都有用），应该用不同策略吗？思考：能否让外部化策略感知输出的信息密度？
 
 ---

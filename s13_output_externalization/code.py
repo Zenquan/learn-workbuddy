@@ -36,12 +36,12 @@ import re
 import tempfile
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 if os.name == "nt":
     import msvcrt
@@ -59,6 +59,7 @@ PROGRESSION = {
         "page-fault reads",
         "reference-aware artifact retention",
         "crash-recoverable retention lease journal",
+        "generation-fenced Memory owner reconciliation",
     ],
     "preserves": ["context budget mindset", "memory as a selective derived view"],
 }
@@ -116,6 +117,10 @@ class ArtifactPublicationRejected(RuntimeError):
     """
 
 
+class ArtifactOwnerGenerationChanged(RuntimeError):
+    """Memory owner generation changed before an absence proof could be sealed."""
+
+
 class ArtifactCleanupStatus(str, Enum):
     """Terminal or planned state for one artifact cleanup decision."""
 
@@ -139,6 +144,27 @@ class ArtifactLeasePhase(str, Enum):
     COMMITTED = "committed"
     RELEASED = "released"
     ABORTED = "aborted"
+
+
+class ArtifactReferencePresence(str, Enum):
+    """One fenced Memory-owner observation for a stable publication ID."""
+
+    PUBLISHED = "published"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
+class ArtifactReconciliationStatus(str, Enum):
+    """Auditable result of reconciling one durable lease transaction."""
+
+    COMMITTED = "committed"
+    ABORTED = "aborted"
+    PENDING_UNKNOWN = "pending_unknown"
+    PENDING_CONFLICT = "pending_conflict"
+    PENDING_STALE = "pending_stale"
+    ALREADY_COMMITTED = "already_committed"
+    ALREADY_ABORTED = "already_aborted"
+    ALREADY_RELEASED = "already_released"
 
 
 @dataclass(frozen=True)
@@ -583,6 +609,126 @@ class ArtifactLeaseRecovery:
         }
 
 
+@dataclass(frozen=True)
+class ArtifactReferenceObservation:
+    """Path-free Memory state captured while its generation fence is held.
+
+    ``absence_sealed`` means the owner has durably tombstoned this transaction
+    ID, so delayed or future writes for it can no longer become visible.
+    """
+
+    transaction_id: str
+    generation: int
+    presence: ArtifactReferencePresence
+    source_id: str | None = None
+    content_sha256: str | None = None
+    absence_sealed: bool = False
+
+    def __post_init__(self) -> None:
+        _source_component(self.transaction_id, field_name="lease transaction ID")
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 0
+        ):
+            raise ArtifactRetentionError("owner generation must be a non-negative integer")
+        if not isinstance(self.presence, ArtifactReferencePresence):
+            raise ArtifactRetentionError("owner presence must use the typed enum")
+        if not isinstance(self.absence_sealed, bool):
+            raise ArtifactRetentionError("owner absence seal must be boolean")
+        if self.presence is ArtifactReferencePresence.PUBLISHED:
+            if not isinstance(self.source_id, str) or not isinstance(
+                self.content_sha256,
+                str,
+            ):
+                raise ArtifactRetentionError(
+                    "published owner observation requires source ID and digest"
+                )
+            parse_artifact_source_id(self.source_id)
+            if not _FULL_SHA256_PATTERN.fullmatch(self.content_sha256):
+                raise ArtifactRetentionError(
+                    "published owner observation requires a full SHA-256 digest"
+                )
+            if self.absence_sealed:
+                raise ArtifactRetentionError(
+                    "published owner observation cannot be sealed absent"
+                )
+            return
+        if self.source_id is not None or self.content_sha256 is not None:
+            raise ArtifactRetentionError(
+                "non-published owner observation cannot carry reference identity"
+            )
+        if (
+            self.presence is ArtifactReferencePresence.UNKNOWN
+            and self.absence_sealed
+        ):
+            raise ArtifactRetentionError("unknown owner observation cannot be sealed")
+
+
+class ArtifactReferenceFence(Protocol):
+    """Exclusive owner view that remains valid until its context exits."""
+
+    @property
+    def observation(self) -> ArtifactReferenceObservation:
+        """Return the owner state protected by this fence."""
+
+    def seal_absent(self) -> ArtifactReferenceObservation:
+        """CAS an unsealed absence into a durable tombstone and advance generation."""
+
+
+class ArtifactReferenceOwner(Protocol):
+    """Trusted Memory adapter for one stable publication transaction ID.
+
+    The context must exclude publication changes for the transaction while it
+    is held. A sealed absence must also reject delayed and future publication.
+    """
+
+    def inspect_fenced(
+        self,
+        transaction: ArtifactLeaseTransaction,
+    ) -> AbstractContextManager[ArtifactReferenceFence]:
+        """Observe the transaction while holding its owner generation fence."""
+
+
+@dataclass(frozen=True)
+class ArtifactReconciliationReport:
+    """Path-free reconciliation outcome suitable for logs and operator UI."""
+
+    transaction_id: str
+    status: ArtifactReconciliationStatus
+    reason: str
+    observed_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        _source_component(self.transaction_id, field_name="lease transaction ID")
+        if not isinstance(self.status, ArtifactReconciliationStatus):
+            raise ArtifactRetentionError("reconciliation status must use the typed enum")
+        if (
+            not isinstance(self.reason, str)
+            or not self.reason
+            or len(self.reason) > 200
+        ):
+            raise ArtifactRetentionError(
+                "reconciliation reason must contain at most 200 characters"
+            )
+        if self.observed_generation is not None and (
+            isinstance(self.observed_generation, bool)
+            or not isinstance(self.observed_generation, int)
+            or self.observed_generation < 0
+        ):
+            raise ArtifactRetentionError(
+                "reconciliation generation must be a non-negative integer"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "transaction_id": self.transaction_id,
+            "status": self.status.value,
+            "reason": self.reason,
+            "observed_generation": self.observed_generation,
+        }
+
+
 class ArtifactRetentionJournal:
     """Crash-recoverable owner for Artifact retention leases.
 
@@ -981,19 +1127,231 @@ class ArtifactRetentionJournal:
                 )
             if state.current_phase is phase:
                 return state
-            self._validate_transition(state.current_phase, phase)
-            self._append_event_unlocked(
+            return self._transition_unlocked(
                 events,
-                state.transaction,
+                state,
                 phase,
                 recorded_at=recorded_at,
             )
-            updated = ArtifactLeaseState(
-                transaction=state.transaction,
-                phases=(*state.phases, phase),
+
+    def _transition_unlocked(
+        self,
+        events: Sequence[dict[str, object]],
+        state: ArtifactLeaseState,
+        phase: ArtifactLeasePhase,
+        *,
+        recorded_at: datetime | None = None,
+    ) -> ArtifactLeaseState:
+        """Append one transition while the caller holds the journal lock."""
+
+        self._validate_transition(state.current_phase, phase)
+        self._append_event_unlocked(
+            events,
+            state.transaction,
+            phase,
+            recorded_at=recorded_at,
+        )
+        updated = ArtifactLeaseState(
+            transaction=state.transaction,
+            phases=(*state.phases, phase),
+        )
+        self._checkpoint(f"after_{phase.value}")
+        return updated
+
+    @staticmethod
+    def _state_by_transaction_id(
+        states: Sequence[ArtifactLeaseState],
+        transaction_id: str,
+    ) -> ArtifactLeaseState | None:
+        return next(
+            (
+                state
+                for state in states
+                if state.transaction.transaction_id == transaction_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _terminal_reconciliation_report(
+        state: ArtifactLeaseState,
+    ) -> ArtifactReconciliationReport | None:
+        statuses = {
+            ArtifactLeasePhase.COMMITTED: (
+                ArtifactReconciliationStatus.ALREADY_COMMITTED,
+                "lease_already_committed",
+            ),
+            ArtifactLeasePhase.ABORTED: (
+                ArtifactReconciliationStatus.ALREADY_ABORTED,
+                "lease_already_aborted",
+            ),
+            ArtifactLeasePhase.RELEASED: (
+                ArtifactReconciliationStatus.ALREADY_RELEASED,
+                "lease_already_released",
+            ),
+        }
+        result = statuses.get(state.current_phase)
+        if result is None:
+            return None
+        status, reason = result
+        return ArtifactReconciliationReport(
+            transaction_id=state.transaction.transaction_id,
+            status=status,
+            reason=reason,
+        )
+
+    def reconcile_reference(
+        self,
+        transaction_id: str,
+        owner: ArtifactReferenceOwner,
+        *,
+        resolved_at: datetime | None = None,
+    ) -> ArtifactReconciliationReport:
+        """Resolve one PREPARED lease while a trusted owner fence is held.
+
+        Presence must match the original source and digest. Absence is terminal
+        only after the owner durably seals the transaction ID against delayed
+        publication. Every other result remains conservatively PREPARED.
+        """
+
+        normalized_id = _source_component(
+            transaction_id,
+            field_name="lease transaction ID",
+        )
+        with _exclusive_journal_lock(self.path):
+            _events, states = self._read_states_unlocked()
+            state = self._state_by_transaction_id(states, normalized_id)
+            if state is None:
+                raise ArtifactLeaseJournalError(
+                    f"unknown lease transaction: {normalized_id}"
+                )
+            terminal = self._terminal_reconciliation_report(state)
+            if terminal is not None:
+                return terminal
+            transaction = state.transaction
+
+        # Memory I/O 不占用 journal lock；拿到 owner fence 后再重读 journal，
+        # 同时避免长时间查询阻塞 GC，也避免使用查询前的陈旧 lease 状态。
+        with owner.inspect_fenced(transaction) as fence:
+            observation = fence.observation
+            if not isinstance(observation, ArtifactReferenceObservation):
+                raise ArtifactRetentionError(
+                    "owner fence returned an invalid reference observation"
+                )
+            with _exclusive_journal_lock(self.path):
+                events, states = self._read_states_unlocked()
+                current = self._state_by_transaction_id(states, normalized_id)
+                if current is None:
+                    raise ArtifactLeaseJournalError(
+                        f"unknown lease transaction: {normalized_id}"
+                    )
+                terminal = self._terminal_reconciliation_report(current)
+                if terminal is not None:
+                    return terminal
+                if current.transaction != transaction:
+                    raise ArtifactLeaseJournalError(
+                        f"lease transaction {normalized_id} changed during reconciliation"
+                    )
+                if observation.transaction_id != normalized_id:
+                    return ArtifactReconciliationReport(
+                        transaction_id=normalized_id,
+                        status=ArtifactReconciliationStatus.PENDING_CONFLICT,
+                        reason="owner_transaction_mismatch",
+                        observed_generation=observation.generation,
+                    )
+                if observation.presence is ArtifactReferencePresence.UNKNOWN:
+                    return ArtifactReconciliationReport(
+                        transaction_id=normalized_id,
+                        status=ArtifactReconciliationStatus.PENDING_UNKNOWN,
+                        reason="owner_result_unknown",
+                        observed_generation=observation.generation,
+                    )
+                if observation.presence is ArtifactReferencePresence.PUBLISHED:
+                    claim = transaction.claim
+                    if (
+                        observation.source_id != claim.source_id
+                        or observation.content_sha256 != claim.content_sha256
+                    ):
+                        return ArtifactReconciliationReport(
+                            transaction_id=normalized_id,
+                            status=ArtifactReconciliationStatus.PENDING_CONFLICT,
+                            reason="owner_reference_mismatch",
+                            observed_generation=observation.generation,
+                        )
+                    self._transition_unlocked(
+                        events,
+                        current,
+                        ArtifactLeasePhase.COMMITTED,
+                        recorded_at=resolved_at,
+                    )
+                    return ArtifactReconciliationReport(
+                        transaction_id=normalized_id,
+                        status=ArtifactReconciliationStatus.COMMITTED,
+                        reason="owner_confirmed_reference",
+                        observed_generation=observation.generation,
+                    )
+
+                sealed = observation
+                if not sealed.absence_sealed:
+                    try:
+                        sealed = fence.seal_absent()
+                    except ArtifactOwnerGenerationChanged:
+                        return ArtifactReconciliationReport(
+                            transaction_id=normalized_id,
+                            status=ArtifactReconciliationStatus.PENDING_STALE,
+                            reason="owner_generation_changed",
+                            observed_generation=observation.generation,
+                        )
+                    if not isinstance(sealed, ArtifactReferenceObservation):
+                        raise ArtifactRetentionError(
+                            "owner fence returned an invalid sealed observation"
+                        )
+                    if sealed.generation <= observation.generation:
+                        raise ArtifactRetentionError(
+                            "sealing owner absence must advance its generation"
+                        )
+                if (
+                    sealed.transaction_id != normalized_id
+                    or sealed.presence is not ArtifactReferencePresence.ABSENT
+                    or not sealed.absence_sealed
+                ):
+                    return ArtifactReconciliationReport(
+                        transaction_id=normalized_id,
+                        status=ArtifactReconciliationStatus.PENDING_CONFLICT,
+                        reason="owner_absence_not_sealed",
+                        observed_generation=sealed.generation,
+                    )
+                self._checkpoint("after_owner_absence_sealed")
+                self._transition_unlocked(
+                    events,
+                    current,
+                    ArtifactLeasePhase.ABORTED,
+                    recorded_at=resolved_at,
+                )
+                return ArtifactReconciliationReport(
+                    transaction_id=normalized_id,
+                    status=ArtifactReconciliationStatus.ABORTED,
+                    reason="owner_sealed_absence",
+                    observed_generation=sealed.generation,
+                )
+
+    def reconcile_pending(
+        self,
+        owner: ArtifactReferenceOwner,
+        *,
+        resolved_at: datetime | None = None,
+    ) -> tuple[ArtifactReconciliationReport, ...]:
+        """Reconcile the pending snapshot; later prepares remain for the next run."""
+
+        pending = self.recover(now=resolved_at).pending_transaction_ids
+        return tuple(
+            self.reconcile_reference(
+                transaction_id,
+                owner,
+                resolved_at=resolved_at,
             )
-            self._checkpoint(f"after_{phase.value}")
-            return updated
+            for transaction_id in pending
+        )
 
     def commit(
         self,

@@ -16,7 +16,11 @@ from mini_workbuddy.agent import MiniAgent
 from mini_workbuddy.config import HarnessConfig, workspace_id
 from mini_workbuddy.events import Event, EventBus
 from mini_workbuddy.server import HarnessRuntime
-from mini_workbuddy.storage import Storage
+from mini_workbuddy.storage import (
+    Storage,
+    TranscriptCorruptionError,
+    TranscriptValidationError,
+)
 from mini_workbuddy.tools import PermissionError, ToolRegistry
 
 
@@ -46,9 +50,94 @@ def test_storage_appends_and_recovers_transcript(tmp_path: Path) -> None:
 
     transcript = storage.read_transcript(session)
     assert [event["content"] for event in transcript] == ["hello", "world"]
+    assert [event["sequence"] for event in transcript] == [1, 2]
+    assert [event["event_id"] for event in transcript] == [
+        f"transcript:{session.id}:1",
+        f"transcript:{session.id}:2",
+    ]
+    assert all(event["schema_version"] == 1 for event in transcript)
     assert storage.transcript_path(session).exists()
     assert storage.load_session(session.id).title == "storage"
     assert storage.list_sessions()[0].id == session.id
+
+
+def test_storage_rejects_spoofed_transcript_envelope(tmp_path: Path) -> None:
+    storage = Storage(HarnessConfig(root_dir=tmp_path / "home"))
+    session = storage.create_session(str(tmp_path), "storage")
+
+    with pytest.raises(TranscriptValidationError, match="reserved envelope"):
+        storage.append_event(
+            session,
+            {
+                "type": "message",
+                "content": "spoofed",
+                "event_id": "transcript:other-session:99",
+            },
+        )
+
+    assert storage.read_transcript(session) == []
+
+
+def test_storage_recovers_unterminated_tail_before_next_append(
+    tmp_path: Path,
+) -> None:
+    config = HarnessConfig(root_dir=tmp_path / "home")
+    storage = Storage(config)
+    session = storage.create_session(str(tmp_path), "storage")
+    storage.append_event(session, {"type": "message", "content": "before"})
+
+    with storage.transcript_path(session).open("ab") as handle:
+        handle.write(b'{"type":')
+
+    assert [event["content"] for event in storage.read_transcript(session)] == [
+        "before"
+    ]
+
+    restarted = Storage(config)
+    restarted.append_event(session, {"type": "message", "content": "after"})
+    transcript = restarted.read_transcript(session)
+
+    assert [event["content"] for event in transcript] == ["before", "after"]
+    assert [event["sequence"] for event in transcript] == [1, 2]
+    assert len(storage.transcript_path(session).read_text().splitlines()) == 2
+
+
+def test_storage_rejects_complete_corrupt_transcript_record(
+    tmp_path: Path,
+) -> None:
+    storage = Storage(HarnessConfig(root_dir=tmp_path / "home"))
+    session = storage.create_session(str(tmp_path), "storage")
+    storage.append_event(session, {"type": "message", "content": "safe"})
+
+    with storage.transcript_path(session).open("a", encoding="utf-8") as handle:
+        handle.write("{broken}\n")
+
+    with pytest.raises(TranscriptCorruptionError, match="invalid complete JSON"):
+        storage.read_transcript(session)
+    with pytest.raises(TranscriptCorruptionError, match="invalid complete JSON"):
+        storage.append_event(session, {"type": "message", "content": "unsafe"})
+
+
+def test_storage_serializes_concurrent_session_appends(tmp_path: Path) -> None:
+    config = HarnessConfig(root_dir=tmp_path / "home")
+    storages = [Storage(config) for _ in range(4)]
+    session = storages[0].create_session(str(tmp_path), "storage")
+
+    def append(index: int) -> None:
+        storages[index % len(storages)].append_event(
+            session,
+            {"type": "message", "content": str(index)},
+        )
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(append, range(100)))
+
+    transcript = storages[0].read_transcript(session)
+    assert len(transcript) == 100
+    assert [event["sequence"] for event in transcript] == list(range(1, 101))
+    assert {event["content"] for event in transcript} == {
+        str(index) for index in range(100)
+    }
 
 
 def test_storage_appends_and_reads_memory(tmp_path: Path) -> None:

@@ -17,7 +17,7 @@
 - **无法安全解析的命令**：例如不平衡引号。现在会 fail closed，返回拒绝，而不是崩溃或继续执行。
 - **bash 子进程直接继承宿主凭据的风险**：S02 与 `mini_workbuddy` 会重新构造子进程环境，只保留 `PATH`、语言区域和临时目录变量，并把 `HOME`、`PWD` 指向当前工作区。`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`SSH_AUTH_SOCK` 及任意未列入允许列表的父进程变量不会传入工具进程。相关测试在 `test_s02_tool_dispatch.py` 和 `test_mini_workbuddy.py`。
 - **审计链的并发追加、崩溃恢复与篡改检测**：`AuditLog` 先用进程内锁串行化同一服务中的线程，再用文件锁协调共享目录的进程；它在锁内校验索引、哈希链和 head anchor，发现损坏就拒绝继续写。新条目以 `O_APPEND` 写入并 `fsync`，随后原子替换记录条目数和链尾哈希的 `audit.head`。若进程在两次持久化之间退出，`HarnessRuntime` 只会在完整哈希链有效、旧 anchor 精确指向倒数第二条且仅多一条记录时推进 anchor。哈希链检测历史条目被修改，head anchor 检测删尾截断；裸哈希链做不到后者，因为任何合法前缀本身仍是一条合法链。
-- **运行时 Transcript 的完整记录边界**：`mini_workbuddy.storage` 为每条事件写入 `schema_version`、单调 `sequence`、稳定 `event_id` 和 `session_id`，在同一进程内串行化同一会话的追加，并以 `O_APPEND`、完整写入和 `fsync` 持久化。读取时会校验完整 JSON 行的序号、会话和事件 ID；只有没有换行的最后一段会被视为尚未提交的崩溃尾行，并在下一次追加前删除。完整坏行不会被静默跳过。
+- **运行时 Transcript 的完整记录边界**：`mini_workbuddy.storage` 为每条事件写入 `schema_version`、单调 `sequence`、稳定 `event_id` 和 `session_id`，在同一进程内串行化同一会话的追加，并以 `O_APPEND`、完整写入和 `fsync` 持久化。读取时会校验完整 JSON 行的序号、会话和事件 ID；只有没有换行的最后一段会被视为尚未提交的崩溃尾行，并在下一次追加前删除。完整坏行不会被静默跳过。`MiniAgent` 在执行工具前先持久化带 `tool_call_id` 的 `tool_call`，再写入引用同一 ID 的 `tool_result` 或 `tool_error`；Audit 与 SSE 只在相应 Transcript 事件落盘后发布，并引用其 `event_id`。
 - **上下文洪泛**：超过阈值的大工具输出会写入文件，prompt 里只保留预览和指针，避免多 MB 输出挤爆上下文窗口。
 
 ## 教学 harness 明确挡不住的东西

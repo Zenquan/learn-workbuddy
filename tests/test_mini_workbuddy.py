@@ -45,8 +45,14 @@ def test_storage_appends_and_recovers_transcript(tmp_path: Path) -> None:
     storage = Storage(config)
     session = storage.create_session(str(tmp_path), "storage")
 
-    storage.append_event(session, {"type": "message", "role": "user", "content": "hello"})
-    storage.append_event(session, {"type": "message", "role": "assistant", "content": "world"})
+    first = storage.append_event(
+        session,
+        {"type": "message", "role": "user", "content": "hello"},
+    )
+    second = storage.append_event(
+        session,
+        {"type": "message", "role": "assistant", "content": "world"},
+    )
 
     transcript = storage.read_transcript(session)
     assert [event["content"] for event in transcript] == ["hello", "world"]
@@ -56,6 +62,8 @@ def test_storage_appends_and_recovers_transcript(tmp_path: Path) -> None:
         f"transcript:{session.id}:2",
     ]
     assert all(event["schema_version"] == 1 for event in transcript)
+    assert first == transcript[0]
+    assert second == transcript[1]
     assert storage.transcript_path(session).exists()
     assert storage.load_session(session.id).title == "storage"
     assert storage.list_sessions()[0].id == session.id
@@ -424,16 +432,77 @@ def test_tool_call_ids_are_unique_under_fast_repeated_calls(tmp_path: Path) -> N
     assert len(ids) == 200
 
 
-def test_agent_records_user_tool_result_and_assistant_events(tmp_path: Path) -> None:
-    _, storage, _, _, agent, session = build_runtime(tmp_path / "home", tmp_path)
+def test_tool_registry_rejects_untrusted_call_id(tmp_path: Path) -> None:
+    _, _, _, tools, _, session = build_runtime(tmp_path / "home", tmp_path)
+
+    with pytest.raises(ValueError, match="registry format"):
+        tools.run(
+            "tool_search",
+            "",
+            session,
+            tool_call_id="../tool-result",
+        )
+
+
+def test_agent_records_correlated_tool_lifecycle_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, storage, events, _, agent, session = build_runtime(
+        tmp_path / "home",
+        tmp_path,
+    )
+    published: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        events,
+        "publish",
+        lambda name, data: published.append((name, data)),
+    )
 
     result = agent.prompt(session, "pwd")
     transcript = storage.read_transcript(session)
 
     assert result["toolResults"][0]["name"] == "bash"
-    assert [event["type"] for event in transcript] == ["message", "tool_result", "message"]
+    assert [event["type"] for event in transcript] == [
+        "message",
+        "tool_call",
+        "tool_result",
+        "message",
+    ]
     assert transcript[0]["role"] == "user"
     assert transcript[-1]["role"] == "assistant"
+    assert transcript[1]["tool_call_id"] == transcript[2]["tool_call_id"]
+
+    updates = [data for name, data in published if name == "session_update"]
+    assert [event["eventId"] for event in updates] == [
+        event["event_id"] for event in transcript
+    ]
+    assert [event["sequence"] for event in updates] == [1, 2, 3, 4]
+    assert updates[1]["tool_call_id"] == updates[2]["tool_call_id"]
+
+
+def test_agent_persists_tool_error_with_the_reserved_call_id(
+    tmp_path: Path,
+) -> None:
+    _, storage, _, _, agent, session = build_runtime(
+        tmp_path / "home",
+        tmp_path,
+    )
+
+    result = agent.prompt(session, "bash rm -rf .")
+    transcript = storage.read_transcript(session)
+
+    assert result["toolResults"] == []
+    assert result["answer"].startswith("Tool failed:")
+    assert [event["type"] for event in transcript] == [
+        "message",
+        "tool_call",
+        "tool_error",
+        "message",
+    ]
+    assert transcript[1]["tool_call_id"] == transcript[2]["tool_call_id"]
+    assert transcript[2]["tool"] == "bash"
+    assert "denied" in transcript[2]["error"]
 
 
 def test_agent_writes_audit_entries_when_enabled(tmp_path: Path) -> None:
@@ -447,8 +516,15 @@ def test_agent_writes_audit_entries_when_enabled(tmp_path: Path) -> None:
 
     agent.prompt(session, "pwd")
 
-    actions = [entry.action for entry in audit.read_entries()]
+    transcript = storage.read_transcript(session)
+    entries = audit.read_entries()
+    actions = [entry.action for entry in entries]
     assert actions == ["user_prompt", "tool_call", "tool_result", "assistant_message"]
+    assert [entry.data["transcriptEventId"] for entry in entries] == [
+        event["event_id"] for event in transcript
+    ]
+    assert entries[1].data["toolCallId"] == entries[2].data["toolCallId"]
+    assert entries[1].data["toolCallId"] == transcript[1]["tool_call_id"]
     assert audit.verify() is True
 
 

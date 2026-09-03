@@ -61,6 +61,20 @@ python3 examples/mini_workbuddy_demo/code.py --mode offline
 - JSONL transcript 恢复。
 - audit hash chain 校验。
 
+## 工具调用如何留下完整证据
+
+`MiniAgent` 不会等工具成功后才补写历史。它先从 `ToolRegistry` 取得路径安全且唯一的 `tool_call_id`，持久化调用意图，然后才执行工具：
+
+```text
+user message
+  -> tool_call (tool_call_id)
+  -> tool_result (同一 tool_call_id)
+     或 tool_error (同一 tool_call_id)
+  -> assistant message
+```
+
+每次 `Storage.append_event()` 返回已经落盘的 `event_id` 和 `sequence`。Audit 条目通过 `transcriptEventId` 引用这条证据，SSE 更新通过 `eventId` 暴露同一引用。因此客户端收到实时事件后可以从 `/history` 找回对应记录；工具被拒绝、超时或执行失败时，Transcript 也不会只剩一条无法解释的 assistant 回复。
+
 ## 并发审计追加流程
 
 `server.py` 使用 `ThreadingHTTPServer`，多个请求会共享同一条审计链。`AuditLog.append()` 因此把链尾分配和落盘放在同一个临界区：

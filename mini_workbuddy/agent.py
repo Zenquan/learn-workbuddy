@@ -30,9 +30,20 @@ class MiniAgent:
         self.audit = audit
 
     def prompt(self, session: SessionRecord, text: str) -> dict:
-        self.storage.append_event(session, {"type": "message", "role": "user", "content": text})
-        self._audit("user_prompt", {"sessionId": session.id, "text": text})
-        self.events.publish("session_update", {"sessionId": session.id, "role": "user", "content": text})
+        user_event = self.storage.append_event(
+            session,
+            {"type": "message", "role": "user", "content": text},
+        )
+        self._audit(
+            "user_prompt",
+            {"sessionId": session.id, "text": text},
+            user_event,
+        )
+        self._publish(
+            session,
+            user_event,
+            {"role": "user", "content": text},
+        )
 
         plan = self._plan(text)
         if plan is None:
@@ -44,47 +55,151 @@ class MiniAgent:
             return {"answer": answer, "toolResults": []}
 
         tool_name, argument = plan
-        self.events.publish(
-            "session_update",
-            {"sessionId": session.id, "type": "tool_call", "tool": tool_name, "argument": argument},
+        # Allocate the correlation ID before execution so a crash, denial, or
+        # timeout still leaves a durable record of what the harness attempted.
+        tool_call_id = self.tools.new_call_id(tool_name)
+        tool_call_event = self.storage.append_event(
+            session,
+            {
+                "type": "tool_call",
+                "tool_call_id": tool_call_id,
+                "tool": tool_name,
+                "argument": argument,
+            },
+        )
+        self._publish(
+            session,
+            tool_call_event,
+            {
+                "type": "tool_call",
+                "tool_call_id": tool_call_id,
+                "tool": tool_name,
+                "argument": argument,
+            },
         )
         self._audit(
             "tool_call",
-            {"sessionId": session.id, "tool": tool_name, "argument": argument},
+            {
+                "sessionId": session.id,
+                "toolCallId": tool_call_id,
+                "tool": tool_name,
+                "argument": argument,
+            },
+            tool_call_event,
         )
         try:
-            result = self.tools.run(tool_name, argument, session)
-            self.storage.append_event(session, {"type": "tool_result", **asdict(result)})
-            self.events.publish("session_update", {"sessionId": session.id, "type": "tool_result", **asdict(result)})
+            result = self.tools.run(
+                tool_name,
+                argument,
+                session,
+                tool_call_id=tool_call_id,
+            )
+            result_data = asdict(result)
+            result_event = self.storage.append_event(
+                session,
+                {"type": "tool_result", **result_data},
+            )
+            self._publish(
+                session,
+                result_event,
+                {"type": "tool_result", **result_data},
+            )
             self._audit(
                 "tool_result",
                 {
                     "sessionId": session.id,
+                    "toolCallId": tool_call_id,
                     "tool": result.name,
                     "externalized": result.externalized_path is not None,
                     "exit_code": result.exit_code,
                 },
+                result_event,
             )
             answer = self._summarize_result(result.content)
         except (PermissionError, OSError, KeyError, TimeoutError) as exc:
             answer = f"Tool failed: {exc}"
             result = None
+            error_event = self.storage.append_event(
+                session,
+                {
+                    "type": "tool_error",
+                    "tool_call_id": tool_call_id,
+                    "tool": tool_name,
+                    "error": str(exc),
+                },
+            )
+            self._publish(
+                session,
+                error_event,
+                {
+                    "type": "tool_error",
+                    "tool_call_id": tool_call_id,
+                    "tool": tool_name,
+                    "error": str(exc),
+                },
+            )
             self._audit(
                 "tool_error",
-                {"sessionId": session.id, "tool": tool_name, "error": str(exc)},
+                {
+                    "sessionId": session.id,
+                    "toolCallId": tool_call_id,
+                    "tool": tool_name,
+                    "error": str(exc),
+                },
+                error_event,
             )
 
         self._assistant(session, answer)
         return {"answer": answer, "toolResults": [asdict(result)] if result else []}
 
     def _assistant(self, session: SessionRecord, content: str) -> None:
-        self.storage.append_event(session, {"type": "message", "role": "assistant", "content": content})
-        self._audit("assistant_message", {"sessionId": session.id, "content": content[:500]})
-        self.events.publish("session_update", {"sessionId": session.id, "role": "assistant", "content": content})
+        assistant_event = self.storage.append_event(
+            session,
+            {"type": "message", "role": "assistant", "content": content},
+        )
+        self._audit(
+            "assistant_message",
+            {"sessionId": session.id, "content": content[:500]},
+            assistant_event,
+        )
+        self._publish(
+            session,
+            assistant_event,
+            {"role": "assistant", "content": content},
+        )
 
-    def _audit(self, action: str, data: dict) -> None:
+    def _audit(
+        self,
+        action: str,
+        data: dict,
+        transcript_event: dict,
+    ) -> None:
         if self.audit is not None:
-            self.audit.append(action, data)
+            self.audit.append(
+                action,
+                {
+                    **data,
+                    "transcriptEventId": transcript_event["event_id"],
+                },
+            )
+
+    def _publish(
+        self,
+        session: SessionRecord,
+        transcript_event: dict,
+        data: dict,
+    ) -> None:
+        """Publish only after the corresponding transcript event is durable."""
+
+        self.events.publish(
+            "session_update",
+            {
+                "sessionId": session.id,
+                "eventId": transcript_event["event_id"],
+                "sequence": transcript_event["sequence"],
+                **data,
+            },
+        )
 
     def _plan(self, text: str) -> tuple[str, str] | None:
         lowered = text.lower().strip()

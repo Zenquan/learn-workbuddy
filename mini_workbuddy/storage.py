@@ -98,7 +98,18 @@ class Storage:
         project_dir.mkdir(parents=True, exist_ok=True)
         return project_dir / f"{record.id}.jsonl"
 
-    def append_event(self, record: SessionRecord, event: dict[str, Any]) -> None:
+    def append_event(
+        self,
+        record: SessionRecord,
+        event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one event and return the exact versioned envelope written.
+
+        Returning the Storage-owned identity lets Audit and live event
+        projections point back to durable transcript evidence.  Callers still
+        cannot supply those reserved fields themselves.
+        """
+
         path = self.transcript_path(record)
         reserved = sorted(_RESERVED_TRANSCRIPT_FIELDS.intersection(event))
         if reserved:
@@ -136,6 +147,7 @@ class Storage:
                 json.dumps(envelope, ensure_ascii=False, sort_keys=True) + "\n"
             ).encode("utf-8")
             self._append_transcript_unlocked(path, payload)
+            return envelope
 
     def read_transcript(self, record: SessionRecord, limit: int = 1000) -> list[dict[str, Any]]:
         path = self.transcript_path(record)

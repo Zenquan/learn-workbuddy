@@ -45,7 +45,14 @@ def test_run_endpoint_creates_session_and_history(mini_server: str) -> None:
     assert "README.md" in data["answer"]
 
     history = request_json(mini_server + f"/api/v1/sessions/{session_id}/history", headers=HEADER)
-    assert [event["type"] for event in history["data"]] == ["message", "tool_result", "message"]
+    events = history["data"]
+    assert [event["type"] for event in events] == [
+        "message",
+        "tool_call",
+        "tool_result",
+        "message",
+    ]
+    assert events[1]["tool_call_id"] == events[2]["tool_call_id"]
 
 
 def test_acp_initialize_new_prompt_and_load(mini_server: str) -> None:
@@ -76,7 +83,9 @@ def test_acp_initialize_new_prompt_and_load(mini_server: str) -> None:
         HEADER,
     )
     assert loaded["result"]["sessionId"] == session_id
-    assert len(loaded["result"]["history"]) == 3
+    history = loaded["result"]["history"]
+    assert len(history) == 4
+    assert history[1]["tool_call_id"] == history[2]["tool_call_id"]
 
 
 def test_acp_unknown_method_returns_jsonrpc_error(mini_server: str) -> None:

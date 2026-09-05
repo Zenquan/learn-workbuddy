@@ -75,6 +75,14 @@ user message
 
 每次 `Storage.append_event()` 返回已经落盘的 `event_id` 和 `sequence`。Audit 条目通过 `transcriptEventId` 引用这条证据，SSE 更新通过 `eventId` 暴露同一引用。因此客户端收到实时事件后可以从 `/history` 找回对应记录；工具被拒绝、超时或执行失败时，Transcript 也不会只剩一条无法解释的 assistant 回复。
 
+### 工具失败与记录失败有什么区别
+
+`MiniAgent.prompt()` 只将 `ToolRegistry.run()` 抛出的权限拒绝、`OSError`、`KeyError` 和 `TimeoutError` 转成 `tool_error`。工具返回后的结果落盘、SSE 发布和 Audit 追加放在 `try/except/else` 的 `else` 中；这些步骤失败时，原始异常直接向调用方传播，不再生成 `Tool failed` 回复，也不自动重跑工具。
+
+例如，`tools` 已成功返回工具目录，`tool_result` 已写入 Transcript，随后 Audit 追加抛出 `OSError`：调用方收到该异常，历史保留 `message → tool_call → tool_result`，不会给同一调用再追加 `tool_error` 或 assistant 回复。如果结果落盘前就失败，历史可能只有 `message → tool_call`；不能据此认定工具没有执行。
+
+这里没有把工具执行、Transcript、SSE 和 Audit 变成一个事务，也没有新增自动恢复或恰好执行一次的保证。调用方遇到这类异常，应先检查已有历史及工具实际影响，再决定是否重试。异常处理按失败位置划分，而不能只按异常类型划分：同样的 `OSError`，可能来自工具，也可能来自后续记录写入。
+
 ## 并发审计追加流程
 
 `server.py` 使用 `ThreadingHTTPServer`，多个请求会共享同一条审计链。`AuditLog.append()` 因此把链尾分配和落盘放在同一个临界区：

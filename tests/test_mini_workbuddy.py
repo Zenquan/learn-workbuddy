@@ -528,6 +528,113 @@ def test_agent_writes_audit_entries_when_enabled(tmp_path: Path) -> None:
     assert audit.verify() is True
 
 
+@pytest.mark.parametrize("failure_stage", ["transcript", "after_append", "publish", "audit"])
+@pytest.mark.parametrize("error_type", [OSError, KeyError])
+def test_agent_does_not_report_evidence_failure_as_tool_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    error_type: type[Exception],
+) -> None:
+    config, storage, events, tools, agent, session = build_runtime(
+        tmp_path / "home", tmp_path,
+    )
+    audit = AuditLog(config)
+    agent.audit = audit
+    failure = error_type(f"injected {failure_stage} failure")
+    original_run = tools.run
+    original_append = storage.append_event
+    original_audit = audit.append
+    run_count = 0
+    published: list[dict] = []
+
+    def run(*args, **kwargs):
+        nonlocal run_count
+        run_count += 1
+        return original_run(*args, **kwargs)
+
+    def append(record, event):
+        if event["type"] == "tool_result" and failure_stage == "transcript":
+            raise failure
+        persisted = original_append(record, event)
+        # Model a write that became durable before its caller saw an error.
+        # The harness cannot infer rollback from an append exception.
+        if event["type"] == "tool_result" and failure_stage == "after_append":
+            raise failure
+        return persisted
+
+    def publish(name, data):
+        if data.get("type") == "tool_result" and failure_stage == "publish":
+            raise failure
+        published.append(data)
+
+    def append_audit(action, data):
+        if action == "tool_result" and failure_stage == "audit":
+            raise failure
+        return original_audit(action, data)
+
+    monkeypatch.setattr(tools, "run", run)
+    monkeypatch.setattr(storage, "append_event", append)
+    monkeypatch.setattr(events, "publish", publish)
+    monkeypatch.setattr(audit, "append", append_audit)
+
+    with pytest.raises(error_type) as caught:
+        agent.prompt(session, "tools")
+
+    assert caught.value is failure
+    assert run_count == 1
+    transcript = storage.read_transcript(session)
+    expected_types = ["message", "tool_call"]
+    if failure_stage != "transcript":
+        expected_types.append("tool_result")
+        assert transcript[1]["tool_call_id"] == transcript[2]["tool_call_id"]
+    assert [event["type"] for event in transcript] == expected_types
+    assert not any(event.get("type") == "tool_error" for event in published)
+    assert not any(event.get("role") == "assistant" for event in published)
+    assert not any(entry.action == "tool_error" for entry in audit.read_entries())
+
+
+@pytest.mark.parametrize("error_type", [PermissionError, OSError, KeyError, TimeoutError])
+def test_agent_still_records_tool_execution_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    config, storage, events, tools, agent, session = build_runtime(
+        tmp_path / "home", tmp_path,
+    )
+    audit = AuditLog(config)
+    agent.audit = audit
+    run_count = 0
+    published: list[dict] = []
+
+    def fail_tool(*args, **kwargs):
+        nonlocal run_count
+        run_count += 1
+        raise error_type("injected tool execution failure")
+
+    monkeypatch.setattr(tools, "run", fail_tool)
+    monkeypatch.setattr(events, "publish", lambda name, data: published.append(data))
+
+    result = agent.prompt(session, "tools")
+
+    assert run_count == 1
+    assert result["toolResults"] == []
+    assert result["answer"].startswith("Tool failed:")
+    transcript = storage.read_transcript(session)
+    assert [event["type"] for event in transcript] == [
+        "message", "tool_call", "tool_error", "message",
+    ]
+    call_id = transcript[1]["tool_call_id"]
+    assert transcript[2]["tool_call_id"] == call_id
+    assert published[2]["type"] == "tool_error"
+    assert published[2]["tool_call_id"] == call_id
+    entries = audit.read_entries()
+    assert entries[2].action == "tool_error"
+    assert entries[2].data["toolCallId"] == call_id
+    assert audit.verify() is True
+
+
 def test_agent_unknown_prompt_returns_help_without_tool_call(tmp_path: Path) -> None:
     _, storage, _, _, agent, session = build_runtime(tmp_path / "home", tmp_path)
 

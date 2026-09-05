@@ -94,28 +94,6 @@ class MiniAgent:
                 session,
                 tool_call_id=tool_call_id,
             )
-            result_data = asdict(result)
-            result_event = self.storage.append_event(
-                session,
-                {"type": "tool_result", **result_data},
-            )
-            self._publish(
-                session,
-                result_event,
-                {"type": "tool_result", **result_data},
-            )
-            self._audit(
-                "tool_result",
-                {
-                    "sessionId": session.id,
-                    "toolCallId": tool_call_id,
-                    "tool": result.name,
-                    "externalized": result.externalized_path is not None,
-                    "exit_code": result.exit_code,
-                },
-                result_event,
-            )
-            answer = self._summarize_result(result.content)
         except (PermissionError, OSError, KeyError, TimeoutError) as exc:
             answer = f"Tool failed: {exc}"
             result = None
@@ -148,6 +126,33 @@ class MiniAgent:
                 },
                 error_event,
             )
+        else:
+            # Only exceptions from tools.run belong to the tool-error branch.
+            # A later persistence, publication, or audit failure does not undo
+            # execution. Let it propagate without inventing a tool_error or
+            # retrying a tool whose side effects may already have happened.
+            result_data = asdict(result)
+            result_event = self.storage.append_event(
+                session,
+                {"type": "tool_result", **result_data},
+            )
+            self._publish(
+                session,
+                result_event,
+                {"type": "tool_result", **result_data},
+            )
+            self._audit(
+                "tool_result",
+                {
+                    "sessionId": session.id,
+                    "toolCallId": tool_call_id,
+                    "tool": result.name,
+                    "externalized": result.externalized_path is not None,
+                    "exit_code": result.exit_code,
+                },
+                result_event,
+            )
+            answer = self._summarize_result(result.content)
 
         self._assistant(session, answer)
         return {"answer": answer, "toolResults": [asdict(result)] if result else []}

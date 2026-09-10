@@ -9,6 +9,7 @@ import json
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,10 +78,21 @@ def _long_messages() -> list[dict]:
         {"role": "user", "content": "Keep the original request."}
     ]
     for index in range(8):
+        content: str | list[dict] = f"turn-{index} " + ("detail " * 80)
+        if index == 0:
+            content = [
+                {"type": "text", "text": content},
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "read_file",
+                    "input": {"path": "src/app.py"},
+                },
+            ]
         messages.append(
             {
                 "role": "assistant" if index % 2 == 0 else "user",
-                "content": f"turn-{index} " + ("detail " * 80),
+                "content": content,
             }
         )
     messages.insert(
@@ -98,6 +110,50 @@ def _long_messages() -> list[dict]:
         },
     )
     return messages
+
+
+def _tool_ids(messages: list[dict]) -> tuple[list[str], list[str]]:
+    uses: list[str] = []
+    results: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                uses.append(block["id"])
+            elif block.get("type") == "tool_result":
+                results.append(block["tool_use_id"])
+    return uses, results
+
+
+def _file_read_interaction(tool_id: str, path: str, result: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "read_file",
+                    "input": {"path": path},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result,
+                    "_read_path": path,
+                }
+            ],
+        },
+    ]
 
 
 def _source_fixture(s14, root: Path):
@@ -279,11 +335,243 @@ def test_failed_or_empty_summary_keeps_original_messages(s14) -> None:
         summarizer=lambda _: (_ for _ in ()).throw(RuntimeError("offline")),
     )
     empty, empty_saved = s14.generate_summary(messages, summarizer=lambda _: " ")
+    short_messages = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": str(index)}
+        for index in range(5)
+    ]
+    inflated, inflated_saved = s14.generate_summary(
+        short_messages, summarizer=lambda _: "longer summary " * 20
+    )
 
     assert failed is messages
     assert empty is messages
+    assert inflated is short_messages
     assert failed_saved == 0
     assert empty_saved == 0
+    assert inflated_saved == 0
+
+
+def test_file_read_dedup_removes_both_sides_and_preserves_parallel_tools(s14) -> None:
+    messages = [
+        {"role": "user", "content": "Inspect the workspace."},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "read-old",
+                    "name": "read_file",
+                    "input": {"path": "src/app.py"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "shell-1",
+                    "name": "run_command",
+                    "input": {"command": "git status"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "read-old",
+                    "content": "old file body " * 100,
+                    "_read_path": "src/app.py",
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "shell-1",
+                    "content": "clean",
+                },
+            ],
+        },
+        *_file_read_interaction("read-new", "src/app.py", "new file body"),
+    ]
+
+    deduplicated, saved = s14.dedup_file_reads(messages)
+
+    assert _tool_ids(deduplicated) == (
+        ["shell-1", "read-new"],
+        ["shell-1", "read-new"],
+    )
+    assert saved > 0
+    assert s14.validate_tool_protocol(deduplicated)
+
+
+def test_protocol_validation_accepts_sdk_shaped_tool_use_blocks(s14) -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                SimpleNamespace(
+                    type="tool_use",
+                    id="sdk-call",
+                    name="read_file",
+                    input={"path": "README.md"},
+                )
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "sdk-call",
+                    "content": "body",
+                    "_read_path": "README.md",
+                }
+            ],
+        },
+    ]
+
+    interactions = s14.validate_tool_protocol(messages)
+
+    assert set(interactions) == {"sdk-call"}
+
+
+def test_message_pruning_drops_an_entire_interaction_crossing_the_cut(
+    s14, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(s14, "KEEP_RECENT_TURNS", 2)
+    messages = [
+        {"role": "user", "content": "Keep the original request."},
+        {"role": "assistant", "content": "Old reasoning."},
+        {"role": "user", "content": "Old follow-up."},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "cut-call",
+                    "name": "read_file",
+                    "input": {"path": "README.md"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Keep this recent note."},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "cut-call",
+                    "content": "result crossing the raw cut",
+                    "_read_path": "README.md",
+                },
+            ],
+        },
+        {"role": "assistant", "content": "Most recent answer."},
+    ]
+
+    pruned, saved = s14.prune_old_messages(messages)
+
+    assert _tool_ids(pruned) == ([], [])
+    assert "Keep this recent note." in str(pruned)
+    assert "Most recent answer." in str(pruned)
+    assert saved > 0
+    assert s14.validate_tool_protocol(pruned) == {}
+
+
+def test_summary_expands_recent_window_to_keep_a_complete_interaction(s14) -> None:
+    messages = [
+        {"role": "user", "content": "Original request."},
+        {"role": "assistant", "content": "Old answer details. " * 100},
+        *_file_read_interaction("boundary-call", "README.md", "current body"),
+        {"role": "assistant", "content": "Used the current body."},
+        {"role": "user", "content": "Continue."},
+        {"role": "assistant", "content": "Ready."},
+    ]
+    summary_inputs: list[str] = []
+
+    summarized, saved = s14.generate_summary(
+        messages,
+        summarizer=lambda conversation: summary_inputs.append(conversation) or "Old context.",
+    )
+
+    assert summary_inputs
+    assert "boundary-call" not in summary_inputs[0]
+    assert _tool_ids(summarized) == (["boundary-call"], ["boundary-call"])
+    assert saved > 0
+    assert s14.validate_tool_protocol(summarized)
+
+
+@pytest.mark.parametrize(
+    "messages, match",
+    [
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "missing", "name": "read_file"}
+                    ],
+                }
+            ],
+            "no matching tool_result",
+        ),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "unknown",
+                            "content": "result",
+                        }
+                    ],
+                }
+            ],
+            "no matching tool_use",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "duplicate", "name": "read_file"}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "duplicate", "content": "one"},
+                        {"type": "tool_result", "tool_use_id": "duplicate", "content": "two"},
+                    ],
+                },
+            ],
+            "duplicate tool_result ID",
+        ),
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "reversed", "content": "early"}
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "reversed", "name": "read_file"}
+                    ],
+                },
+            ],
+            "must follow tool_use",
+        ),
+    ],
+)
+def test_compaction_rejects_malformed_tool_protocol_without_mutating_input(
+    s14, messages: list[dict], match: str
+) -> None:
+    original = copy.deepcopy(messages)
+
+    with pytest.raises(s14.ToolProtocolError, match=match):
+        s14.compact_context(messages, verbose=False)
+
+    assert messages == original
 
 
 def test_source_pointer_parser_accepts_owned_shapes_and_rejects_paths(s14) -> None:

@@ -44,6 +44,7 @@ flowchart LR
 - 用 `SourcePointerResolver` 在可信根目录和授权策略内重新核验 Transcript / Artifact，而不是把 pointer 字符串当成证据。
 - 来源核验明确区分 `available`、`missing`、`denied`、`corrupt` 与 `unsupported`；只有 `available` 才能携带证据哈希。
 - `capture_retrieval_evidence()` 只冻结上游已经选中的 hit，不在压缩阶段重做 scope、score、冲突或预算裁决。
+- 用 `tool_use.id` / `tool_result.tool_use_id` 校验并原子裁剪工具交互，兼容同一消息中的并行调用。
 
 ## 常见误区
 
@@ -56,6 +57,8 @@ flowchart LR
 - 原地修改 messages 会连带污染 Transcript 回放或调用方保存的证据视图。
 - 摘要生成失败后仍用错误字符串替换旧历史，会静默丢失最后一份可用上下文。
 - 把压缩当成一定成功的操作，会让不可压缩的超长消息继续进入 provider 请求。
+- 只删重复的 `tool_result` 或只检查最近消息的第一个 block，会留下孤立调用并让 provider 拒绝整个请求。
+
 ## 问题
 
 agent 跑得越久，消息历史越长。一次对话可能产生几十条消息——每次工具调用的输入输出都堆在 `messages` 列表里。模型的上下文窗口是有限的（128K、200K，无论多大终归有限），一旦超限，API 直接报错。
@@ -73,7 +76,7 @@ agent 跑得越久，消息历史越长。一次对话可能产生几十条消�
 | 层级 | 策略 | 做什么 | 代价 |
 |------|------|-------|------|
 | Layer 1 | 工具结果截断 | 大输出截断为摘要 | 低（不丢消息） |
-| Layer 2 | 文件内容去重 | 同一文件多次读取 → 只留最新 | 低（不丢消息） |
+| Layer 2 | 文件内容去重 | 同一文件多次读取 → 只留最新 | 低（仅删除冗余交互） |
 | Layer 3 | 消息历史修剪 | 删除旧的非关键消息 | 中（可能丢细节） |
 | Layer 4 | 全对话摘要 | 用模型生成摘要替换历史 | 高（一次 API 调用） |
 
@@ -113,6 +116,8 @@ agent 跑得越久，消息历史越长。一次对话可能产生几十条消�
 ```
 
 **关键原则**：系统提示、工具定义与 `DurableContextState` **永远不进入有损压缩层**。压缩器先深拷贝 messages，四层只操作这份可丢弃 Prompt 视图；已确认事实、未决事项，以及已选 MemoryHit 的来源、分数、排名和冲突标记沿旁路进入下一次 API 调用。
+
+工具调用还有一条独立的不变量：每个非空 `tool_use.id` 必须唯一对应一个稍后出现的 `tool_result.tool_use_id`。压缩入口先用 `validate_tool_protocol()` 检查整张关联图；缺失、未知、重复或倒序 ID 都抛出 `ToolProtocolError`，即使消息尚未达到软阈值也不会把无效历史交给 provider。L2/L3/L4 删除内容时，把这对 block 当成一个原子 interaction group；并行工具调用仍可按各自 ID 独立保留。
 
 ### 压缩对象边界：Messages 可以有损，Durable state 必须无损
 
@@ -264,42 +269,34 @@ def truncate_tool_results(messages: list) -> list:
 同一个文件被读多次（agent 先读了全文，改了几行后又读了一次确认）——旧的读取结果是冗余的，只留最新的。
 
 ```python
-def dedup_file_reads(messages: list) -> list:
-    """Layer 2: 同一文件多次读取, 只保留最新一次。"""
-    # 找到每个文件路径最后一次读取的位置
-    last_read = {}  # path -> (msg_index, block_index)
-    for mi, msg in enumerate(messages):
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for bi, block in enumerate(content):
-            if (isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and block.get("_tool_name") == "read_file"):
-                path = block.get("_tool_input", {}).get("path", "")
-                last_read[path] = (mi, bi)
+def dedup_file_reads(messages: list) -> tuple[list, int]:
+    validate_tool_protocol(messages)
+    tool_results = [
+        block
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+    latest_reads = {}  # path -> tool_use_id
+    for block in tool_results:
+        if block.get("_read_path"):
+            latest_reads[block["_read_path"]] = block["tool_use_id"]
 
-    # 删除非最新的文件读取结果
-    to_remove = set()
-    for path, (mi, bi) in last_read.items():
-        # 找所有更早的同文件读取
-        for mi2, msg in enumerate(messages[:mi]):
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for bi2, block in enumerate(content):
-                if (isinstance(block, dict)
-                    and block.get("type") == "tool_result"
-                    and block.get("_tool_name") == "read_file"
-                    and block.get("_tool_input", {}).get("path") == path):
-                    to_remove.add((mi2, bi2))
-
-    # 执行删除
-    for mi, bi in sorted(to_remove, reverse=True):
-        del messages[mi]["content"][bi]
-
-    return messages
+    obsolete_ids = {
+        block["tool_use_id"]
+        for block in tool_results
+        if block.get("_read_path")
+        and latest_reads[block["_read_path"]] != block["tool_use_id"]
+    }
+    # 按 ID 同时删除旧 tool_use 与旧 tool_result；同一消息中的
+    # 其他并行调用、结果和文本 block 不受影响。
+    old_count = estimate_tokens(messages)
+    deduplicated = _without_tool_interactions(messages, obsolete_ids)
+    return deduplicated, old_count - estimate_tokens(deduplicated)
 ```
+
+完整实现还会在删除后再次校验，并返回精确的 token 节省量；上面的片段突出所有权关系：`_read_path` 只判断“哪个文件读重复了”，`tool_use_id` 才决定“必须成对删除哪些协议 block”。
 
 ### Layer 3: 消息历史修剪
 
@@ -308,28 +305,23 @@ def dedup_file_reads(messages: list) -> list:
 ```python
 KEEP_RECENT_TURNS = 6  # 保留最近 6 轮
 
-def prune_old_messages(messages: list) -> list:
-    """Layer 3: 保留最近 N 轮, 删除旧消息。
-
-    注意: 不能删除中间的 tool_result 而留下 tool_use —
-    那会导致 API 报错。必须成对删除。
-    """
-    if len(messages) <= KEEP_RECENT_TURNS:
-        return messages
-
-    # 保留最近 N 条消息
-    kept = messages[-KEEP_RECENT_TURNS:]
-
-    # 确保不以孤立的 tool_result 开头
-    while kept and isinstance(kept[0].get("content"), list):
-        first = kept[0]["content"][0] if kept[0]["content"] else None
-        if isinstance(first, dict) and first.get("type") == "tool_result":
-            kept = kept[1:]
-        else:
-            break
-
-    return messages[:1] + kept  # 保留第一条用户消息作为上下文
+def prune_old_messages(messages: list) -> tuple[list, int]:
+    interactions = validate_tool_protocol(messages)
+    selected = {0, *range(len(messages) - KEEP_RECENT_TURNS, len(messages))}
+    crossing_ids = {
+        tool_id
+        for tool_id, pair in interactions.items()
+        if ((pair.tool_use_message in selected)
+            != (pair.tool_result_message in selected))
+    }
+    kept = [msg for index, msg in enumerate(messages) if index in selected]
+    # 跨越裁剪边界的一侧也被移除；混合消息中的普通文本仍保留。
+    old_count = estimate_tokens(messages)
+    pruned = _without_tool_interactions(kept, crossing_ids)
+    return pruned, old_count - estimate_tokens(pruned)
 ```
+
+只检查最近第一条消息的第一个 block 不够：一条消息可能先有文本、后有多个工具结果。这里检查的是所有 interaction 的两个消息索引，因此无论 block 顺序或并行数量如何，都不会留下半条调用链。
 
 ### Layer 4: 全对话摘要
 
@@ -337,13 +329,21 @@ def prune_old_messages(messages: list) -> list:
 
 ```python
 def generate_summary(messages: list, summarizer) -> tuple[list, int]:
-    """Layer 4: 生成对话摘要替换历史。
+    interactions = validate_tool_protocol(messages)
+    recent_start = len(messages) - 4
+    # 若固定边界切在 tool_use 与 result 之间，向前扩展到 tool_use。
+    while any(
+        pair.tool_use_message < recent_start <= pair.tool_result_message
+        for pair in interactions.values()
+    ):
+        recent_start = min(
+            pair.tool_use_message
+            for pair in interactions.values()
+            if pair.tool_use_message < recent_start <= pair.tool_result_message
+        )
 
-    调用模型总结到目前为止的对话,
-    用摘要替换旧消息, 保留最近几轮。
-    """
-    old_messages = messages[:-4]  # 保留最近 4 条
-    recent = messages[-4:]
+    old_messages = messages[:recent_start]
+    recent = messages[recent_start:]
 
     try:
         summary = summarizer(json.dumps(old_messages)).strip()
@@ -358,6 +358,8 @@ def generate_summary(messages: list, summarizer) -> tuple[list, int]:
     ] + recent
     return summarized, estimate_tokens(messages) - estimate_tokens(summarized)
 ```
+
+向前扩展可能让“最近窗口”超过四条消息，这是有意的：保留一条完整交互比机械满足消息条数更重要。如果扩展到索引 0、已经没有可总结的旧消息，或新视图并未真正变小，函数直接保留原视图。
 
 ### 在循环中的位置
 
@@ -439,7 +441,7 @@ selected hits ──capture_retrieval_evidence()──> immutable RetrievalEvide
 |--------|----------|------------|
 | token 计数 | 4 字符约 1 token | 使用目标模型 tokenizer，并计入 system 与 tools |
 | 工具结果 | 保留有界前缀 | 按内容类型保留头尾，或外置为 Artifact |
-| 协议完整性 | 避免以孤立 tool result 开头 | 按 tool-use ID 成对裁剪完整调用组 |
+| 协议完整性 | 全量校验 ID，并按 ID 原子裁剪调用组 | 补充 provider 专属的相邻角色、批量结果等语法约束 |
 | 摘要失败 | 原消息原样保留 | 加超时、重试预算和可观测失败原因 |
 | 长期事实 | durable state 旁路 | 接入带版本、冲突处理和来源校验的 Memory store |
 | source 核验 | 本地可信根、前置授权、结构与 digest 校验 | 对象存储 adapter、签名 manifest、细粒度租户策略与审计 trace |
@@ -466,12 +468,13 @@ S24 综合章直接复用本章的 `capture_retrieval_evidence()`、`DurableCont
 5. **`SourceResolution` / `resolve_durable_sources()`** — 用不可变五态结果冻结本轮观察，并按首次出现顺序去重
 6. **`render_durable_context()`** — 把 durable state 与核验状态独立渲染进 system context，不混入摘要或 excerpt
 7. **`estimate_tokens()`** — 粗略估算 messages 的 token 数（4 字符 ≈ 1 token）
-8. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
-9. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新
-10. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，删除旧消息
-11. **`generate_summary()`** — Layer 4: 用模型生成摘要替换历史；失败或空摘要时保留原历史
-12. **`compact_context()`** — 深拷贝 messages，依次尝试四层，并返回 `CompactionResult`
-13. **Agent 循环** — 每次 API 调用前压缩 disposable messages、重新核验来源，再独立注入 durable state
+8. **`validate_tool_protocol()`** — 用唯一 ID 校验完整、正序的 tool-use/result 关联图
+9. **`truncate_tool_results()`** — Layer 1: 截断超过 5000 token 的工具结果
+10. **`dedup_file_reads()`** — Layer 2: 同一文件多次读取，只留最新的完整 interaction group
+11. **`prune_old_messages()`** — Layer 3: 保留最近 N 轮，原子移除跨边界工具交互
+12. **`generate_summary()`** — Layer 4: 在完整交互边界生成摘要；失败或空摘要时保留原历史
+13. **`compact_context()`** — 深拷贝 messages，先校验协议，再依次尝试四层并返回 `CompactionResult`
+14. **Agent 循环** — 每次 API 调用前压缩 disposable messages、重新核验来源，再独立注入 durable state
 
 运行后会看到压缩日志——每层触发时打印 `[compact]` 消息，可以看到哪些层在什么时候被触发。
 

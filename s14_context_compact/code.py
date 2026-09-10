@@ -66,6 +66,7 @@ PROGRESSION = {
     "adds": [
         "token pressure detection",
         "structured compaction",
+        "protocol-safe tool interaction compaction",
         "hard message-view ceiling",
         "durable state preservation",
         "selected retrieval evidence retention",
@@ -880,6 +881,115 @@ def estimate_tokens(messages: list) -> int:
     return total
 
 
+class ToolProtocolError(ValueError):
+    """Raised when a prompt view contains an invalid tool interaction graph."""
+
+
+@dataclass(frozen=True)
+class _ToolInteraction:
+    """Locations of one complete provider tool-use/result interaction."""
+
+    tool_use_message: int
+    tool_result_message: int
+
+
+def _block_field(block: object, field: str, default: object = None) -> object:
+    """Read one field from mapping-shaped or SDK-shaped content blocks."""
+
+    if isinstance(block, dict):
+        return block.get(field, default)
+    return getattr(block, field, default)
+
+
+def _tool_block_id(block: object) -> tuple[str | None, object]:
+    """Return the protocol block type and its correlation ID, if applicable."""
+
+    block_type = _block_field(block, "type")
+    if block_type == "tool_use":
+        return "tool_use", _block_field(block, "id")
+    if block_type == "tool_result":
+        return "tool_result", _block_field(block, "tool_use_id")
+    return None, None
+
+
+def validate_tool_protocol(messages: list) -> dict[str, _ToolInteraction]:
+    """Validate and index complete tool interactions by correlation ID.
+
+    Compaction is allowed to lose evidence, but never to manufacture a
+    provider-invalid prompt. Each tool-use ID must therefore occur exactly
+    once on an assistant block and exactly once on a later user result block.
+    """
+
+    uses: dict[str, int] = {}
+    results: dict[str, int] = {}
+    for message_index, message in enumerate(messages):
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            block_type, raw_id = _tool_block_id(block)
+            if block_type is None:
+                continue
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                raise ToolProtocolError(f"{block_type} requires a non-empty correlation ID")
+            tool_id = raw_id
+            expected_role = "assistant" if block_type == "tool_use" else "user"
+            if role != expected_role:
+                raise ToolProtocolError(
+                    f"{block_type} {tool_id!r} must appear in a {expected_role} message"
+                )
+            locations = uses if block_type == "tool_use" else results
+            if tool_id in locations:
+                raise ToolProtocolError(f"duplicate {block_type} ID: {tool_id!r}")
+            locations[tool_id] = message_index
+
+    missing_results = sorted(set(uses) - set(results))
+    if missing_results:
+        raise ToolProtocolError(
+            f"tool_use has no matching tool_result: {missing_results[0]!r}"
+        )
+    unknown_results = sorted(set(results) - set(uses))
+    if unknown_results:
+        raise ToolProtocolError(
+            f"tool_result has no matching tool_use: {unknown_results[0]!r}"
+        )
+
+    interactions: dict[str, _ToolInteraction] = {}
+    for tool_id, use_message in uses.items():
+        result_message = results[tool_id]
+        if result_message <= use_message:
+            raise ToolProtocolError(
+                f"tool_result must follow tool_use for ID {tool_id!r}"
+            )
+        interactions[tool_id] = _ToolInteraction(use_message, result_message)
+    return interactions
+
+
+def _without_tool_interactions(messages: list, removed_ids: set[str]) -> list:
+    """Remove both sides of selected interactions and discard empty messages."""
+
+    if not removed_ids:
+        return messages
+    filtered: list = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            filtered.append(message)
+            continue
+        kept_blocks = []
+        for block in content:
+            block_type, raw_id = _tool_block_id(block)
+            if block_type is not None and raw_id in removed_ids:
+                continue
+            kept_blocks.append(block)
+        if kept_blocks:
+            copied_message = dict(message)
+            copied_message["content"] = kept_blocks
+            filtered.append(copied_message)
+    return filtered
+
+
 # ======================================================================
 # Layer 1: Tool result truncation
 # ======================================================================
@@ -892,6 +1002,7 @@ def truncate_tool_results(messages: list) -> tuple[list, int]:
 
     Returns: (modified messages, tokens saved)
     """
+    validate_tool_protocol(messages)
     saved = 0
     for msg in messages:
         if msg.get("role") != "user":
@@ -917,6 +1028,7 @@ def truncate_tool_results(messages: list) -> tuple[list, int]:
                 )
                 saved += tokens - MAX_TOOL_RESULT_TOKENS
 
+    validate_tool_protocol(messages)
     return messages, saved
 
 
@@ -933,12 +1045,11 @@ def dedup_file_reads(messages: list) -> tuple[list, int]:
 
     Returns: (modified messages, tokens saved)
     """
-    # Track metadata on tool results
-    # In real implementation, we'd correlate tool_use and tool_result
-    # by ID. Teaching version: we tag results during execution.
+    validate_tool_protocol(messages)
 
-    # Find the latest read of each file path
-    latest_reads: dict[str, int] = {}  # path -> msg index
+    # Find the latest completed read of each file path. ``_read_path`` is
+    # execution metadata, while ``tool_use_id`` is the protocol authority.
+    latest_reads: dict[str, str] = {}  # path -> tool-use ID
     for mi, msg in enumerate(messages):
         content = msg.get("content")
         if not isinstance(content, list):
@@ -948,30 +1059,29 @@ def dedup_file_reads(messages: list) -> tuple[list, int]:
                 continue
             if block.get("type") == "tool_result":
                 path = block.get("_read_path")
-                if path:
-                    latest_reads[path] = mi
+                tool_id = block.get("tool_use_id")
+                if path and isinstance(tool_id, str):
+                    latest_reads[path] = tool_id
 
-    # Remove older reads of the same file
-    saved = 0
-    for mi, msg in enumerate(messages):
+    # Mark older reads, then remove both their tool_use and tool_result blocks.
+    removed_ids: set[str] = set()
+    for msg in messages:
         content = msg.get("content")
         if not isinstance(content, list):
             continue
-        new_content = []
         for block in content:
             if not isinstance(block, dict):
-                new_content.append(block)
                 continue
             if block.get("type") == "tool_result":
                 path = block.get("_read_path")
-                if path and latest_reads.get(path, mi) > mi:
-                    # This is an older read — skip it
-                    saved += len(str(block.get("content", ""))) // 4
-                    continue
-            new_content.append(block)
-        msg["content"] = new_content
+                tool_id = block.get("tool_use_id")
+                if path and tool_id and latest_reads.get(path) != tool_id:
+                    removed_ids.add(tool_id)
 
-    return messages, saved
+    old_count = estimate_tokens(messages)
+    deduplicated = _without_tool_interactions(messages, removed_ids)
+    validate_tool_protocol(deduplicated)
+    return deduplicated, old_count - estimate_tokens(deduplicated)
 
 
 # ======================================================================
@@ -990,27 +1100,24 @@ def prune_old_messages(messages: list) -> tuple[list, int]:
 
     Returns: (pruned messages, tokens saved)
     """
+    interactions = validate_tool_protocol(messages)
     if len(messages) <= KEEP_RECENT_TURNS + 1:
         return messages, 0
 
     old_count = estimate_tokens(messages)
 
-    first = messages[0]
-    recent = messages[-KEEP_RECENT_TURNS:]
-
-    # Fix orphaned tool_results at the start of `recent`
-    while recent:
-        content = recent[0].get("content")
-        if not isinstance(content, list):
-            break
-        first_block = content[0] if content else None
-        if (isinstance(first_block, dict)
-                and first_block.get("type") == "tool_result"):
-            recent = recent[1:]
-        else:
-            break
-
-    pruned = [first] + recent
+    selected_indices = {0, *range(len(messages) - KEEP_RECENT_TURNS, len(messages))}
+    crossing_ids = {
+        tool_id
+        for tool_id, interaction in interactions.items()
+        if ((interaction.tool_use_message in selected_indices)
+            != (interaction.tool_result_message in selected_indices))
+    }
+    selected = [
+        message for index, message in enumerate(messages) if index in selected_indices
+    ]
+    pruned = _without_tool_interactions(selected, crossing_ids)
+    validate_tool_protocol(pruned)
     new_count = estimate_tokens(pruned)
 
     return pruned, old_count - new_count
@@ -1052,15 +1159,33 @@ def generate_summary(
 
     Returns: (summarized messages, tokens saved)
     """
+    interactions = validate_tool_protocol(messages)
     if len(messages) <= 4:
         return messages, 0
 
     old_count = estimate_tokens(messages)
 
-    # Split: old messages to summarize, recent to keep
+    # Split at a complete interaction boundary. If the raw four-message cut
+    # crosses a tool call, expand the recent window back to its tool_use.
     keep_recent = 4
-    to_summarize = messages[:-keep_recent]
-    recent = messages[-keep_recent:]
+    recent_start = len(messages) - keep_recent
+    while True:
+        expanded_start = min(
+            (
+                interaction.tool_use_message
+                for interaction in interactions.values()
+                if (interaction.tool_use_message < recent_start
+                    <= interaction.tool_result_message)
+            ),
+            default=recent_start,
+        )
+        if expanded_start == recent_start:
+            break
+        recent_start = expanded_start
+    if recent_start == 0:
+        return messages, 0
+    to_summarize = messages[:recent_start]
+    recent = messages[recent_start:]
 
     # Build a text representation of old messages for summarization
     convo_text = []
@@ -1074,16 +1199,28 @@ def generate_summary(
                     if block.get("type") == "text":
                         parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_use":
-                        parts.append(f"[tool_use: {block.get('name', '?')}]")
+                        parts.append(
+                            f"[tool_use: {block.get('name', '?')} "
+                            f"id={block.get('id', '?')}]"
+                        )
                     elif block.get("type") == "tool_result":
-                        parts.append(f"[tool_result: {str(block.get('content', ''))[:200]}]")
+                        parts.append(
+                            f"[tool_result: id={block.get('tool_use_id', '?')} "
+                            f"{str(block.get('content', ''))[:200]}]"
+                        )
                 elif hasattr(block, 'type'):
                     if block.type == "text":
                         parts.append(block.text)
                     elif block.type == "tool_use":
-                        parts.append(f"[tool_use: {block.name}]")
+                        parts.append(
+                            f"[tool_use: {block.name} id={getattr(block, 'id', '?')}]"
+                        )
                     elif block.type == "tool_result":
-                        parts.append(f"[tool_result: {str(block.content)[:200]}]")
+                        parts.append(
+                            "[tool_result: "
+                            f"id={getattr(block, 'tool_use_id', '?')} "
+                            f"{str(block.content)[:200]}]"
+                        )
             content = " ".join(parts)
         convo_text.append(f"{role}: {content[:500]}")
 
@@ -1103,7 +1240,11 @@ def generate_summary(
         {"role": "assistant", "content": "好的, 我已了解之前的对话内容。请继续。"},
     ] + recent
 
+    validate_tool_protocol(summarized)
+
     new_count = estimate_tokens(summarized)
+    if new_count >= old_count:
+        return messages, 0
 
     return summarized, old_count - new_count
 
@@ -1132,6 +1273,7 @@ def compact_context(
     callers' transcript-derived messages unchanged for replay and audit.
     """
     working = copy.deepcopy(messages)
+    validate_tool_protocol(working)
     tokens_before = estimate_tokens(working)
     tokens = tokens_before
     applied_layers: list[str] = []

@@ -361,8 +361,18 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         ),
     )
     messages = list(recovered_session["messages"])
-    messages.insert(
-        1,
+    messages[1:1] = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "walkthrough-tool-1",
+                    "name": "read_file",
+                    "input": {"path": "README.md"},
+                }
+            ],
+        },
         {
             "role": "user",
             "content": [
@@ -374,7 +384,7 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
                 }
             ],
         },
-    )
+    ]
     for index in range(8):
         messages.append(
             {

@@ -62,6 +62,57 @@ def test_heading_aware_chunks_preserve_contiguous_source_lines(rag) -> None:
     assert len(child.content_hash) == 64
 
 
+@pytest.mark.parametrize("opening,closing", [
+    ("```python", "```"), ("~~~python", "~~~~"),
+    ("   ````python", "  ````` \t"), ("~~~a`b", "~~~"),
+])
+def test_fenced_code_comments_do_not_change_heading_path(rag, opening, closing) -> None:
+    source = f"# Root\n\n{opening}\n# Comment\nprint(1)\n{closing}\n\nAfter code.\n\n## Child\n\nDetails."
+    chunks = rag.chunk_markdown(document_id="doc_test", source_path="test.md", text=source)
+    assert [chunk.heading_path for chunk in chunks] == [("Root",), ("Root", "Child")]
+    assert chunks[0].start_line == 1
+    assert chunks[0].end_line == 8
+    assert chunks[1].start_line == 10
+    for chunk in chunks:
+        assert chunk.text == "\n".join(source.splitlines()[chunk.start_line - 1:chunk.end_line]).strip()
+
+
+@pytest.mark.parametrize("false_close", ["```", "~~~~", "```` trailing", "    ````", ""])
+def test_unclosed_fence_keeps_later_headings_in_code(rag, false_close) -> None:
+    source = f"# Root\n````python\n# Comment\n{false_close}\n## Still code\n"
+    chunks = rag.chunk_markdown(document_id="doc_test", source_path="test.md", text=source)
+    assert len(chunks) == 1
+    assert chunks[0].heading_path == ("Root",)
+    assert "## Still code" in chunks[0].text
+
+
+@pytest.mark.parametrize("not_opening", ["``python", "```a`b", "    ```", "text ```"])
+def test_invalid_fence_does_not_hide_real_heading(rag, not_opening) -> None:
+    source = f"# Root\n{not_opening}\n## Child\nDetails."
+    chunks = rag.chunk_markdown(document_id="doc_test", source_path="test.md", text=source)
+    assert chunks[-1].heading_path == ("Root", "Child")
+
+
+def test_version_two_rebuilds_legacy_fenced_chunks(rag, tmp_path, monkeypatch) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "code.md").write_text("# Root\n```python\n# Comment\n```\n## Child\nDetails.", encoding="utf-8")
+    path = tmp_path / "index.json"
+    # Save actual old-style wrong sections, not merely a new index with an old label.
+    with monkeypatch.context() as patch:
+        patch.setattr(rag, "INDEX_VERSION", 2)
+        patch.setattr(rag, "_section_ranges", lambda lines: [
+            (1, 2, ("Root",)), (3, 4, ("Comment",)), (5, 6, ("Comment", "Child")),
+        ])
+        rag.SourceIndex(corpus, path).sync()
+    index = rag.SourceIndex(corpus, path)
+    assert rag.OfflineBM25Retriever(index).search("Comment").hits == ()
+    assert index.sync().documents_updated == 1
+    assert [chunk.heading_path for chunk in index.chunks] == [("Root",), ("Root", "Child")]
+    assert json.loads(path.read_text())["version"] == 3
+    assert rag.SourceIndex(corpus, path).sync().documents_unchanged == 1
+
+
 def test_chunk_identity_depends_on_content_not_line_position(rag) -> None:
     original = "# Stable\n\nSame paragraph.\n"
     shifted = "\n\n# Stable\n\nSame paragraph.\n"
@@ -265,11 +316,13 @@ def test_chunk_settings_are_validated_at_index_boundaries(rag, tmp_path: Path, i
         rag.SourceIndex(corpus, path)
 
 
-def test_version_two_requires_saved_chunk_settings(rag, tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [2, 3])
+def test_versioned_index_requires_saved_chunk_settings(rag, tmp_path: Path, version) -> None:
     corpus = _copy_corpus(tmp_path)
     path = tmp_path / "index.json"
     rag.SourceIndex(corpus, path).sync()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = version
     del payload["max_chars"]
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(rag.RagContractError, match="index.max_chars"):
@@ -471,4 +524,4 @@ def test_cli_writes_machine_readable_index_and_report(tmp_path: Path) -> None:
 
 def rag_version() -> int:
     # CLI 产物的公开格式版本保持显式，避免测试依赖导入 fixture 生命周期。
-    return 2
+    return 3

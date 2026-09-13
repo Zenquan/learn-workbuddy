@@ -368,6 +368,59 @@ def test_deleted_document_is_removed_and_tombstoned(rag, tmp_path: Path) -> None
     assert tombstone["deleted_generation"] == report.generation
 
 
+def test_empty_corpus_sync_delete_restart_and_readd(rag, tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    path = tmp_path / "index.json"
+    index = rag.SourceIndex(corpus, path)
+    assert index.sync().chunks_active == 0
+    source = corpus / "memory.md"
+    source.write_text("# Memory\n\nRecall facts.\n", encoding="utf-8")
+    assert index.sync().documents_added == 1
+    source.unlink()
+    report = index.sync()
+    assert report.documents_deleted == 1
+    assert report.chunks_active == 0
+    assert index.documents == {}
+    assert index.chunks == ()
+    assert index.tombstones[0]["deleted_generation"] == report.generation
+    reloaded = rag.SourceIndex(corpus, path)
+    assert reloaded.documents == {}
+    assert reloaded.chunks == ()
+    assert rag.OfflineBM25Retriever(reloaded).search("memory").hits == ()
+    assert reloaded.sync().documents_deleted == 0
+    assert len(reloaded.tombstones) == 1
+    source.write_text("# Memory\n\nNew facts.\n", encoding="utf-8")
+    assert reloaded.sync().documents_added == 1
+    assert len(reloaded.tombstones) == 1
+    assert rag.OfflineBM25Retriever(reloaded).search("memory").hits
+
+
+@pytest.mark.parametrize("failure", ["missing", "walk", "empty_document", "symlink_directory"])
+def test_failed_discovery_must_not_clear_index(rag, tmp_path: Path, monkeypatch, failure) -> None:
+    corpus = _copy_corpus(tmp_path)
+    index, _ = _index(rag, corpus, tmp_path)
+    before = index.index_path.read_bytes()
+    documents = dict(index.documents)
+    if failure == "missing":
+        corpus.rename(tmp_path / "moved-corpus")
+    elif failure == "walk":
+        def failed_walk(root, *, onerror, followlinks):
+            # Simulate failure below the root, even after a partial listing.
+            yield str(root), [], ["layered-memory.md"]
+            onerror(PermissionError("unreadable child directory"))
+        monkeypatch.setattr(rag.os, "walk", failed_walk)
+    elif failure == "empty_document":
+        (corpus / "empty.md").touch()
+    else:
+        (corpus / "linked").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises((rag.RagContractError, OSError)):
+        index.sync()
+    assert index.index_path.read_bytes() == before
+    assert index.documents == documents
+    assert index.tombstones == []
+
+
 def test_fixture_evaluation_passes_source_and_safety_metrics(rag, tmp_path: Path) -> None:
     corpus = _copy_corpus(tmp_path)
     index, report = _index(rag, corpus, tmp_path)

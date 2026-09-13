@@ -437,7 +437,21 @@ class SourceIndex:
         if not self.corpus_root.is_dir():
             raise RagContractError(f"corpus directory does not exist: {self.corpus_root}")
         sources: list[Path] = []
-        for path in sorted(self.corpus_root.rglob("*.md")):
+        def scan_error(error: OSError) -> None:
+            # A partial scan is not an empty corpus: never infer deletions
+            # from a subtree that could not be read.
+            raise error
+
+        discovered: list[Path] = []
+        for directory, directories, files in os.walk(
+            self.corpus_root, onerror=scan_error, followlinks=False
+        ):
+            for name in directories:
+                child = Path(directory) / name
+                if child.is_symlink():
+                    raise RagContractError(f"symbolic-link directories are not allowed: {child}")
+            discovered.extend(Path(directory) / name for name in files if name.endswith(".md"))
+        for path in sorted(discovered):
             if path.is_symlink():
                 raise RagContractError(f"symbolic-link sources are not allowed: {path}")
             resolved = path.resolve()
@@ -446,8 +460,8 @@ class SourceIndex:
             except ValueError as exc:
                 raise RagContractError(f"source escapes corpus root: {path}") from exc
             sources.append(resolved)
-        if not sources:
-            raise RagContractError("corpus has no Markdown documents")
+        # A successfully scanned, existing empty directory is valid. sync()
+        # can now remove the last active document and publish its tombstone.
         return tuple(sources)
 
     def sync(self) -> IndexReport:

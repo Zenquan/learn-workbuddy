@@ -50,7 +50,7 @@ flowchart LR
     T -->|"key + value + expiry"| D["Preference lifecycle gate"]
     E["s09 event ID"] -->|"Harness attaches"| D
     D -->|"create / update"| J["preferences.json"]
-    D -->|"same complete state"| N["UNCHANGED / no disk write"]
+    D -->|"same state, no new evidence"| N["UNCHANGED / no disk write"]
     J --> G{"active at as_of?"}
     G -->|"yes"| MP["MEMORY.md"]
     G -->|"expired"| H["canonical audit only"]
@@ -139,7 +139,11 @@ UPDATED   revision=2  previous=Chinese  current=English
 
 去重不能只比较整段文本。例如“回复使用中文”和“以后回复使用英文”不是两条并存的长期事实，而是同一个 `response.language` 偏好的两个版本。稳定 key 提供冲突域，value 表示当前状态。
 
-完整幂等身份还包含 `source`、`expires_at` 和 `source_event_id`。相同 value 但延长期限或补充新的来源证据属于可观察更新，会增加 revision；仅 `updated_at` 不同的完整重试仍然是 `UNCHANGED`。不同状态的写入时间必须晚于 canonical `updated_at`，避免重放旧 transcript 时回滚新偏好。
+完整幂等身份还包含 `source`、`expires_at` 和 `source_event_id`。相同 value 但延长期限或补充新的来源证据属于可观察更新，会增加 revision。同一个非空事件 ID、相同完整状态的重试仍是 `UNCHANGED`，即使重试传入的时间更晚，也不推进证据时间。
+
+没有事件 ID 时，显式传入比 canonical `updated_at` 更晚的时间表示新确认，即使 value 不变，也更新 `updated_at` 并增加 revision。没有 ID 的重放应保留原始证据时间；相同状态、相同或更早时间仍不写盘。不传时间和事件 ID 的简便调用沿用状态去重，程序自动取得的当前时间不能证明用户再次确认。需要记录确认顺序的调用方应提供稳定事件 ID 或明确的证据时间，不能用重试到达时间冒充证据时间。
+
+例如 09:00 写入“中文”，11:00 用户再次确认“中文”，没有事件 ID 但显式携带 11:00 的新确认会将记录推进到 11:00；之后延迟到达的 10:00“英文”会被拒绝。不同状态的写入时间必须晚于 canonical `updated_at`，避免重放旧 transcript 时回滚新偏好。这里保护的是单次顺序写入的时间边界，不提供跨进程并发写入控制或完整事件历史去重。
 
 ### 3. 临时偏好与 active projection
 

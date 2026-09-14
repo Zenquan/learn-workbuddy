@@ -256,6 +256,7 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
 
     # 4. User memory is keyed and user-scoped.  Repeating the same explicit
     # preference is a no-op; another user does not inherit it.
+    # Both deliveries represent one event, even though the retry arrives later.
     user_root = home / "user-memory"
     alice = chapters.s11.UserMemory(user_root, user_id="alice")
     first_write = alice.set_preference(
@@ -263,12 +264,14 @@ def run_walkthrough(home: Path) -> WalkthroughResult:
         "concise with source pointers",
         source="explicit-user-setting",
         updated_at="2026-08-14T12:00:00Z",
+        source_event_id="walkthrough:preference-1",
     )
     repeated_write = alice.set_preference(
         "response.style",
         "concise with source pointers",
         source="explicit-user-setting",
         updated_at="2026-08-14T12:01:00Z",
+        source_event_id="walkthrough:preference-1",
     )
     bob = chapters.s11.UserMemory(user_root, user_id="bob")
     user_isolated = bob.list_preferences() == []

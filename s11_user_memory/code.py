@@ -469,6 +469,8 @@ class UserMemory:
         A retry is a true no-op only when value, source, expiry, and source event
         all match. Changing lifecycle or provenance is an observable revision,
         even when the user-facing value stays the same.
+        Without an event ID, an explicitly newer evidence timestamp is also a
+        revision. An implicit wall clock alone does not identify new evidence.
         """
 
         normalized_key = _preference_key(key)
@@ -492,7 +494,17 @@ class UserMemory:
         preferences = {item.key: item for item in self.list_preferences()}
         previous = preferences.get(normalized_key)
 
-        if previous and (
+        # A fresh confirmation can repeat the value but must still advance
+        # the stale-write boundary. Stable event IDs identify true retries;
+        # callers without IDs must retain the original time when replaying.
+        newer_unidentified_evidence = (
+            previous is not None
+            and normalized_source_event_id is None
+            and updated_at is not None
+            and _parse_timestamp(normalized_updated_at, field_name="updated_at")
+            > _parse_timestamp(previous.updated_at, field_name="updated_at")
+        )
+        if previous and not newer_unidentified_evidence and (
             previous.value,
             previous.source,
             previous.expires_at,

@@ -79,7 +79,7 @@ def test_preference_key_deduplicates_retries_and_replaces_stale_value(
         "response.language", "Chinese", updated_at="2026-08-09T01:00:00Z"
     )
     unchanged = memory.set_preference(
-        "response.language", "Chinese", updated_at="2026-08-09T02:00:00Z"
+        "response.language", "Chinese", updated_at="2026-08-09T01:00:00Z"
     )
     updated = memory.set_preference(
         "response.language", "English", updated_at="2026-08-09T03:00:00Z"
@@ -94,6 +94,61 @@ def test_preference_key_deduplicates_retries_and_replaces_stale_value(
     assert memory.read_memory().count("response.language") == 1
     assert "English" in memory.read_memory()
     assert "Chinese" not in memory.read_memory()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("use_event_ids", [False, True])
+def test_new_confirmation_blocks_delayed_conflict(s11, tmp_path, restart, use_event_ids):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    memory.set_preference(
+        "response.language", "Chinese", updated_at="2026-09-14T09:00:00Z",
+        source_event_id="event-1" if use_event_ids else None,
+    )
+    confirmed = memory.set_preference(
+        "response.language", "Chinese", updated_at="2026-09-14T11:00:00Z",
+        source_event_id="event-3" if use_event_ids else None,
+    )
+    assert confirmed.status is s11.WriteStatus.UPDATED
+    assert confirmed.revision == 2
+    if restart:
+        memory = s11.UserMemory(tmp_path, user_id="alice")
+    assert memory.list_preferences()[0].updated_at == "2026-09-14T11:00:00Z"
+    before = memory.preferences_path.read_bytes()
+    with pytest.raises(s11.StalePreferenceUpdateError):
+        memory.set_preference(
+            "response.language", "English", updated_at="2026-09-14T10:00:00Z",
+            source_event_id="event-2" if use_event_ids else None,
+        )
+    assert memory.preferences_path.read_bytes() == before
+    assert memory.list_preferences()[0].value == "Chinese"
+
+
+@pytest.mark.parametrize("event_id", [None, "event-1"])
+def test_same_evidence_retry_keeps_timestamp_and_bytes(s11, tmp_path, event_id):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    memory.set_preference(
+        "response.language", "Chinese", updated_at="2026-09-14T09:00:00Z",
+        source_event_id=event_id,
+    )
+    before = memory.preferences_path.read_bytes()
+    # With an ID, a later retry clock is irrelevant; without one, replay the
+    # original evidence time (including equivalent timezone representations).
+    retry_time = "2026-09-14T11:00:00Z" if event_id else "2026-09-14T17:00:00+08:00"
+    retry = memory.set_preference(
+        "response.language", "Chinese", updated_at=retry_time, source_event_id=event_id,
+    )
+    assert retry.status is s11.WriteStatus.UNCHANGED
+    assert retry.revision == 1
+    assert memory.preferences_path.read_bytes() == before
+
+
+def test_implicit_clock_is_not_new_confirmation(s11, tmp_path, monkeypatch):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    memory.set_preference("response.language", "Chinese", updated_at="2026-09-14T09:00:00Z")
+    before = memory.preferences_path.read_bytes()
+    monkeypatch.setattr(s11, "_now_iso", lambda: "2026-09-14T11:00:00Z")
+    assert memory.set_preference("response.language", "Chinese").status is s11.WriteStatus.UNCHANGED
+    assert memory.preferences_path.read_bytes() == before
 
 
 def test_two_users_share_a_root_without_sharing_state(s11, tmp_path: Path) -> None:

@@ -70,6 +70,69 @@ def test_profile_patch_is_explicit_partial_and_restart_safe(s11, tmp_path: Path)
     assert "Call them: A" in recovered.user_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("new_city", ["Beijing", None])
+@pytest.mark.parametrize("recovery", ["retry", "restart"])
+def test_profile_projection_recovers_after_partial_write(s11, tmp_path, monkeypatch, new_city, recovery):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    _establish_identity(memory)
+    memory.update_profile({"city": "Shanghai"})
+    original_write = memory._atomic_write_text
+
+    def fail_projection(path, content):
+        if path == memory.user_path:
+            raise OSError("injected projection failure")
+        original_write(path, content)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(memory, "_atomic_write_text", fail_projection)
+        with pytest.raises(OSError, match="projection failure"):
+            memory.update_profile({"city": new_city})
+    canonical = memory.profile_path.read_bytes()
+    assert "Shanghai" in memory.user_path.read_text()
+    if recovery == "retry":
+        assert memory.update_profile({"city": new_city}).unchanged == ("city",)
+        assert "Shanghai" not in memory.user_path.read_text()
+    else:
+        memory = s11.UserMemory(tmp_path, user_id="alice")
+    context = memory.get_context_for_agent()
+    assert "Shanghai" not in context
+    assert ("City: Beijing" in context) == (new_city is not None)
+    assert memory.profile_path.read_bytes() == canonical
+
+
+@pytest.mark.parametrize("damage", ["stale", "missing", "empty_profile"])
+def test_profile_projection_is_repaired_without_rewriting_json(s11, tmp_path, monkeypatch, damage):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    _establish_identity(memory)
+    if damage == "empty_profile":
+        memory.update_profile({key: None for key in memory.read_profile()})
+    canonical = memory.profile_path.read_bytes()
+    if damage == "missing":
+        memory.user_path.unlink()
+    else:
+        memory.user_path.write_text("stale profile", encoding="utf-8")
+    user = memory.load_identity()["user"]
+    assert "stale profile" not in user
+    assert ("Name: Alice" in user) == (damage != "empty_profile")
+    assert memory.profile_path.read_bytes() == canonical
+    assert memory.user_path.read_text() == user
+    def unexpected_write(*args, **kwargs):
+        raise AssertionError("current projections must not be rewritten")
+    monkeypatch.setattr(memory, "_atomic_write_text", unexpected_write)
+    assert memory.load_identity()["user"] == user
+
+
+def test_failed_profile_repair_does_not_return_stale_prompt(s11, tmp_path, monkeypatch):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    _establish_identity(memory)
+    memory.user_path.write_text("stale profile", encoding="utf-8")
+    def fail_write(*args, **kwargs):
+        raise OSError("cannot repair projection")
+    monkeypatch.setattr(memory, "_atomic_write_text", fail_write)
+    with pytest.raises(OSError, match="cannot repair"):
+        memory.get_context_for_agent()
+
+
 def test_preference_key_deduplicates_retries_and_replaces_stale_value(
     s11, tmp_path: Path
 ) -> None:

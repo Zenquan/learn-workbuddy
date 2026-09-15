@@ -423,7 +423,9 @@ class UserMemory:
 
         if changed:
             self._write_scoped_json(self.profile_path, "profile", profile)
-            self._write_profile_projection(profile)
+        # A previous attempt may have committed JSON but failed to refresh
+        # Markdown. Even an unchanged retry must reconcile that derived view.
+        self._write_profile_projection(profile)
         return ProfileWrite(tuple(sorted(changed)), tuple(sorted(unchanged)))
 
     # ── Preferences: addressable, explicit cross-project rules ─
@@ -615,7 +617,9 @@ class UserMemory:
         """Load readable prompt blocks without exposing canonical JSON."""
 
         profile = self.read_profile()
-        if profile and not self.user_path.exists():
+        # Existence alone does not prove freshness. Reconcile even an empty
+        # canonical profile so removed fields cannot survive in an old view.
+        if profile or self.profile_path.exists() or self.user_path.exists():
             self._write_profile_projection(profile)
         return {
             "soul": self._read_text(self.soul_path),
@@ -697,6 +701,7 @@ class UserMemory:
         self._atomic_write_text(self.memory_path, self._render_preferences(active))
 
     def _write_profile_projection(self, profile: Mapping[str, str]) -> None:
+        """Repair a derived view without rewriting an already current file."""
         labels = {
             "name": "Name",
             "call_them": "Call them",
@@ -709,7 +714,9 @@ class UserMemory:
         lines.extend(
             f"{labels[key]}: {profile[key]}" for key in labels if profile.get(key)
         )
-        self._atomic_write_text(self.user_path, "\n".join(lines).rstrip() + "\n")
+        expected = "\n".join(lines).rstrip() + "\n"
+        if self._read_text(self.user_path) != expected:
+            self._atomic_write_text(self.user_path, expected)
 
     @staticmethod
     def _render_preferences(preferences: list[Preference]) -> str:

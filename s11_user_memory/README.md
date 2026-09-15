@@ -116,7 +116,7 @@ result = memory.update_profile({
 - 只修改请求中出现的字段，未出现字段保持不变；
 - `None` 表示明确删除某字段；
 - 不在 schema 中的字段直接报错，避免模型每轮发明新字段；
-- 相同值计入 `unchanged`，不重写文件；
+- 相同值计入 `unchanged`，不重写 canonical JSON；若 Markdown 投影过期，仍修复投影；
 - 改动发生时原子替换 `profile.json`，再刷新 `persona/user.md`。
 
 Profile 不是从聊天内容自动抽取的“画像”。只有用户明确提供或明确要求保存的信息才进入这一层。
@@ -234,6 +234,10 @@ validate -> serialize -> write temp file -> fsync -> os.replace
 如果写临时文件时进程失败，旧 canonical file 仍然存在；成功替换后，不会留下“写了一半的 JSON”。新进程重新创建 `UserMemory(root, user_id=...)` 即可恢复状态，不依赖内存缓存。
 
 `MEMORY.md` 被人工改坏、过期或处于旧版本时，`read_memory()` 会根据 canonical records 和当前时间重新生成 active projection。这体现了 Harness 中常见的原则：可读视图可以修复，canonical state 必须有清晰边界。
+
+Profile 同样以 `profile.json` 为准。`load_identity()` 不仅检查 `persona/user.md` 是否存在，还比较其内容与当前 Profile 生成的预期文本；不一致时原子替换投影，已一致则不写盘。`update_profile()` 的无变化重试也会执行这项检查，因此 JSON 已保存、Markdown 写入失败后，重试或重启后的身份加载都能恢复视图，不需要再修改一次业务字段。清空 Profile 或删除字段后，旧 Markdown 中对应的值不会继续进入身份加载结果。
+
+例如城市从 Shanghai 改为 Beijing，若只完成 JSON 写入，加载身份时会先修复旧 Markdown，再组装北京的新上下文。修复写入仍失败时异常上抛，不把旧资料当作成功加载的 Prompt。两份文件并非同一个事务：JSON 成功后投影失败仍可能让原写入报错；恢复以 JSON 为准，不回滚事实记录。`read_profile()` 本身保持纯读取，`as_of` 只影响 Preference 的时间投影，不是 Profile 的历史查询。
 
 当前 schema 为 v2，读取器仍接受 v1 profile 与 preferences。v1 Preference 缺少的 `expires_at` 和 `source_event_id` 按 `None` 恢复，下一次发生可观察写入时统一保存为 v2；读取本身不会为了迁移而修改 canonical state。
 

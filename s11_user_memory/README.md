@@ -233,6 +233,8 @@ validate -> serialize -> write temp file -> fsync -> os.replace
 
 如果写临时文件时进程失败，旧 canonical file 仍然存在；成功替换后，不会留下“写了一半的 JSON”。新进程重新创建 `UserMemory(root, user_id=...)` 即可恢复状态，不依赖内存缓存。
 
+临时文件创建后立即记录路径；`write`、`flush`、`fsync` 或 `os.replace` 抛出异常时，`finally` 会尝试删除临时文件，并向调用方报告失败。回归测试分别覆盖这四个阶段，检查旧文件不变（首次写入则目标仍不存在）、临时文件清除，以及故障解除后可重试成功。原子替换保护目标文件，异常清理避免遗留包含用户资料的临时副本，两者不是同一件事；这里不保证进程被强制终止、断电或删除操作本身失败时仍能完成清理，也不提供多文件事务。
+
 `MEMORY.md` 被人工改坏、过期或处于旧版本时，`read_memory()` 会根据 canonical records 和当前时间重新生成 active projection。这体现了 Harness 中常见的原则：可读视图可以修复，canonical state 必须有清晰边界。
 
 Profile 同样以 `profile.json` 为准。`load_identity()` 不仅检查 `persona/user.md` 是否存在，还比较其内容与当前 Profile 生成的预期文本；不一致时原子替换投影，已一致则不写盘。`update_profile()` 的无变化重试也会执行这项检查，因此 JSON 已保存、Markdown 写入失败后，重试或重启后的身份加载都能恢复视图，不需要再修改一次业务字段。清空 Profile 或删除字段后，旧 Markdown 中对应的值不会继续进入身份加载结果。

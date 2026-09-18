@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,6 +51,44 @@ def _establish_identity(memory) -> None:
         assistant_identity="# Identity\n\nName: WorkBuddy",
         profile={"name": "Alice", "call_them": "Alice"},
     )
+
+
+@pytest.mark.parametrize("stage", ["write", "flush", "fsync", "replace"])
+@pytest.mark.parametrize("existing", [True, False])
+def test_atomic_write_cleans_up_after_failure(s11, tmp_path, monkeypatch, stage, existing):
+    target = tmp_path / "profile.json"
+    old = '{"city": "Shanghai"}'
+    new = '{"city": "Beijing"}'
+    if existing:
+        target.write_text(old, encoding="utf-8")
+    original_tempfile = s11.tempfile.NamedTemporaryFile
+
+    def fail(*args, **kwargs):
+        raise OSError(f"injected {stage} failure")
+
+    @contextmanager
+    def failing_tempfile(*args, **kwargs):
+        # Use a real temporary file so cleanup is tested on disk, not on a mock.
+        with original_tempfile(*args, **kwargs) as handle:
+            monkeypatch.setattr(handle, stage, fail)
+            yield handle
+
+    with monkeypatch.context() as patch:
+        if stage in {"write", "flush"}:
+            patch.setattr(s11.tempfile, "NamedTemporaryFile", failing_tempfile)
+        else:
+            patch.setattr(s11.os, stage, fail)
+        with pytest.raises(OSError, match=f"injected {stage} failure"):
+            s11.UserMemory._atomic_write_text(target, new)
+    assert target.exists() == existing
+    if existing:
+        assert target.read_text(encoding="utf-8") == old
+    assert list(tmp_path.glob(".profile.json.*.tmp")) == []
+
+    # Once the underlying failure is gone, the same write can be retried.
+    s11.UserMemory._atomic_write_text(target, new)
+    assert target.read_text(encoding="utf-8") == new
+    assert list(tmp_path.glob(".profile.json.*.tmp")) == []
 
 
 def test_profile_patch_is_explicit_partial_and_restart_safe(s11, tmp_path: Path) -> None:

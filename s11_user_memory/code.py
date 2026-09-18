@@ -747,10 +747,11 @@ class UserMemory:
                 suffix=".tmp",
                 delete=False,
             ) as handle:
+                # Track the file before any I/O can fail so finally can clean it up.
+                temp_name = handle.name
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-                temp_name = handle.name
             os.replace(temp_name, path)
         finally:
             if temp_name:

@@ -119,6 +119,10 @@ result = memory.update_profile({
 - 相同值计入 `unchanged`，不重写 canonical JSON；若 Markdown 投影过期，仍修复投影；
 - 改动发生时原子替换 `profile.json`，再刷新 `persona/user.md`。
 
+字段值必须是字符串，经空白归一化后非空且不超过 1,000 字符；字典、列表、数字和布尔值不会被隐式转成文本。`None` 只在更新请求中表示删除，不是可保存的字段值。局部更新中任一字段非法，整个请求报错，不写入前面已校验的字段。
+
+读取已有 `profile.json` 时也检查字段名、类型和文本约束；例如磁盘中的 `{"name": null}` 会报 `UserMemoryValidationError`，而不是变成 `Name: None` 注入 Prompt。校验在生成 Markdown 投影之前完成，失败时不覆盖原 JSON 或投影；正常读取不改写 JSON，v1/v2 的合法记录仍可读取。原始类型已经被旧版本转成字符串的数据无法据此自动识别，需要核对原始事实后处理。
+
 Profile 不是从聊天内容自动抽取的“画像”。只有用户明确提供或明确要求保存的信息才进入这一层。
 
 ### 2. Preference：按语义 key 去重

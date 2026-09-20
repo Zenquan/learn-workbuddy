@@ -305,6 +305,18 @@ def _clean_text(value: object, *, field_name: str, max_chars: int) -> str:
     return text
 
 
+def _profile_text(key: str, value: object) -> str:
+    """Validate profile fields at both the write and disk-read boundaries."""
+
+    if key not in PROFILE_FIELDS:
+        raise UserMemoryValidationError(f"unknown profile field: {key}")
+    # Do not turn null, containers or numbers into apparent facts via str().
+    # None is a deletion instruction only in update_profile, never stored data.
+    if not isinstance(value, str):
+        raise UserMemoryValidationError(f"{key} must be a string")
+    return _clean_text(value, field_name=key, max_chars=1_000)
+
+
 def _optional_source_event_id(value: object | None) -> str | None:
     if value is None:
         return None
@@ -387,7 +399,9 @@ class UserMemory:
         profile = payload.get("profile", {})
         if not isinstance(profile, dict):
             raise UserMemoryValidationError("profile must be a JSON object")
-        return {str(key): str(value) for key, value in profile.items()}
+        # Scope/schema checks alone do not make on-disk facts safe to project.
+        # Validate without rewriting the canonical file during a read.
+        return {key: _profile_text(key, value) for key, value in profile.items()}
 
     def update_profile(self, changes: Mapping[str, object]) -> ProfileWrite:
         """Apply an explicit partial update; omitted fields remain untouched.
@@ -414,7 +428,7 @@ class UserMemory:
                 else:
                     unchanged.append(key)
                 continue
-            value = _clean_text(raw_value, field_name=key, max_chars=1_000)
+            value = _profile_text(key, raw_value)
             if profile.get(key) == value:
                 unchanged.append(key)
             else:

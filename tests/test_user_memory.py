@@ -109,6 +109,53 @@ def test_profile_patch_is_explicit_partial_and_restart_safe(s11, tmp_path: Path)
     assert "Call them: A" in recovered.user_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("value", [{"unexpected": "Beijing"}, ["Beijing"], 42, True, "", "  ", "x" * 1001])
+def test_profile_rejects_invalid_patch_without_writes(s11, tmp_path, value):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    _establish_identity(memory)
+    before = (memory.profile_path.read_bytes(), memory.user_path.read_bytes())
+    # A valid earlier field must not be committed if a later field is invalid.
+    with pytest.raises(s11.UserMemoryValidationError):
+        memory.update_profile({"name": "Bob", "city": value})
+    assert (memory.profile_path.read_bytes(), memory.user_path.read_bytes()) == before
+
+
+@pytest.mark.parametrize("profile", [
+    {"name": None}, {"city": {"unexpected": "Beijing"}}, {"city": ["Beijing"]},
+    {"city": 42}, {"city": True}, {"name": ""}, {"name": "  "},
+    {"notes": "x" * 1001}, {"unknown": "value"}, [],
+])
+def test_profile_rejects_invalid_disk_records_before_projection(s11, tmp_path, profile):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    _establish_identity(memory)
+    payload = json.loads(memory.profile_path.read_text())
+    payload["profile"] = profile
+    memory.profile_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = (memory.profile_path.read_bytes(), memory.user_path.read_bytes())
+    restarted = s11.UserMemory(tmp_path, user_id="alice")
+    for read in (restarted.read_profile, restarted.load_identity, restarted.get_context_for_agent):
+        with pytest.raises(s11.UserMemoryValidationError):
+            read()
+    with pytest.raises(s11.UserMemoryValidationError):
+        restarted.update_profile({"name": "Bob"})
+    assert (memory.profile_path.read_bytes(), memory.user_path.read_bytes()) == before
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_profile_valid_strings_remain_restart_safe(s11, tmp_path, version):
+    memory = s11.UserMemory(tmp_path, user_id="alice")
+    memory.update_profile({"name": "  Alice\n Smith ", "notes": "x" * 1000})
+    payload = json.loads(memory.profile_path.read_text())
+    payload["schema_version"] = version
+    memory.profile_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = memory.profile_path.read_bytes()
+    restarted = s11.UserMemory(tmp_path, user_id="alice")
+    assert restarted.read_profile() == {"name": "Alice Smith", "notes": "x" * 1000}
+    assert memory.profile_path.read_bytes() == before
+    assert restarted.update_profile({"notes": None}).changed == ("notes",)
+    assert restarted.read_profile() == {"name": "Alice Smith"}
+
+
 @pytest.mark.parametrize("new_city", ["Beijing", None])
 @pytest.mark.parametrize("recovery", ["retry", "restart"])
 def test_profile_projection_recovers_after_partial_write(s11, tmp_path, monkeypatch, new_city, recovery):

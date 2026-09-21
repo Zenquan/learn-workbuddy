@@ -117,6 +117,10 @@ result = OfflineBM25Retriever(index).search("memory")
 
 如果只有低相关或无重叠候选，检索器返回空 hits。它不会为了“总得回答点什么”而强行选择文档。
 
+来源校验时，单个文件无法读取或不是合法 UTF-8，只拒绝该文件的证据，并在 `rejected` 中记录 `source document cannot be read` 或 `source document is not valid UTF-8`；其他通过校验的来源继续参与检索。即使文件刚通过存在性检查，也可能在实际读取前被删除，因此读取阶段同样需要处理 `OSError`。无法验证时不会回退使用索引中的旧正文；全部来源不可用时返回空 hits，Prompt 仅保留 guard。
+
+这一处理仅限检索阶段的文件 I/O 与解码异常，不捕获程序错误。`sync()` 仍在读取失败时抛出异常并保留原索引，不把读不到的文件当成删除，也不发布仅包含部分文档的新索引。
+
 ## 5. Retrieved content 永远不是指令
 
 投影结果有固定 guard，并把每条证据放在显式边界内：

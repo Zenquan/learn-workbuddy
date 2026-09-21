@@ -569,14 +569,23 @@ class SourceIndex:
         document = self.documents.get(chunk.document_id)
         if document is None or chunk.chunk_id not in document.chunk_ids:
             return False, "chunk is no longer active"
-        path = (self.corpus_root / chunk.source_path).resolve()
         try:
-            path.relative_to(self.corpus_root)
-        except ValueError:
-            return False, "source escapes corpus root"
-        if not path.is_file():
-            return False, "source document is missing"
-        current_text = path.read_text(encoding="utf-8")
+            path = (self.corpus_root / chunk.source_path).resolve()
+            try:
+                path.relative_to(self.corpus_root)
+            except ValueError:
+                return False, "source escapes corpus root"
+            if not path.is_file():
+                return False, "source document is missing"
+            current_text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return False, "source document is not valid UTF-8"
+        except OSError:
+            # A source can become unreadable/disappear after is_file(). Reject
+            # its evidence, never fall back to indexed text or abort other hits.
+            # Keep this boundary local: sync failures and programming errors
+            # must still propagate instead of publishing incomplete state.
+            return False, "source document cannot be read"
         if _sha256(current_text) != document.content_hash:
             return False, "source document changed after indexing"
         lines = current_text.splitlines()

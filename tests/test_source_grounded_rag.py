@@ -486,6 +486,67 @@ def test_source_change_after_indexing_fails_closed(rag, tmp_path: Path) -> None:
     assert "rag-security.md" not in {hit.chunk.source_path for hit in result.hits}
 
 
+@pytest.mark.parametrize("failure", ["encoding", "permission", "disappeared"])
+@pytest.mark.parametrize("all_unavailable", [False, True])
+def test_source_read_failure_isolated_from_other_evidence(
+    rag, tmp_path, monkeypatch, failure, all_unavailable
+):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    good = corpus / "good.md"
+    bad = corpus / "bad.md"
+    good.write_text("# Memory\nMemory retains explicit preferences.", encoding="utf-8")
+    bad.write_text("# Memory\nMemory contains unavailable profile facts.", encoding="utf-8")
+    index = rag.SourceIndex(corpus, tmp_path / "index.json")
+    index.sync()
+    before = index.index_path.read_bytes()
+    generation = index.generation
+    failed_paths = {bad, good} if all_unavailable else {bad}
+    original_read = Path.read_text
+
+    def failing_read(path, *args, **kwargs):
+        if path in failed_paths:
+            if failure == "permission":
+                raise PermissionError("injected unreadable source")
+            # The file still passes is_file(): simulate removal just before read.
+            raise FileNotFoundError("injected source disappeared")
+        return original_read(path, *args, **kwargs)
+
+    if failure == "encoding":
+        for path in failed_paths:
+            path.write_bytes(b"\xff\xfe invalid utf8")
+    else:
+        monkeypatch.setattr(Path, "read_text", failing_read)
+    result = rag.OfflineBM25Retriever(index).search("memory")
+    assert {hit.chunk.source_path for hit in result.hits} == (
+        set() if all_unavailable else {"good.md"}
+    )
+    expected = "source document is not valid UTF-8" if failure == "encoding" else "source document cannot be read"
+    for chunk in index.chunks:
+        if corpus / chunk.source_path in failed_paths:
+            assert result.rejected[chunk.chunk_id] == expected
+    assert "unavailable profile facts" not in result.evidence_prompt
+    if all_unavailable:
+        assert result.evidence_prompt == rag.PROMPT_GUARD
+    # Retrieval degradation must not turn a failed sync into a partial publication.
+    with pytest.raises((OSError, UnicodeDecodeError)):
+        index.sync()
+    assert index.index_path.read_bytes() == before
+    assert index.generation == generation
+
+
+def test_source_validation_does_not_hide_programming_errors(rag, tmp_path, monkeypatch):
+    corpus = _copy_corpus(tmp_path)
+    index, _report = _index(rag, corpus, tmp_path)
+
+    def broken_read(*args, **kwargs):
+        raise TypeError("injected programming error")
+
+    monkeypatch.setattr(Path, "read_text", broken_read)
+    with pytest.raises(TypeError, match="programming error"):
+        rag.OfflineBM25Retriever(index).search("memory")
+
+
 def test_budget_keeps_complete_evidence_blocks(rag, tmp_path: Path) -> None:
     corpus = _copy_corpus(tmp_path)
     index, _report = _index(rag, corpus, tmp_path)

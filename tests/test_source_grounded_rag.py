@@ -547,6 +547,96 @@ def test_source_validation_does_not_hide_programming_errors(rag, tmp_path, monke
         rag.OfflineBM25Retriever(index).search("memory")
 
 
+def test_search_reads_each_source_once_and_refreshes_next_query(rag, tmp_path, monkeypatch):
+    corpus = (tmp_path / "corpus").resolve()
+    corpus.mkdir()
+    source = corpus / "memory.md"
+    text = "\n\n".join(
+        f"# Memory section {i}\nMemory records explicit preferences for user {i}."
+        for i in range(20)
+    )
+    source.write_text(text, encoding="utf-8")
+    index = rag.SourceIndex(corpus, tmp_path / "index.json", max_chars=120)
+    index.sync()
+    assert len(index.chunks) == 20
+    retriever = rag.OfflineBM25Retriever(index)
+    original_validate = index._validate_chunk
+    with monkeypatch.context() as uncached:
+        # Compare scores, ordering, rejection reasons and Prompt with fresh reads
+        # for every chunk, not just a second run through the optimized path.
+        uncached.setattr(index, "_validate_chunk", lambda chunk, reads: original_validate(chunk, {}))
+        baseline = retriever.search("memory").to_dict()
+    original_read = Path.read_text
+    reads = []
+
+    def counted_read(path, *args, **kwargs):
+        if path == source:
+            reads.append(path)
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read)
+    assert retriever.search("memory").to_dict() == baseline
+    assert len(reads) == 1
+    source.write_text(text + "\nChanged", encoding="utf-8")
+    changed = retriever.search("memory")
+    assert not changed.hits
+    assert set(changed.rejected.values()) == {"source document changed after indexing"}
+    assert len(reads) == 2
+    source.write_bytes(b"\xff")
+    assert not retriever.search("memory").hits
+    assert len(reads) == 3
+    source.write_text(text, encoding="utf-8")
+    assert retriever.search("memory").to_dict() == baseline
+    assert len(reads) == 4
+    source.unlink()
+    assert set(retriever.search("memory").rejected.values()) == {"source document is missing"}
+
+
+def test_query_reads_distinct_documents_and_standalone_validation_is_fresh(rag, tmp_path, monkeypatch):
+    corpus = (tmp_path / "corpus").resolve()
+    corpus.mkdir()
+    for name in ("a", "b"):
+        (corpus / f"{name}.md").write_text(
+            f"# Memory {name}\nMemory {name} preferences.\n\n# Details\nMemory {name} details.",
+            encoding="utf-8",
+        )
+    index = rag.SourceIndex(corpus, tmp_path / "index.json")
+    index.sync()
+    original_read = Path.read_text
+    reads = []
+
+    def counted_read(path, *args, **kwargs):
+        reads.append(path)
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read)
+    result = rag.OfflineBM25Retriever(index).search("memory", top_k=4)
+    assert len(result.hits) == 4
+    assert sorted(path.name for path in reads) == ["a.md", "b.md"]
+    chunk = index.chunks[0]
+    assert index.validate_chunk(chunk) == (True, "verified")
+    (corpus / chunk.source_path).write_text("changed", encoding="utf-8")
+    assert index.validate_chunk(chunk) == (False, "source document changed after indexing")
+    assert len(reads) == 4
+
+
+def test_shared_source_read_still_validates_each_citation(rag, tmp_path):
+    from dataclasses import replace
+
+    corpus = (tmp_path / "corpus").resolve()
+    corpus.mkdir()
+    (corpus / "memory.md").write_text(
+        "# Memory one\nMemory preferences.\n\n# Memory two\nMemory profile.", encoding="utf-8"
+    )
+    index = rag.SourceIndex(corpus, tmp_path / "index.json")
+    index.sync()
+    first, second = index.chunks
+    index.chunks = (first, replace(second, text="forged memory"))
+    result = rag.OfflineBM25Retriever(index).search("memory")
+    assert [hit.chunk.chunk_id for hit in result.hits] == [first.chunk_id]
+    assert result.rejected[second.chunk_id] == "citation content no longer matches the chunk"
+
+
 def test_budget_keeps_complete_evidence_blocks(rag, tmp_path: Path) -> None:
     corpus = _copy_corpus(tmp_path)
     index, _report = _index(rag, corpus, tmp_path)

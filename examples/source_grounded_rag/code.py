@@ -564,37 +564,58 @@ class SourceIndex:
         )
 
     def validate_chunk(self, chunk: SourceChunk) -> tuple[bool, str]:
+        """Standalone validation always reads fresh source data."""
+        return self._validate_chunk(chunk, {})
+
+    def _validate_chunk(
+        self,
+        chunk: SourceChunk,
+        source_reads: dict[tuple[str, str], tuple[list[str] | None, str]],
+    ) -> tuple[bool, str]:
         if self._indexed_max_chars != self.max_chars:
             return False, "chunk settings changed or unknown; sync the index first"
         document = self.documents.get(chunk.document_id)
         if document is None or chunk.chunk_id not in document.chunk_ids:
             return False, "chunk is no longer active"
-        try:
-            path = (self.corpus_root / chunk.source_path).resolve()
-            try:
-                path.relative_to(self.corpus_root)
-            except ValueError:
-                return False, "source escapes corpus root"
-            if not path.is_file():
-                return False, "source document is missing"
-            current_text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return False, "source document is not valid UTF-8"
-        except OSError:
-            # A source can become unreadable/disappear after is_file(). Reject
-            # its evidence, never fall back to indexed text or abort other hits.
-            # Keep this boundary local: sync failures and programming errors
-            # must still propagate instead of publishing incomplete state.
-            return False, "source document cannot be read"
-        if _sha256(current_text) != document.content_hash:
-            return False, "source document changed after indexing"
-        lines = current_text.splitlines()
+        # Share only source-level work. Every chunk still verifies its own lines
+        # and digest. Include the expected document hash in the lookup key.
+        key = (chunk.source_path, document.content_hash)
+        if key not in source_reads:
+            source_reads[key] = self._read_source(*key)
+        lines, reason = source_reads[key]
+        if lines is None:
+            return False, reason
         if chunk.end_line > len(lines):
             return False, "citation line range is out of bounds"
         cited = "\n".join(lines[chunk.start_line - 1 : chunk.end_line]).strip()
         if _sha256(cited) != chunk.content_hash or cited != chunk.text:
             return False, "citation content no longer matches the chunk"
         return True, "verified"
+
+    def _read_source(
+        self, source_path: str, expected_hash: str
+    ) -> tuple[list[str] | None, str]:
+        """Read and hash one source, returning lines or a rejection reason."""
+        try:
+            path = (self.corpus_root / source_path).resolve()
+            try:
+                path.relative_to(self.corpus_root)
+            except ValueError:
+                return None, "source escapes corpus root"
+            if not path.is_file():
+                return None, "source document is missing"
+            current_text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return None, "source document is not valid UTF-8"
+        except OSError:
+            # A source can become unreadable/disappear after is_file(). Reject
+            # its evidence, never fall back to indexed text or abort other hits.
+            # Keep this boundary local: sync failures and programming errors
+            # must still propagate instead of publishing incomplete state.
+            return None, "source document cannot be read"
+        if _sha256(current_text) != expected_hash:
+            return None, "source document changed after indexing"
+        return current_text.splitlines(), "verified"
 
 
 @dataclass(frozen=True)
@@ -662,11 +683,14 @@ class OfflineBM25Retriever:
 
         rejected: dict[str, str] = {}
         eligible: list[tuple[SourceChunk, tuple[str, ...]]] = []
+        # Query-local only: reuse both successful reads and failures, then discard
+        # them so the next query observes changed/deleted/recovered source files.
+        source_reads: dict[tuple[str, str], tuple[list[str] | None, str]] = {}
         for chunk in self.index.chunks:
             if chunk.unsafe_reason:
                 rejected[chunk.chunk_id] = chunk.unsafe_reason
                 continue
-            valid, reason = self.index.validate_chunk(chunk)
+            valid, reason = self.index._validate_chunk(chunk, source_reads)
             if not valid:
                 rejected[chunk.chunk_id] = reason
                 continue

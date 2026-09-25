@@ -673,6 +673,12 @@ class OfflineBM25Retriever:
         self, query: str, *, top_k: int = 3, prompt_budget_chars: int = 1800
     ) -> SearchResult:
         query = _require_text(query, field_name="query")
+        # Type hints do not validate direct callers. Reject bool/float/NaN before
+        # comparisons so Top-K and the hard budget cannot silently change meaning.
+        top_k = _require_int(top_k, field_name="top_k", minimum=1)
+        prompt_budget_chars = _require_int(
+            prompt_budget_chars, field_name="prompt_budget_chars"
+        )
         if not 1 <= top_k <= 20:
             raise RagContractError("top_k must be between 1 and 20")
         if prompt_budget_chars < len(PROMPT_GUARD):

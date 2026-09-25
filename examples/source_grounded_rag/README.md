@@ -107,6 +107,8 @@ result = OfflineBM25Retriever(index).search("memory")
 
 ## 4. BM25 与 Prompt 预算是两个阶段
 
+直接调用 `search()` 时，`top_k` 和 `prompt_budget_chars` 必须是整数，不接受布尔值、小数（包括 `1800.0`）、NaN、无穷值或数字字符串。检索入口复用评测输入的 `_require_int` 校验；Top-K 仍限定为 1–20，字符预算至少容纳 `PROMPT_GUARD`。非法参数在读取来源之前抛出 `RagContractError`，不会静默取整或把 NaN 当成无预算限制。预算恰好等于 guard 长度是合法请求，返回空 hits 和完整 guard。
+
 纯标准库 BM25 负责相关性排序；进入 Prompt 前还要依次经过：
 
 1. `unsafe_reason` 门禁：命中提示覆盖模式的 chunk 不参与打分。

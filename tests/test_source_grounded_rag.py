@@ -637,6 +637,36 @@ def test_shared_source_read_still_validates_each_citation(rag, tmp_path):
     assert result.rejected[second.chunk_id] == "citation content no longer matches the chunk"
 
 
+@pytest.mark.parametrize("parameter", ["top_k", "prompt_budget_chars"])
+@pytest.mark.parametrize("value", [True, False, 1.5, 1800.0, float("nan"), float("inf"), "1800", None, 0, -1])
+def test_search_rejects_invalid_limits_before_source_reads(rag, tmp_path, monkeypatch, parameter, value):
+    corpus = _copy_corpus(tmp_path)
+    index, _report = _index(rag, corpus, tmp_path)
+
+    def forbidden_read(*args, **kwargs):
+        raise AssertionError("invalid query limits must not read source files")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read)
+    with pytest.raises(rag.RagContractError):
+        rag.OfflineBM25Retriever(index).search("memory", **{parameter: value})
+
+
+@pytest.mark.parametrize("top_k", [1, 20])
+def test_search_accepts_integer_limit_boundaries(rag, tmp_path, top_k):
+    corpus = _copy_corpus(tmp_path)
+    index, _report = _index(rag, corpus, tmp_path)
+    retriever = rag.OfflineBM25Retriever(index)
+    result = retriever.search("memory", top_k=top_k, prompt_budget_chars=len(rag.PROMPT_GUARD))
+    assert result.hits == ()
+    assert result.evidence_prompt == rag.PROMPT_GUARD
+    assert result.top_k == top_k
+    assert result.prompt_chars == result.prompt_budget_chars
+    with pytest.raises(rag.RagContractError):
+        retriever.search("memory", top_k=21)
+    with pytest.raises(rag.RagContractError):
+        retriever.search("memory", prompt_budget_chars=len(rag.PROMPT_GUARD) - 1)
+
+
 def test_budget_keeps_complete_evidence_blocks(rag, tmp_path: Path) -> None:
     corpus = _copy_corpus(tmp_path)
     index, _report = _index(rag, corpus, tmp_path)
